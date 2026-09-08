@@ -1,0 +1,25 @@
+[package]
+name = "synapse-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Idiomatic, high-performance async client SDK for the Synapse 2.0 BitTorrent Daemon."
+
+[dependencies]
+synapse-proto = { path = "../synapse-proto" }
+tonic = { version = "0.12", default-features = false, features = ["channel"] }
+prost = "0.13"
+tokio = { workspace = true, features = ["sync", "time", "macros", "rt"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+futures = "0.3"
+thiserror = { workspace = true }
+tracing = { workspace = true }
+parking_lot = "0.12"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
+synapse-rpc = { path = "../synapse-rpc" }
+synapse-engine = { path = "../synapse-engine" }
+diskio = { package = "synapse-diskio", path = "../synapse-diskio" }
+tempfile = "3"

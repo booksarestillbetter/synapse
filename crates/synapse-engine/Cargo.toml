@@ -1,0 +1,49 @@
+[package]
+name = "synapse-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Torrent state machine: wires peer connections, the piece picker/choker, and the disk engine together. See doc/REWRITE_ROADMAP.md."
+
+[dependencies]
+tokio = { workspace = true, features = ["net", "io-util", "process"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+futures = "0.3"
+bytes = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+sha1 = "0.10"
+synapse-wire = { path = "../synapse-wire" }
+synapse-meta = { path = "../synapse-meta" }
+synapse-tracker = { path = "../synapse-tracker" }
+synapse-dht = { path = "../synapse-dht" }
+dashmap = "6.1"
+parking_lot = "0.12"
+rand = "0.8"
+
+synapse-picker = { path = "../synapse-picker" }
+libc = "0.2"
+diskio = { package = "synapse-diskio", path = "../synapse-diskio" }
+synapse-bencode = { path = "../synapse-bencode" }
+synapse-config = { path = "../synapse-config" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hex = "0.4"
+url = "2"
+async-trait = { workspace = true }
+redb = "2"
+chacha20poly1305 = "0.10"
+# Only for instructions::ConduitInstructionsPlugin's occasional (once-per-torrent-completion,
+# not hot-path) outbound POST to a configured completion-instructions URL — everything else in
+# this daemon avoids a client HTTP stack in favor of hand-rolled minimal I/O (see
+# synapse-tracker's http.rs), but hand-rolling HTTPS + redirects + timeouts for this one rare
+# call isn't a reasonable use of that same effort. rustls (not the OS/openssl default) keeps
+# the Docker build simple.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
+tempfile = "3"
+tracing-subscriber = { workspace = true }
+parking_lot = "0.12"

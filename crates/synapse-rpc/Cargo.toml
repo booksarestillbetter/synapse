@@ -1,0 +1,39 @@
+[package]
+name = "synapse-rpc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "High-performance gRPC & Delta-streaming control plane for Synapse 2.0."
+
+[dependencies]
+tonic = "0.12"
+prost = "0.13"
+tokio = { workspace = true, features = ["net", "sync", "macros", "time"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+futures = "0.3"
+async-stream = "0.3"
+parking_lot = "0.12"
+hex = "0.4"
+bytes = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+dashmap = "6.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+url = "2.5"
+axum = { version = "0.7", default-features = false, features = ["json", "tokio", "query"] }
+synapse-bencode = { path = "../synapse-bencode" }
+synapse-meta = { path = "../synapse-meta" }
+synapse-engine = { path = "../synapse-engine" }
+synapse-config = { path = "../synapse-config" }
+synapse-proto = { path = "../synapse-proto" }
+synapse-picker = { path = "../synapse-picker" }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tower = { version = "0.5", features = ["util"] }
+diskio = { package = "synapse-diskio", path = "../synapse-diskio" }

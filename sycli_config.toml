@@ -1,7 +1,0 @@
-[default]
-server = "ws://localhost:8412"
-password = "hackme"
-
-[other]
-server = "wss://myserver.com:8412"
-password = "betterpassword"

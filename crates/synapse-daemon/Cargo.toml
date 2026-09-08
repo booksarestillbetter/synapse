@@ -1,0 +1,42 @@
+[package]
+name = "synapsed"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "The rewritten synapse daemon binary. See doc/REWRITE_ROADMAP.md."
+
+[[bin]]
+name = "synapsed"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
+bytes = { workspace = true }
+diskio = { package = "synapse-diskio", path = "../synapse-diskio" }
+synapse-bencode = { path = "../synapse-bencode" }
+synapse-config = { path = "../synapse-config" }
+synapse-engine = { path = "../synapse-engine" }
+synapse-meta = { path = "../synapse-meta" }
+synapse-rpc = { path = "../synapse-rpc" }
+axum = { version = "0.7", features = ["tokio", "http1"] }
+tonic = "0.12"
+rand = "0.8"
+hex = "0.4"
+synapse-picker = { path = "../synapse-picker" }
+serde_json = "1.0"
+sha1 = "0.10"
+
+[dev-dependencies]
+reqwest = { version = "0.12", features = ["json"] }
+serde_json = "1.0"
+tempfile = "3"
+base64 = "0.22"
+hex = "0.4"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+

@@ -1,5 +1,6 @@
 target
 spec/
+external/
 config.toml
 *.torrent
 oprofile*
@@ -10,3 +11,5 @@ perf*
 *.bk
 rr.sh
 *.vi
+.DS_Store
+*.log

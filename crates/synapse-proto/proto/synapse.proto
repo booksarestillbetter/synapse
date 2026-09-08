@@ -1,0 +1,297 @@
+syntax = "proto3";
+package synapse.v2;
+
+service SynapseControl {
+  // --- Tier 1: High-Speed Torrent List & Deltas ---
+  rpc SubscribeTorrents(SubscribeTorrentsRequest) returns (stream TorrentListEvent);
+  rpc SubscribeSessionStats(SessionStatsRequest) returns (stream SessionStatsUpdate);
+
+  // --- Tier 2: Deep Per-Torrent Inspection (Opt-In) ---
+  rpc SubscribeTorrentDetail(TorrentDetailRequest) returns (stream TorrentDetailEvent);
+
+  // --- Unary Swarm Commands ---
+  rpc AddTorrent(AddTorrentRequest) returns (AddTorrentResponse);
+  rpc RemoveTorrent(RemoveTorrentRequest) returns (CommandResponse);
+  rpc PauseTorrent(TorrentHashRequest) returns (CommandResponse);
+  rpc ResumeTorrent(TorrentHashRequest) returns (CommandResponse);
+  rpc RecheckTorrent(TorrentHashRequest) returns (CommandResponse);
+  rpc SetFilePriority(FilePriorityRequest) returns (CommandResponse);
+  rpc SetLocation(SetLocationRequest) returns (CommandResponse);
+  rpc SetRateLimits(RateLimitsRequest) returns (CommandResponse);
+  rpc GetSessionStats(SessionStatsRequest) returns (SessionStatsUpdate);
+  rpc GetSessionSettings(SessionSettingsRequest) returns (SessionSettingsResponse);
+  rpc UpdateSessionSettings(UpdateSessionSettingsRequest) returns (UpdateSessionSettingsResponse);
+}
+
+enum TorrentState {
+  STATE_STOPPED = 0;
+  STATE_CHECKING = 1;
+  STATE_QUEUED = 2;
+  STATE_DOWNLOADING = 3;
+  STATE_SEEDING = 4;
+  STATE_ERROR = 5;
+}
+
+message SubscribeTorrentsRequest {
+  uint32 chunk_size = 1;
+  uint32 flush_window_ms = 2;
+}
+
+message SessionStatsRequest {}
+
+message SessionStatsUpdate {
+  uint64 rate_download = 1;
+  uint64 rate_upload = 2;
+  uint64 total_downloaded = 3;
+  uint64 total_uploaded = 4;
+  uint32 torrent_count = 5;
+  uint32 active_downloading = 6;
+  uint32 active_seeding = 7;
+  uint64 free_disk_space_bytes = 8;
+  int64 timestamp_ms = 9;
+}
+
+message TorrentSummary {
+  string hash = 1;
+  string name = 2;
+  uint64 total_size = 3;
+  float progress = 4;
+  TorrentState state = 5;
+  uint64 rate_download = 6;
+  uint64 rate_upload = 7;
+  uint32 peers_connected = 8;
+  uint32 peers_sending = 9;
+  uint64 eta_seconds = 10;
+  float ratio = 11;
+  optional string error_message = 12;
+  string download_dir = 13;
+  int64 added_at = 14;
+  uint32 piece_count = 15;
+  uint32 piece_size = 16;
+}
+
+message TorrentDelta {
+  string hash = 1;
+  optional float progress = 2;
+  optional TorrentState state = 3;
+  optional uint64 rate_download = 4;
+  optional uint64 rate_upload = 5;
+  optional uint32 peers_connected = 6;
+  optional uint32 peers_sending = 7;
+  optional uint64 eta_seconds = 8;
+  optional float ratio = 9;
+  optional string error_message = 10;
+}
+
+message TorrentSnapshotChunk {
+  repeated TorrentSummary items = 1;
+  uint32 chunk_index = 2;
+  uint32 total_chunks = 3;
+  bool is_last_chunk = 4;
+}
+
+message TorrentListEvent {
+  uint64 sequence_id = 1;
+  int64 timestamp_ms = 2;
+  oneof event {
+    TorrentSnapshotChunk snapshot = 3;
+    TorrentSummary added = 4;
+    TorrentDelta updated = 5;
+    string removed_hash = 6;
+  }
+}
+
+message TorrentDetailRequest {
+  string hash = 1;
+  uint32 refresh_interval_ms = 2;
+}
+
+message PeerDetail {
+  string address = 1;
+  string client_name = 2;
+  string flags = 3;
+  uint64 rate_to_client = 4;
+  uint64 rate_to_peer = 5;
+  float progress = 6;
+  bool is_encrypted = 7;
+  bool is_utp = 8;
+  optional string country_code = 9;
+  optional string as_name = 10;
+}
+
+message TrackerStatus {
+  string url = 1;
+  string status = 2;
+  uint32 seeders = 3;
+  uint32 leechers = 4;
+  int64 next_announce_in = 5;
+  optional string failure_reason = 6;
+  bool is_circuit_broken = 7;
+}
+
+message FileProgress {
+  uint32 index = 1;
+  string path = 2;
+  uint64 size_bytes = 3;
+  uint64 bytes_completed = 4;
+  float progress = 5;
+  uint32 priority = 6; // 0=skip, 1=low, 4=normal, 7=high
+}
+
+message TorrentDetailEvent {
+  string hash = 1;
+  int64 timestamp_ms = 2;
+  repeated PeerDetail active_peers = 3;
+  repeated TrackerStatus trackers = 4;
+  repeated FileProgress files = 5;
+  bytes piece_bitfield = 6;
+  uint32 piece_count = 7;
+  uint32 piece_size = 8;
+  repeated uint32 availability = 9;
+}
+
+message AddTorrentRequest {
+  oneof source {
+    bytes torrent_bytes = 1;
+    string magnet_uri = 2;
+    string file_path = 3;
+    string torrent_url = 6;
+  }
+  optional string download_dir = 4;
+  optional bool start_paused = 5;
+}
+
+message AddTorrentResponse {
+  bool success = 1;
+  string hash = 2;
+  string name = 3;
+  optional string error = 4;
+}
+
+message RemoveTorrentRequest {
+  string hash = 1;
+  bool delete_data = 2;
+}
+
+message TorrentHashRequest {
+  string hash = 1;
+}
+
+message FilePriorityRequest {
+  string hash = 1;
+  uint32 file_index = 2;
+  uint32 priority = 3;
+}
+
+message SetLocationRequest {
+  string hash = 1;
+  string new_download_dir = 2;
+  bool move_existing_files = 3;
+}
+
+message RateLimitsRequest {
+  optional uint64 global_download_limit = 1;
+  optional uint64 global_upload_limit = 2;
+  optional string per_torrent_hash = 3;
+  optional uint64 torrent_download_limit = 4;
+  optional uint64 torrent_upload_limit = 5;
+}
+
+message CommandResponse {
+  bool success = 1;
+  optional string error = 2;
+}
+
+message SessionSettingsRequest {}
+
+message SessionSettingsResponse {
+  bool download_limit_enabled = 1;
+  uint64 download_limit_bytes = 2;
+  bool upload_limit_enabled = 3;
+  uint64 upload_limit_bytes = 4;
+
+  bool alt_speed_enabled = 5;
+  uint64 alt_speed_down_bytes = 6;
+  uint64 alt_speed_up_bytes = 7;
+  bool alt_speed_time_enabled = 8;
+  uint32 alt_speed_time_begin = 9;
+  uint32 alt_speed_time_end = 10;
+  uint32 alt_speed_time_days = 11;
+
+  bool download_queue_enabled = 12;
+  uint32 download_queue_size = 13;
+  bool seed_queue_enabled = 14;
+  uint32 seed_queue_size = 15;
+  uint32 max_active_torrents = 16;
+  bool queue_stalled_enabled = 17;
+  uint32 queue_stalled_minutes = 18;
+  bool seed_ratio_limited = 19;
+  double seed_ratio_limit = 20;
+  bool idle_seeding_limit_enabled = 21;
+  uint32 idle_seeding_limit_minutes = 22;
+
+  uint32 max_peers_per_torrent = 23;
+  uint32 max_global_peers = 24;
+  bool dht_enabled = 25;
+  bool pex_enabled = 26;
+  bool lsd_enabled = 27;
+  string encryption = 28;
+
+  string download_dir = 29;
+  optional string incomplete_dir = 30;
+  bool incomplete_dir_enabled = 31;
+  bool start_added_torrents = 32;
+  bool trash_original_torrent_files = 33;
+  bool is_alt_speed_active = 34;
+}
+
+message UpdateSessionSettingsRequest {
+  optional bool download_limit_enabled = 1;
+  optional uint64 download_limit_bytes = 2;
+  optional bool upload_limit_enabled = 3;
+  optional uint64 upload_limit_bytes = 4;
+
+  optional bool alt_speed_enabled = 5;
+  optional uint64 alt_speed_down_bytes = 6;
+  optional uint64 alt_speed_up_bytes = 7;
+  optional bool alt_speed_time_enabled = 8;
+  optional uint32 alt_speed_time_begin = 9;
+  optional uint32 alt_speed_time_end = 10;
+  optional uint32 alt_speed_time_days = 11;
+
+  optional bool download_queue_enabled = 12;
+  optional uint32 download_queue_size = 13;
+  optional bool seed_queue_enabled = 14;
+  optional uint32 seed_queue_size = 15;
+  optional uint32 max_active_torrents = 16;
+  optional bool queue_stalled_enabled = 17;
+  optional uint32 queue_stalled_minutes = 18;
+  optional bool seed_ratio_limited = 19;
+  optional double seed_ratio_limit = 20;
+  optional bool idle_seeding_limit_enabled = 21;
+  optional uint32 idle_seeding_limit_minutes = 22;
+
+  optional uint32 max_peers_per_torrent = 23;
+  optional uint32 max_global_peers = 24;
+  optional bool dht_enabled = 25;
+  optional bool pex_enabled = 26;
+  optional bool lsd_enabled = 27;
+  optional string encryption = 28;
+
+  optional string download_dir = 29;
+  optional string incomplete_dir = 30;
+  optional bool incomplete_dir_enabled = 31;
+  optional bool start_added_torrents = 32;
+  optional bool trash_original_torrent_files = 33;
+
+  optional uint32 peer_port = 34;
+  optional string rpc_listen_addr = 35;
+  optional string http_listen_addr = 36;
+}
+
+message UpdateSessionSettingsResponse {
+  bool success = 1;
+  repeated string warnings = 2;
+  optional string error = 3;
+}
+

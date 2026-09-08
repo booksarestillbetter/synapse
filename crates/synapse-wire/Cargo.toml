@@ -1,0 +1,18 @@
+[package]
+name = "synapse-wire"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "BitTorrent peer wire protocol (BEP3/BEP10) codec for the synapse rewrite. See doc/REWRITE_ROADMAP.md."
+
+[dependencies]
+bytes = { workspace = true }
+synapse-bencode = { path = "../synapse-bencode", version = "2.0.0" }
+thiserror = { workspace = true }
+hex = "0.4"
+tokio = { workspace = true, features = ["io-util"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }

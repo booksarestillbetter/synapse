@@ -1,60 +1,229 @@
-# TCP port used for peer connections
-port = 16493
+# Example synapse.toml — reference for every field synapse-config actually reads
+# (crates/synapse-config/src/lib.rs). Every field below is optional; anything you omit
+# falls back to the default shown in its comment, since every section is `#[serde(default)]`.
+#
+# Usage: `synapsed --config /path/to/synapse.toml`, or omit --config to use the platform
+# config directory's synapse.toml (`~/.config/synapse/synapse.toml` on Linux), or built-in
+# defaults if neither exists.
+#
+# NOTE: this replaces a stale, pre-rewrite example config that documented a schema
+# ([tracker]/[dht]/[net]/[peer]/[ip_filter] sections, top-level port/max_dl, an
+# [rpc].ssl_cert/.ssl_key/.allowed_origins WebSocket-RPC shape) none of which exists in the
+# current daemon. If you're looking at this after some future rewrite and it looks wrong
+# again, `synapse-config/src/lib.rs`'s `Config` struct is the source of truth — regenerate
+# this file from it rather than hand-editing around drift.
 
-# Maximum number of downloading torrents
-max_dl = 10
+# Top-level variables: You can define variables at the top of this file and interpolate
+# them anywhere below using `${var_name}`, or use environment variables `${ENV_VAR:-default}`.
+# Example:
+# data_root = "/data"
 
-[rpc]
-# TCP port used for RPC
-port = 8412
-# Whether or not RPC should listen on localhost
-# or 0.0.0.0
-local = true
-# Whether or not RPC should use auth
-# WARNING: If you do not use auth, synapse is still insecure, even running locally!
-auth = false
-# Password to use for auth.
-password = "hackme"
-# Optional SSL full certificate chain and key file (PEM only)
-ssl_cert = "./cert.pem"
-# If SSL key is encrypted, you will need to enter your password at start
-ssl_key = "./key.pem"
+# Top-level log verbosity — distinct from [logging].level below (both exist in the real
+# config; this one is the one that actually gates most `tracing` output today).
+# One of: "error", "warn", "info", "debug", "trace". Default: "info"
+log_level = "info"
 
-[tracker]
-# UDP port used for UDP tracker interaction
-port = 16362
-
-[dht]
-# UDP port used for DHT interaction
-port = 16309
-# Node to use for DHT bootstrapping.
-# If this is not specified, DHT will be disabled.
-bootstrap_node = "router.bittorrent.com:6881"
+[logging]
+# Same values as top-level log_level above.
+level = "info"
+# One of: "pretty", "json", "compact". Default: "pretty"
+format = "pretty"
+# Also write logs to this file, in addition to stdout. Default: unset (stdout only)
+# file = "/var/log/synapse/synapse.log"
+# Also stream logs to a syslog collector (RFC 5424) at this address. Default: unset (disabled)
+# syslog_addr = "127.0.0.1:514"
+# Use TCP instead of UDP for syslog. Default: false (UDP — RFC 5424's own default, and the
+# lower-overhead choice for a fire-and-forget log stream; set true only if delivery genuinely
+# needs to be reliable).
+# syslog_tcp = false
 
 [disk]
-# Location for storing session metadata
-session = "~/.local/share/synapse/"
-# Default download directory
-directory = "./"
+# Optional base root directory. When set, any relative paths below ("downloads", "session",
+# "incomplete", "watch") automatically resolve relative to root_dir.
+# Can also be set via SYNAPSE_ROOT_DIR or SYNAPSE_DATA_DIR environment variable.
+# Default: unset
+# root_dir = "/data"
 
-[net]
-# These max open limits should be set to be somewhat lower
-# than whatever the system ulimit is to accomodate for internal
-# fd's
-max_open_files = 500
-max_open_sockets = 400
-max_open_announces = 50
+# NOTE: All directories below (session_dir, download_dir, incomplete_dir, watch_dir)
+# are automatically created recursively on startup if they do not already exist.
 
-[peer]
-# Duration(in seconds) of inactivity before
-# a connection is eligible for forced pruning
-# when the max socket limit is reached
-prune_timeout = 15
+# Where resume/session state (one JSON file per torrent) is kept.
+# Default: the platform data directory (e.g. ~/.local/share/synapse/ on Linux) — set this
+# explicitly in a container, since the platform-default path assumes a real user profile.
+session_dir = "/var/lib/synapse/session"
+# Default directory downloaded files are written to when a torrent doesn't specify its own.
+# Default: "."
+download_dir = "/data/downloads"
+# Optional directory where unfinished downloads are stored until completion.
+# Default: unset (disabled)
+# incomplete_dir = "/data/incomplete"
+# incomplete_dir_enabled = false
+# Optional directory to watch for .torrent files to auto-ingest (checked every 3s; imported
+# files are moved to <watch_dir>/.imported/). Default: unset (disabled)
+# watch_dir = "/data/watch"
+# Cap on concurrently open file handles in the disk engine's file cache. Default: 500.
+# Soft cap, not a hard limit — see FileCache's doc comment in
+# crates/synapse-diskio/src/cache.rs for what happens beyond it (transparent eviction, no
+# errors). Raise it together with your process's fd ulimit if you do — this competes for the
+# same budget as [network].max_global_peers below.
+max_open_files = 1024
 
-[ip_filter]
-# Assign IP prefix filter rules. Valid value range is 0..255
-# 0 - block prefix
-# 1..255 - accept connections from/to prefix (in future value can set priority for prefix, but now it hasn't implemented yet)
-# by default all IPv4 and IPv6 address space allowed and assigned to value 127
-"::/0" = 127
-"0.0.0.0/0" = 127
+[network]
+# TCP/UDP port for inbound peer connections (dual-stack: binds [::] first, falls back to
+# 0.0.0.0 on IPv6-unavailable hosts). 0 lets the OS pick an ephemeral port. Default: 54345
+listen_port = 54345
+# Specific interfaces to bind to, by name or address. Default: [] (all interfaces)
+bind_interfaces = []
+# Default: true
+enable_ipv6 = true
+# Default: true — NOTE: as of this writing DHT bootstrap isn't actually wired into the
+# running daemon yet regardless of this flag (see CHANGELOG's "Known gaps" entry); newly
+# added torrents currently need inbound connections or a manually-connected peer to get
+# any data at all. Leave this set for forward-compatibility once that's built.
+enable_dht = true
+# Enable Peer Exchange (PEX, BEP 11). Default: true
+enable_pex = true
+# Enable Local Peer Discovery (LSD / LPD, BEP 14). Default: true
+enable_lsd = true
+# One of: "prefer_encrypted", "require_encrypted", "disabled". Default: "prefer_encrypted"
+encryption = "prefer_encrypted"
+# Default: 80
+max_peers_per_torrent = 80
+# Default: 2000
+max_global_peers = 2000
+
+[rpc]
+# Serves the primary Tonic gRPC control plane (synapse.v2 — see
+# docs/CLIENT_PROTOCOLS_AND_SDK.md). Default: true
+enabled = true
+# Bind to 0.0.0.0 (not just 127.0.0.1) if conduit or another client runs in a
+# different container/host — set auth_token below before doing that. Default: "127.0.0.1:50051"
+listen_addr = "0.0.0.0:50051"
+# Shared-secret bearer token — every gRPC call and every /api/v1/* REST route must send
+# `authorization: Bearer <token>` once this is set (see docs/CLIENT_PROTOCOLS_AND_SDK.md's
+# Authentication section). Default: unset (both control planes are open — fine for a
+# loopback-only bind, not for anything reachable off-host).
+# auth_token = "change-me-to-a-real-secret"
+
+[lifecycle]
+# What happens to a torrent's files once it finishes downloading. By default: nothing —
+# synapse leaves everything at [disk].download_dir and does no further placement. There are
+# three independent, optional ways to do more; pick at most one (running more than one at once
+# will genuinely place files in more than one location, which is rarely what you want):
+#
+#   1. auto_hardlink + staging_dir below — synapse hardlinks (same-filesystem only; copies
+#      across devices) the completed torrent into a fixed second directory tree. Good for a
+#      static "everything finished lands here" mirror; it can't route different torrents to
+#      different destinations based on content.
+#   2. [lifecycle.instructions] below — synapse asks a URL where each torrent should go and
+#      places it there. This is what you want if destinations vary by content (TV vs movies vs
+#      music, or per-tracker routing) — see docs/COMPLETION_INSTRUCTIONS.md for the full
+#      request/response contract, whether you're pointing this at conduit or your own server.
+#   3. post_script/copy_script below — hands off to an external script entirely; do whatever
+#      you want in it, including calling the same URL docs/COMPLETION_INSTRUCTIONS.md documents
+#      yourself if you'd rather not use synapse's built-in HTTP client for it.
+#
+# Automatically start newly added torrents. Default: true
+start_added_torrents = true
+# Delete the original .torrent file after successful ingestion. Default: false
+trash_original_torrent_files = false
+# Optional staging directory a completed torrent's files get hardlinked into. Only takes
+# effect if auto_hardlink is also true. Default: unset
+# staging_dir = "/data/staging"
+# Default: false
+auto_hardlink = false
+# Where the completed-torrent write-ahead log lives. Default: <disk.session_dir>/completed_wal.jsonl
+# wal_path = "/var/lib/synapse/session/completed_wal.jsonl"
+# Optional script run after a torrent completes (receives info-hash/name/path as args). Default: unset
+# post_script = "/etc/synapse/on-complete.sh"
+# copy_script = "/etc/synapse/on-copy.sh"
+
+[lifecycle.instructions]
+# "Ask a URL where this goes" completion hook — see docs/COMPLETION_INSTRUCTIONS.md for the
+# full contract (what synapse sends, what it expects back, failure/fallback behavior). This is
+# the in-process equivalent of conduit's generated Transmission hook scripts
+# (GET /api/sync/hook-script) — same two HTTP calls, made directly instead of via a shell
+# script. Default: false
+enabled = false
+# Conduit's base URL (or your own compatible server) — required if enabled. No default.
+# url = "http://127.0.0.1:4242"
+# Sent as `Authorization: Bearer <token>` if set. Optional — conduit's classify/notify-download
+# routes don't require it themselves today. Default: unset
+# token = "change-me-to-a-real-secret"
+# Identifies this daemon instance the way a Transmission node name would (shows up in
+# conduit's per-node media-directory overrides and event log). Default: "synapse"
+node_name = "synapse"
+# Default: 10
+timeout_secs = 10
+# Where to place files if the instructions call fails (URL unreachable, times out, errors).
+# Default: unset — leave files at their original download location rather than guessing.
+# fallback_dir = "/data/downloads"
+
+[privacy]
+# Default: true
+prefer_private_safe_defaults = true
+# Redact passkeys/tokens embedded in tracker URLs before they hit the logs. Default: true
+mask_passkeys_in_logs = true
+# Default: false
+disable_dht_globally = false
+
+[http_api]
+# Secondary, thinner REST + Swagger UI + /metrics surface for scripts/curl (see
+# docs/CLIENT_PROTOCOLS_AND_SDK.md section 2). Default: false
+enabled = true
+# Default: "127.0.0.1:8080"
+listen_addr = "0.0.0.0:8080"
+# Default: true
+cors_enabled = true
+
+[metrics]
+# Prometheus exposition on [http_api].listen_addr + this path — also requires
+# [http_api].enabled = true above, since it's served from the same Axum router.
+# Default: false
+enabled = true
+# Default: "/metrics"
+path = "/metrics"
+
+[queue]
+# Queue concurrency and automatic queue progression (Transmission parity)
+# Concurrency limits for active downloads and seeds
+download_queue_enabled = true
+download_queue_size = 5
+seed_queue_enabled = true
+seed_queue_size = 10
+max_active_torrents = 20
+
+# Stalled torrent detection (stalled downloads do not count against download_queue_size)
+queue_stalled_enabled = true
+queue_stalled_minutes = 1
+
+# Seeding auto-stop rules
+seed_ratio_limited = false
+seed_ratio_limit = 2.0
+idle_seeding_limit_enabled = false
+idle_seeding_limit_minutes = 30
+
+[bandwidth]
+# Global rate throttling.
+# Can be specified in pretty network bitrates (e.g. "50m", "1000m", "1g", "5g", "100kbps")
+# or raw integer bytes/sec. "0", "off", or "unlimited" disables throttling.
+# Suffixes:
+#   k / kbps / kbit  -> 1,000 bits/s (125 B/s)
+#   m / mbps / mbit  -> 1,000,000 bits/s (125,000 B/s; e.g. "50m" = 6.25 MB/s)
+#   g / gbps / gbit  -> 1,000,000,000 bits/s (125,000,000 B/s; e.g. "1g" = 125 MB/s, "5g" = 625 MB/s)
+download_limit_enabled = false
+download_limit = "50m"         # 50 Mbps (also accepts download_limit_bytes = 6250000)
+upload_limit_enabled = false
+upload_limit = "1000m"        # 1000 Mbps / 1 Gbps (also accepts upload_limit_bytes = 125000000)
+
+[bandwidth.alt_speed]
+# Turtle Mode / Alternative speed limits (in-flight toggle & scheduled timer)
+enabled = false
+download_limit = "5m"         # 5 Mbps (also accepts download_limit_bytes = 625000)
+upload_limit = "1m"           # 1 Mbps (also accepts upload_limit_bytes = 125000)
+time_enabled = false          # Auto-activate Turtle Mode during scheduled window
+time_begin_minutes = 540      # 09:00 AM (minutes from midnight)
+time_end_minutes = 1020       # 05:00 PM (minutes from midnight)
+time_days = 127               # Bitmask: Sun=1, Mon=2, Tue=4, Wed=8, Thu=16, Fri=32, Sat=64 (127=All)
+
+

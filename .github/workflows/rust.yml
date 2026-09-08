@@ -10,43 +10,62 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
+  test:
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v2
-    #caches all dependencies so you don't have to redownload/recompile everything from scratch
+    - uses: actions/checkout@v4
+
     - name: Rust Cache
-      uses: Swatinem/rust-cache@v1.3.0
+      uses: Swatinem/rust-cache@v2
 
     - name: Version of Rust and Cargo
       run: rustc --version && cargo --version
-             
-    - name: Install cargo-deb
-      uses: actions-rs/cargo@v1.0.1
-      with: 
-        command: install
-        args: cargo-deb
-      
+
     - name: Build
-      run: cargo build --locked --release --all -v
-      
-    - name: Package as deb file
-      uses: actions-rs/cargo@v1.0.1
+      run: cargo build --workspace --locked --verbose
+
+    - name: Test
+      run: cargo test --workspace --locked --verbose
+
+  security-audit:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+    - uses: rustsec/audit-check@v1.4.1
       with:
-        command: deb
-        args: --no-build -v          
-      
+        token: ${{ secrets.GITHUB_TOKEN }}
+
+  package:
+    runs-on: ubuntu-latest
+    needs: test
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Rust Cache
+      uses: Swatinem/rust-cache@v2
+
+    - name: Install cargo-deb
+      run: cargo install cargo-deb --locked
+
+    - name: Build
+      run: cargo build --locked --release --all --verbose
+
+    - name: Package as deb file
+      run: cargo deb --no-build --verbose
+
     - name: Upload Artifact Linux
-      uses: actions/upload-artifact@v2.2.4
+      uses: actions/upload-artifact@v4
       with:
         name: synapse_sycli
         path: |
           target/release/synapse
           target/release/sycli
-        
+
     - name: Upload Artifact Linux as .deb package
-      uses: actions/upload-artifact@v2.2.4
+      uses: actions/upload-artifact@v4
       with:
         name: synapse_deb
         path: target/debian/*.deb

@@ -1,0 +1,41 @@
+services:
+  synapse:
+    image: booksarestillbetter/synapse:${TAG:-latest}
+    container_name: synapse
+    restart: unless-stopped
+    # Host networking is the right default for a BitTorrent daemon specifically: the peer
+    # listen port is then exactly the port a router/firewall rule forwards, with no Docker NAT
+    # layer complicating inbound peer connections. Switch to a bridge network + explicit `ports:`
+    # below if you'd rather keep it isolated (you'll need to port-forward the peer port yourself).
+    network_mode: "host"
+    environment:
+      - PUID=${PUID:-1000}
+      - PGID=${PGID:-1000}
+      - TZ=${TZ:-UTC}
+      - SYNAPSE_CONFIG=/etc/synapse/synapse.toml
+    volumes:
+      # Config directory (auto-seeds a default synapse.toml here if missing)
+      - ${SYNAPSE_CONFIG_DIR:-./config}:/etc/synapse
+      # Session/state directory (resume data, encrypted session store)
+      - ${SYNAPSE_SESSION_DIR:-./session}:/var/lib/synapse
+      # Data directory — covers downloads, incomplete, and watch under one mount
+      - ${SYNAPSE_DATA_DIR:-./data}:/data
+      # Optional: a separate directory a front-end can watch for completed files (only used if
+      # you enable [lifecycle] staging/hardlinking or a completion webhook — see
+      # docs/COMPLETION_INSTRUCTIONS.md). Safe to leave unmounted otherwise.
+      - ${SYNAPSE_MEDIA_DIR:-./media}:/media
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    healthcheck:
+      test: [ "CMD-SHELL", "curl -fsS http://127.0.0.1:8085/api/v1/health 2>/dev/null || pidof synapsed >/dev/null || exit 1" ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+# To point a control-plane client at this instance: with host networking, connect to
+# 127.0.0.1:50051 (gRPC, [rpc].listen_addr's port in synapse.toml) or the machine's LAN address
+# if the client runs elsewhere, using the [rpc].auth_token value as the auth token if you've set
+# one (see docs/CLIENT_PROTOCOLS_AND_SDK.md's Authentication section — recommended once synapse
+# is reachable off-loopback).

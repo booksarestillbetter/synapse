@@ -1,0 +1,10 @@
+[package]
+name = "synapse-picker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Piece picker, bitfield, and choking algorithm for the synapse rewrite. See doc/REWRITE_ROADMAP.md."
+
+[dependencies]
+roaring = { workspace = true }

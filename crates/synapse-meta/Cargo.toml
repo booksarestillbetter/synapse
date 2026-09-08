@@ -1,0 +1,17 @@
+[package]
+name = "synapse-meta"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Torrent metadata (.torrent/magnet) parsing and piece/file layout for the synapse rewrite. See doc/REWRITE_ROADMAP.md."
+
+[dependencies]
+synapse-bencode = { path = "../synapse-bencode" }
+thiserror = { workspace = true }
+url = "2"
+rand = "0.8"
+sha1 = "0.10"
+sha2 = "0.10"
+serde = { version = "1", features = ["derive"] }
+parking_lot = "0.12"

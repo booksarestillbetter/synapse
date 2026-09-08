@@ -1,0 +1,21 @@
+[package]
+name = "synapse-diskio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Disk I/O backend for the synapse rewrite: a portable blocking-thread-pool engine plus an io_uring fast path on Linux. See doc/REWRITE_ROADMAP.md."
+
+[dependencies]
+tokio = { workspace = true }
+bytes = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = "0.6"
+rustix = { version = "0.38", features = ["fs"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "test-util"] }
+tempfile = "3"
