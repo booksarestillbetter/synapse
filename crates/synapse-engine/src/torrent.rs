@@ -1091,6 +1091,8 @@ impl Torrent {
             }
             s.ratio = if s.downloaded_bytes > 0 {
                 s.uploaded_bytes as f32 / s.downloaded_bytes as f32
+            } else if s.total_size > 0 && s.uploaded_bytes > 0 {
+                s.uploaded_bytes as f32 / s.total_size as f32
             } else {
                 0.0
             };

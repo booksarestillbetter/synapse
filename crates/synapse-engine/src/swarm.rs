@@ -243,6 +243,16 @@ pub struct SwarmStats {
     pub piece_size: u32,
 }
 
+/// Options for restoring historical swarm metrics and lifecycle state upon restart.
+#[derive(Debug, Clone, Default)]
+pub struct SwarmResumeOptions {
+    pub uploaded_bytes: u64,
+    pub downloaded_bytes: u64,
+    pub ratio: Option<f32>,
+    pub added_at: Option<i64>,
+    pub is_paused: bool,
+}
+
 #[derive(Clone)]
 pub struct ActiveActor {
     pub peer_event_tx: mpsc::Sender<PeerEvent>,
@@ -481,6 +491,10 @@ impl SwarmEngine {
 
     pub fn circuit_breaker(&self) -> &Arc<PeerCircuitBreaker> {
         &self.circuit_breaker
+    }
+
+    pub fn tracker_circuit_breaker(&self) -> &Arc<synapse_tracker::CanaryCircuitBreaker> {
+        self.announce_scheduler.announcer().tracker_breaker()
     }
 
     pub fn queue_manager(&self) -> &Arc<RwLock<QueueManager>> {
@@ -749,7 +763,10 @@ impl SwarmEngine {
                         let name_c = name_worker.clone();
                         let dl_dir_c = dl_dir_str.clone();
                         let raw_hex_c = raw_bencode_hex_worker.clone();
-                        let uploaded_bytes = stats_worker.read().uploaded_bytes;
+                        let (uploaded_bytes, current_ratio) = {
+                            let s = stats_worker.read();
+                            (s.uploaded_bytes, s.ratio)
+                        };
                         tokio::task::spawn_blocking(move || {
                             let bitfield_hex = bf_snapshot
                                 .map(|b| hex::encode(b.to_bitfield().as_bytes()))
@@ -765,6 +782,7 @@ impl SwarmEngine {
                                 downloaded_bytes: dl_bytes,
                                 added_at,
                                 is_paused: false,
+                                ratio: Some(current_ratio),
                                 magnet_uri: None,
                                 raw_bencode_hex: raw_hex_c,
                             };
@@ -930,23 +948,58 @@ impl SwarmEngine {
         download_dir: std::path::PathBuf,
         have: Option<&Bitfield>,
     ) -> Arc<TorrentHandle> {
+        self.add_torrent_with_resume(info, download_dir, have, None)
+    }
+
+    pub fn add_torrent_with_resume(
+        &self,
+        info: Arc<Info>,
+        download_dir: std::path::PathBuf,
+        have: Option<&Bitfield>,
+        resume: Option<SwarmResumeOptions>,
+    ) -> Arc<TorrentHandle> {
         let info_hash = info.hash;
 
         let total_size = info.total_len;
         let name = info.name.clone();
-        let added_at = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
+        let added_at = resume
+            .as_ref()
+            .and_then(|r| r.added_at)
+            .unwrap_or_else(|| {
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64
+            });
 
         let initial_progress = if let Some(h) = have {
             if h.is_complete() { 1.0 } else { (h.count_ones() as f32) / (info.pieces() as f32) }
         } else { 0.0 };
-        let initial_downloaded = ((initial_progress as f64) * (total_size as f64)) as u64;
+        let piece_downloaded = ((initial_progress as f64) * (total_size as f64)) as u64;
+        let downloaded_bytes = resume
+            .as_ref()
+            .map(|r| r.downloaded_bytes.max(piece_downloaded))
+            .unwrap_or(piece_downloaded);
+        let uploaded_bytes = resume.as_ref().map(|r| r.uploaded_bytes).unwrap_or(0);
+        let is_paused = resume.as_ref().map(|r| r.is_paused).unwrap_or(false);
+        let ratio = resume
+            .as_ref()
+            .and_then(|r| r.ratio)
+            .unwrap_or_else(|| {
+                if downloaded_bytes > 0 {
+                    uploaded_bytes as f32 / downloaded_bytes as f32
+                } else if total_size > 0 && uploaded_bytes > 0 {
+                    uploaded_bytes as f32 / total_size as f32
+                } else {
+                    0.0
+                }
+            });
 
         // Seeding swarms (100% complete) initialize in the Warm tier (standby seed)
         // without spawning an idle actor ticker task until peers connect.
-        let (initial_state, initial_tier) = if initial_progress >= 1.0 {
+        let (initial_state, initial_tier) = if is_paused {
+            (SwarmState::Stopped, SwarmTier::Cold)
+        } else if initial_progress >= 1.0 {
             (SwarmState::Seeding, SwarmTier::Warm)
         } else {
             let qm = self.queue_manager.read();
@@ -970,12 +1023,12 @@ impl SwarmEngine {
             tier: initial_tier,
             download_rate: 0,
             upload_rate: 0,
-            downloaded_bytes: initial_downloaded,
-            uploaded_bytes: 0,
+            downloaded_bytes,
+            uploaded_bytes,
             peers_connected: 0,
             peers_sending: 0,
             eta_seconds: 0,
-            ratio: 0.0,
+            ratio,
             download_dir: download_dir.to_string_lossy().to_string(),
             added_at,
             is_private: info.private,
@@ -985,28 +1038,31 @@ impl SwarmEngine {
             piece_size: info.piece_len,
         };
 
-        self.metrics.record_add(&initial_state, initial_tier, initial_downloaded, 0);
+        self.metrics.record_add(&initial_state, initial_tier, downloaded_bytes, uploaded_bytes);
 
         let stats = Arc::new(RwLock::new(initial_stats));
         let compressed_bitfield = Arc::new(RwLock::new(have.map(synapse_picker::RoaringBitfield::from_bitfield)));
 
-        if let Some(ref store) = self.session_store {
-            let bitfield_hex = have.map(|h| hex::encode(h.as_bytes())).unwrap_or_default();
-            let state = TorrentSessionState {
-                info_hash_hex: hex::encode(info_hash),
-                name: name.clone(),
-                download_dir: download_dir.to_string_lossy().to_string(),
-                bitfield_hex,
-                total_pieces: info.pieces() as usize,
-                total_size,
-                uploaded_bytes: 0,
-                downloaded_bytes: initial_downloaded,
-                added_at,
-                is_paused: false,
-                magnet_uri: None,
-                raw_bencode_hex: Some(hex::encode(info.to_torrent_bytes())),
-            };
-            let _ = store.save_torrent(&state);
+        if resume.is_none() {
+            if let Some(ref store) = self.session_store {
+                let bitfield_hex = have.map(|h| hex::encode(h.as_bytes())).unwrap_or_default();
+                let state = TorrentSessionState {
+                    info_hash_hex: hex::encode(info_hash),
+                    name: name.clone(),
+                    download_dir: download_dir.to_string_lossy().to_string(),
+                    bitfield_hex,
+                    total_pieces: info.pieces() as usize,
+                    total_size,
+                    uploaded_bytes,
+                    downloaded_bytes,
+                    added_at,
+                    is_paused,
+                    ratio: Some(ratio),
+                    magnet_uri: None,
+                    raw_bencode_hex: Some(hex::encode(info.to_torrent_bytes())),
+                };
+                let _ = store.save_torrent(&state);
+            }
         }
 
         let initial_availability = if initial_state == SwarmState::Seeding {
@@ -1044,14 +1100,16 @@ impl SwarmEngine {
             tx
         };
 
-        let is_dl = initial_state == SwarmState::Downloading;
-        self.announce_scheduler.register(
-            info_hash,
-            info,
-            stats,
-            peer_tx,
-            is_dl,
-        );
+        if !is_paused {
+            let is_dl = initial_state == SwarmState::Downloading;
+            self.announce_scheduler.register(
+                info_hash,
+                info,
+                stats,
+                peer_tx,
+                is_dl,
+            );
+        }
 
         handle
     }
@@ -1079,7 +1137,8 @@ impl SwarmEngine {
                         uploaded_bytes: s.uploaded_bytes,
                         downloaded_bytes: s.downloaded_bytes,
                         added_at: s.added_at,
-                        is_paused: matches!(s.tier, SwarmTier::Cold),
+                        is_paused: matches!(s.tier, SwarmTier::Cold) || s.state == SwarmState::Stopped,
+                        ratio: Some(s.ratio),
                         magnet_uri: None,
                         raw_bencode_hex: if h.info.has_piece_hashes() {
                             Some(hex::encode(h.info.to_torrent_bytes()))
@@ -1349,6 +1408,14 @@ impl SwarmEngine {
                 is_dl,
             );
             self.announce_scheduler.notify_resumed(info_hash);
+
+            if let Some(ref store) = self.session_store {
+                let hex_hash = hex::encode(info_hash);
+                if let Ok(Some(mut state)) = store.load_torrent(&hex_hash) {
+                    state.is_paused = false;
+                    let _ = store.save_torrent(&state);
+                }
+            }
             true
         } else {
             false
@@ -1433,10 +1500,18 @@ impl SwarmEngine {
 
                 if let Some(info) = info_result {
                     let have = state.to_bitfield();
-                    self.add_torrent(
+                    let resume_opts = SwarmResumeOptions {
+                        uploaded_bytes: state.uploaded_bytes,
+                        downloaded_bytes: state.downloaded_bytes,
+                        ratio: Some(state.effective_ratio()),
+                        added_at: Some(state.added_at),
+                        is_paused: state.is_paused,
+                    };
+                    self.add_torrent_with_resume(
                         Arc::new(info),
                         std::path::PathBuf::from(&state.download_dir),
                         have.as_ref(),
+                        Some(resume_opts),
                     );
                     restored += 1;
                 }

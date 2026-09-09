@@ -23,15 +23,17 @@ Synapse solves this by decoupling failure detection into two isolated, high-perf
 
 ## 2. The Circuit Breaker State Machine
 
-Both the tracker and peer circuit breakers implement a 3-state canary model:
+Both the tracker and peer circuit breakers implement a **4-state canary & progressive ramp-up model**:
 
 ```mermaid
 stateDiagram-v2
     [*] --> Healthy
     Healthy --> Tripped : Consecutive failures >= threshold (default: 3)
     Tripped --> HalfOpenCanary : Backoff duration elapsed (default: 30s)
-    HalfOpenCanary --> Healthy : Canary probe succeeds (resets backoff to initial)
-    HalfOpenCanary --> Tripped : Canary probe fails (doubles backoff up to max)
+    HalfOpenCanary --> Recovering : Canary probe succeeds (initiates ramp-up)
+    HalfOpenCanary --> Tripped : Canary probe fails (doubles backoff)
+    Recovering --> Healthy : Ramp-up window completes without errors
+    Recovering --> Tripped : Relapse failure during ramp-up (doubles backoff)
 ```
 
 ### State Definitions
@@ -40,7 +42,8 @@ stateDiagram-v2
 | :--- | :--- | :--- |
 | **`Healthy`** | Normal operation. All outbound dials and announces proceed unimpeded. Every failure increments a consecutive failure counter; any success resets it to 0. | Transitions to `Tripped` if `consecutive_failures >= failure_threshold`. |
 | **`Tripped`** | **Complete circuit cutoff**. Outbound dials or announce requests to this endpoint or tracker host are blocked immediately without touching the OS socket layer. | Transitions to `HalfOpenCanary` once `last_failure.elapsed() >= backoff_duration`. |
-| **`HalfOpenCanary`** | **Probe verification**. Exactly **one** canary connection or announce is permitted in-flight. All concurrent requests remain blocked waiting for the probe's outcome. | If canary succeeds: resets to `Healthy`.<br>If canary fails: returns to `Tripped`, doubling `backoff_duration` (`min(backoff * 2, max_backoff)`). |
+| **`HalfOpenCanary`** | **Probe verification**. Exactly **one** canary connection or announce is permitted in-flight. All concurrent requests remain blocked waiting for the probe's outcome. | If canary succeeds: transitions to `Recovering`.<br>If canary fails: returns to `Tripped`, doubling `backoff_duration` (`min(backoff * 2, max_backoff)`). |
+| **`Recovering`** | **Slow Restore & Progressive Ramp-Up**. Throttles throughput to the recovering host/endpoint via a gradual levee to prevent herd slamming: early phase (1 req / 3s), mid phase (1 req / 1s), late phase (3 req / s). | If ramp-up window (30s) and $\ge 5$ successes complete: promotes to `Healthy`.<br>If *any* failure occurs during recovery: **Fast Relapse Abort** immediately re-trips with doubled backoff. |
 
 ---
 
@@ -54,7 +57,8 @@ The tracker breaker operates on the **canonical hostname** extracted from announ
   - HTTP 500/502/503/504 responses
   - UDP connection handshake timeouts (BEP 15)
   - DNS resolution failures
-- **Single Canary Probe**: When the backoff window expires, Synapse permits only **one** torrent to dispatch an announce request to that host. If the canary succeeds, all other torrents are cleared to resume normal scheduled announces.
+- **Single Canary Probe**: When the backoff window expires, Synapse permits only **one** torrent to dispatch an announce request to that host.
+- **Gradual Ramp-Up & Queue Dispersion**: When the canary succeeds, the host enters `Recovering`. Torrents waiting for this tracker are not blasted simultaneously; instead, excess announces are smoothly scattered across 5–15 second randomized intervals in the min-heap scheduler, preventing thundering-herd spikes on fragile trackers.
 
 ---
 

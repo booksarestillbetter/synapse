@@ -395,17 +395,24 @@ async fn main() -> std::process::ExitCode {
     }
 
     // Periodically reconciles queue concurrency, auto-stops seeding torrents that reached ratio
-    // or duration limits, and enforces alt-speed (turtle mode) schedule transitions.
+    // or duration limits, enforces alt-speed (turtle mode) schedule transitions, and checkpoints
+    // active swarm stats (uploaded/downloaded/ratio) to the session database every 30 seconds.
     {
         let swarm_reconciler = swarm.clone();
         let mut shutdown_rx = shutdown_rx.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_secs(1));
+            let mut flush_counter: usize = 0;
             loop {
                 tokio::select! {
                     _ = ticker.tick() => {
                         swarm_reconciler.recalculate_effective_rate_limits();
                         swarm_reconciler.reconcile_queue();
+                        flush_counter += 1;
+                        if flush_counter >= 30 {
+                            flush_counter = 0;
+                            swarm_reconciler.flush_session().await;
+                        }
                     }
                     _ = shutdown_rx.changed() => {
                         if *shutdown_rx.borrow() {

@@ -25,6 +25,8 @@ pub struct TorrentSessionState {
     pub added_at: i64,
     pub is_paused: bool,
     #[serde(default)]
+    pub ratio: Option<f32>,
+    #[serde(default)]
     pub magnet_uri: Option<String>,
     #[serde(default)]
     pub raw_bencode_hex: Option<String>,
@@ -45,6 +47,18 @@ impl TorrentSessionState {
     pub fn to_bitfield(&self) -> Option<Bitfield> {
         let bytes = hex::decode(&self.bitfield_hex).ok()?;
         Bitfield::from_bytes(&bytes, self.total_pieces)
+    }
+
+    pub fn effective_ratio(&self) -> f32 {
+        if let Some(r) = self.ratio {
+            r
+        } else if self.downloaded_bytes > 0 {
+            self.uploaded_bytes as f32 / self.downloaded_bytes as f32
+        } else if self.total_size > 0 && self.uploaded_bytes > 0 {
+            self.uploaded_bytes as f32 / self.total_size as f32
+        } else {
+            0.0
+        }
     }
 }
 

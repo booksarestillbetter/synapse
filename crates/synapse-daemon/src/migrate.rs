@@ -276,6 +276,14 @@ pub fn migrate_transmission(
         };
 
         for entry in &found_entries {
+            let ratio = if entry.downloaded_bytes > 0 {
+                Some(entry.uploaded_bytes as f32 / entry.downloaded_bytes as f32)
+            } else if entry.total_size > 0 && entry.uploaded_bytes > 0 {
+                Some(entry.uploaded_bytes as f32 / entry.total_size as f32)
+            } else {
+                Some(0.0)
+            };
+
             let session_state = TorrentSessionState {
                 info_hash_hex: entry.info_hash_hex.clone(),
                 name: entry.name.clone(),
@@ -287,6 +295,7 @@ pub fn migrate_transmission(
                 downloaded_bytes: entry.downloaded_bytes,
                 added_at: entry.added_at,
                 is_paused: entry.is_paused,
+                ratio,
                 magnet_uri: None,
                 raw_bencode_hex: Some(hex::encode(&entry.raw_bencode)),
             };

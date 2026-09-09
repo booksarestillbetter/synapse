@@ -43,8 +43,8 @@ pub use ratelimit::TokenBucket;
 pub use session::{SessionStore, TorrentSessionState};
 pub use settings::{current_time_mins_and_day, is_in_alt_speed_schedule, DynamicSessionSettings, SessionSettingsUpdate};
 pub use swarm::{
-    EngineMetricsSnapshot, GlobalEngineMetrics, SwarmEngine, SwarmState, SwarmStateFilter,
-    SwarmStats, SwarmTier, TorrentHandle,
+    EngineMetricsSnapshot, GlobalEngineMetrics, SwarmEngine, SwarmResumeOptions, SwarmState,
+    SwarmStateFilter, SwarmStats, SwarmTier, TorrentHandle,
 };
 pub use torrent::{PeerSnapshot, Torrent, TorrentConfig};
 pub use utp::{LedbatCongestionController, UtpConnection, UtpConnectionState};

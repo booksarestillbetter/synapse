@@ -3,6 +3,27 @@
 All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [2.2.2] - 2026-09-09
+
+### Added
+
+- **Circuit Breaker Slow Restore & Ramp-Up (`synapse-tracker::breaker`, `synapse-engine::circuit_breaker`, `synapse-engine::announcer`)**:
+  - Implemented a 4-state circuit breaker lifecycle: `Healthy`, `Tripped`, `HalfOpenCanary`, and `Recovering`.
+  - Added progressive recovery levee rate pacing: after a successful canary probe, requests to recovering hosts/endpoints are paced through a 30-second ramp window (1 req / 3s for early stage, 1 req / 1s for mid stage, 3 req / s for late stage) before full graduation to `Healthy` after $\ge 5$ consecutive successes.
+  - Fast relapse abort: any failure during recovery immediately aborts back to `Tripped` with doubled exponential backoff.
+  - Announce scheduler anti-herd dispersion: when trackers are tripped or rate-limited by the circuit breaker, announce jobs are staggered with randomized jitter (5–15s delay) to prevent stampeding and flap-trip-flap-trip oscillation across swarms.
+  - Published comprehensive documentation in `docs/CIRCUIT_BREAKER.md`.
+- **Swarm Statistics & Paused State Persistence Across Restarts (`synapse-engine`, `synapsed`)**:
+  - Preserved historical swarm metrics across daemon restarts: `uploaded_bytes`, `downloaded_bytes`, `ratio`, `added_at` timestamp, and `is_paused` lifecycle state.
+  - Resolved session restore overwriting: `SwarmEngine::restore_session` now passes restored state via `add_torrent_with_resume`, preventing in-memory zero resets and eliminating the initial redundant database overwrite.
+  - Added `ratio` field to `TorrentSessionState` with backwards-compatible serde deserialization and dynamic fallback calculation for legacy session files.
+  - Added 30-second periodic session checkpointing in the daemon maintenance loop so long-running seeding swarms persist upload metrics continuously without awaiting graceful shutdown.
+
+### Fixed
+
+- **Ratio calculation for initial seeders**: fall back to `uploaded_bytes / total_size` when seeding from existing local files with 0 downloaded bytes.
+- **Paused torrent lifecycle on restart**: paused torrents now cleanly restore into `SwarmState::Stopped` / `SwarmTier::Cold` without prematurely registering with the announce scheduler until resumed.
+
 ## [2.2.1] - 2026-09-09
 
 ### Fixed

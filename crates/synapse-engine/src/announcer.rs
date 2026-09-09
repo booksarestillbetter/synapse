@@ -16,7 +16,7 @@ use tokio::sync::{mpsc, Notify, Semaphore};
 use tracing::{debug, info, warn};
 
 use synapse_meta::Info;
-use synapse_tracker::{AnnounceRequest, Event};
+use synapse_tracker::{AnnounceRequest, CanaryCircuitBreaker, Event};
 
 use crate::circuit_breaker::PeerCircuitBreaker;
 use crate::peer::{connect, PeerEvent};
@@ -47,6 +47,7 @@ pub struct Announcer {
     listen_port: Arc<RwLock<u16>>,
     tracker_key: u32,
     circuit_breaker: Arc<PeerCircuitBreaker>,
+    tracker_breaker: Arc<CanaryCircuitBreaker>,
 }
 
 impl Announcer {
@@ -55,12 +56,31 @@ impl Announcer {
         listen_port: Arc<RwLock<u16>>,
         circuit_breaker: Arc<PeerCircuitBreaker>,
     ) -> Self {
+        Self::with_tracker_breaker(
+            our_peer_id,
+            listen_port,
+            circuit_breaker,
+            Arc::new(CanaryCircuitBreaker::default()),
+        )
+    }
+
+    pub fn with_tracker_breaker(
+        our_peer_id: [u8; 20],
+        listen_port: Arc<RwLock<u16>>,
+        circuit_breaker: Arc<PeerCircuitBreaker>,
+        tracker_breaker: Arc<CanaryCircuitBreaker>,
+    ) -> Self {
         Self {
             our_peer_id,
             listen_port,
             tracker_key: rand::random(),
             circuit_breaker,
+            tracker_breaker,
         }
+    }
+
+    pub fn tracker_breaker(&self) -> &Arc<CanaryCircuitBreaker> {
+        &self.tracker_breaker
     }
 
     /// Extracts all unique announce and fallback tracker URLs for an info hash.
@@ -129,16 +149,33 @@ impl Announcer {
             let req_clone = req.clone();
             let label_c = torrent_label.clone();
             let circuit_breaker = self.circuit_breaker.clone();
+            let tracker_breaker = self.tracker_breaker.clone();
             tasks.push(async move {
                 let mut peers = Vec::new();
                 let mut interval = None;
+                let url_str = tracker_url.to_string();
+
+                if !tracker_breaker.can_announce(&url_str) {
+                    let rep = TrackerReport {
+                        url: url_str,
+                        status: "CircuitBroken".into(),
+                        seeders: 0,
+                        leechers: 0,
+                        next_announce_in: 30,
+                        failure_reason: Some("Tracker circuit broken or cooling down in recovery ramp-up".into()),
+                        is_circuit_broken: true,
+                    };
+                    return (peers, interval, rep);
+                }
+
                 let (peers_res, interval_res, report) = match tracker_url.scheme() {
                     "udp" => {
                         let host = match tracker_url.host_str() {
                             Some(h) => h.to_string(),
                             None => {
+                                tracker_breaker.record_failure(&url_str);
                                 let rep = TrackerReport {
-                                    url: tracker_url.to_string(),
+                                    url: url_str,
                                     status: "Error".into(),
                                     seeders: 0,
                                     leechers: 0,
@@ -177,6 +214,7 @@ impl Announcer {
                                     .await
                                     {
                                         Ok(Ok(resp)) => {
+                                            tracker_breaker.record_success(&url_str);
                                             info!(
                                                 "[{}] UDP tracker {} returned {} seeders, {} leechers, {} peers (interval: {}s)",
                                                 label_c,
@@ -204,6 +242,7 @@ impl Announcer {
                                             (peers, interval, rep)
                                         }
                                         Ok(Err(e)) => {
+                                            tracker_breaker.record_failure(&url_str);
                                             warn!(
                                                 "[{}] UDP tracker {} announce failed: {}",
                                                 label_c, tracker_url, e
@@ -220,6 +259,7 @@ impl Announcer {
                                             (peers, interval, rep)
                                         }
                                         Err(_) => {
+                                            tracker_breaker.record_failure(&url_str);
                                             warn!(
                                                 "[{}] UDP tracker {} announce timed out",
                                                 label_c, tracker_url
@@ -237,6 +277,7 @@ impl Announcer {
                                         }
                                     }
                                 } else {
+                                    tracker_breaker.record_failure(&url_str);
                                     let rep = TrackerReport {
                                         url: tracker_url.to_string(),
                                         status: "Error".into(),
@@ -250,6 +291,7 @@ impl Announcer {
                                 }
                             }
                             Ok(Err(e)) => {
+                                tracker_breaker.record_failure(&url_str);
                                 let rep = TrackerReport {
                                     url: tracker_url.to_string(),
                                     status: "Error".into(),
@@ -262,6 +304,7 @@ impl Announcer {
                                 (peers, interval, rep)
                             }
                             Err(_) => {
+                                tracker_breaker.record_failure(&url_str);
                                 let rep = TrackerReport {
                                     url: tracker_url.to_string(),
                                     status: "Timeout".into(),
@@ -283,6 +326,7 @@ impl Announcer {
                         .await
                         {
                             Ok(Ok(resp)) => {
+                                tracker_breaker.record_success(&url_str);
                                 info!(
                                     "[{}] HTTP/HTTPS tracker {} returned {} seeders, {} leechers, {} peers (interval: {}s)",
                                     label_c,
@@ -310,6 +354,7 @@ impl Announcer {
                                 (peers, interval, rep)
                             }
                             Ok(Err(e)) => {
+                                tracker_breaker.record_failure(&url_str);
                                 warn!(
                                     "[{}] HTTP/HTTPS tracker {} error: {}",
                                     label_c, tracker_url, e
@@ -326,6 +371,7 @@ impl Announcer {
                                 (peers, interval, rep)
                             }
                             Err(_) => {
+                                tracker_breaker.record_failure(&url_str);
                                 warn!(
                                     "[{}] HTTP/HTTPS tracker {} timed out after 10s",
                                     label_c, tracker_url
@@ -568,6 +614,11 @@ impl AnnounceScheduler {
     /// Sets the dynamic peer event router used to awaken dormant Warm/Cold swarms when tracker peers are found.
     pub fn set_peer_router(&self, router: PeerEventRouter) {
         *self.peer_router.write() = Some(router);
+    }
+
+    /// Returns a reference to the inner Announcer instance.
+    pub fn announcer(&self) -> &Arc<Announcer> {
+        &self.announcer
     }
 
     /// Registers a new or restored torrent in the centralized announce queue.
@@ -997,7 +1048,12 @@ impl AnnounceScheduler {
 
                 let is_starved = is_dl && (current_connected < 8 || current_sending == 0);
 
-                let (delay_secs, new_failures) = if (peer_count > 0 || tracker_interval > 0) && !reports.is_empty() {
+                let all_cb = !reports.is_empty() && reports.iter().all(|r| r.is_circuit_broken);
+                let (delay_secs, new_failures) = if all_cb && peer_count == 0 {
+                    // Stagger retry during circuit breaker cooling/ramp-up: 5 to 15 seconds randomized jitter
+                    let stagger = rand::Rng::gen_range(&mut rand::thread_rng(), 5..=15);
+                    (stagger as u64, failures)
+                } else if (peer_count > 0 || tracker_interval > 0) && !reports.is_empty() {
                     let base = if is_starved {
                         if peer_count == 0 { 30 } else { 60 }
                     } else if tracker_interval > 0 {
