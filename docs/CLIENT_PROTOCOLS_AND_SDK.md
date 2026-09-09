@@ -64,6 +64,11 @@ service SynapseControl {
   rpc GetSessionStats(SessionStatsRequest) returns (SessionStatsUpdate);
   rpc GetSessionSettings(SessionSettingsRequest) returns (SessionSettingsResponse);
   rpc UpdateSessionSettings(UpdateSessionSettingsRequest) returns (UpdateSessionSettingsResponse);
+
+  // Capability negotiation & circuit breaker control -- see docs/CIRCUIT_BREAKER.md §6.
+  rpc GetCapabilities(Empty) returns (CapabilitiesResponse);
+  rpc ListCircuitBreakers(Empty) returns (CircuitBreakerListResponse);
+  rpc ForceCircuitBreakerAction(CircuitBreakerActionRequest) returns (CommandResponse);
 }
 
 enum TorrentState {
@@ -368,7 +373,7 @@ Point any web browser to `http://<host>:<port>/` (e.g. `http://localhost:8080/`)
 | Method | Path | Description | Request Body | Response |
 |---|---|---|---|---|
 | `GET` | `/` | Web Client HTML | None | `text/html` |
-| `GET` | `/api/v1/health` | Health check & version | None | `{"status":"ok","version":"2.2.1"}` |
+| `GET` | `/api/v1/health` | Health check, version & feature capabilities | None | `{"status":"ok","version":"2.2.2","features":["tracker_circuit_breaker_v1"]}` |
 | `GET` | `/api/v1/session` | Full dynamic session settings, bitrates & turtle state | None | `{"download_limit_pretty":"50 Mbps","alt_speed_enabled":false,...}` |
 | `PATCH` | `/api/v1/session` | In-flight session settings update (accepts "50m", "1g", etc.) | JSON object with desired updates | `{"success":true,"warnings":[]}` |
 | `GET` | `/api/v1/session/stats` | Global throughput & swarm counts | None | `{"total_torrents":10,"download_rate":0,"upload_rate":0,...}` |
@@ -382,6 +387,9 @@ Point any web browser to `http://<host>:<port>/` (e.g. `http://localhost:8080/`)
 | `POST` | `/api/v1/torrents/{info_hash}/resume` | Resume torrent swarm | None | `{"success":true,"message":"..."}` |
 | `POST` | `/api/v1/torrents/{info_hash}/recheck` | Trigger piece integrity verification | None | `{"success":true,"message":"..."}` |
 | `POST` | `/api/v1/torrents/{info_hash}/location` | Move torrent data directory | `{"location":"/new/path"}` | `{"success":true,"message":"..."}` |
+| `GET` | `/api/v1/circuit-breakers` | List live tracker circuit breaker status (see docs/CIRCUIT_BREAKER.md §6) | None | `[{"host":"tracker.example.org","state":"recovering","recovery_progress_pct":41.7,...}]` |
+| `POST` | `/api/v1/circuit-breakers/{host}/trip` | Force-trip a tracker's circuit breaker | None | `{"success":true,"message":"..."}` |
+| `POST` | `/api/v1/circuit-breakers/{host}/reset` | Force-reset a tracker's circuit breaker | None | `{"success":true,"message":"..."}` |
 
 ### 2.4 OpenAPI 3.1 Specification & Interactive Swagger UI
 - **Swagger UI Browser Interface**: `http://127.0.0.1:8080/swagger-ui`

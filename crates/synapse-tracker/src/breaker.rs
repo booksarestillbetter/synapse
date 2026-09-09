@@ -4,7 +4,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CircuitState {
     Healthy,
     Tripped,
@@ -253,6 +254,72 @@ impl CanaryCircuitBreaker {
         let host = Self::extract_host(tracker_url);
         self.hosts.read().get(&host).cloned().unwrap_or_default()
     }
+
+    /// Snapshot of every host this breaker is currently tracking, keyed by lowercased
+    /// hostname (the same key space `can_announce`/`record_success`/`record_failure` use).
+    pub fn all_hosts(&self) -> Vec<(String, HostCircuitInfo)> {
+        self.hosts
+            .read()
+            .iter()
+            .map(|(host, info)| (host.clone(), info.clone()))
+            .collect()
+    }
+
+    /// Forces a host's breaker into `Tripped`, as if it had just failed `failure_threshold`
+    /// consecutive times. Used for manual/administrative overrides (e.g. from an external
+    /// control-plane client).
+    pub fn force_trip(&self, host: &str) {
+        let host = host.to_lowercase();
+        let mut map = self.hosts.write();
+        let entry = map.entry(host.clone()).or_default();
+        entry.state = CircuitState::Tripped;
+        entry.consecutive_failures = self.failure_threshold.max(entry.consecutive_failures);
+        entry.last_failure = Some(Instant::now());
+        entry.backoff_duration = self.initial_backoff;
+        entry.canary_in_flight = false;
+        entry.recovery_started_at = None;
+        entry.consecutive_successes = 0;
+        warn!("Tracker host {} force-tripped via manual override.", host);
+    }
+
+    /// Clears a single host's breaker state entirely, returning it to `Healthy` on the
+    /// next check. Used for manual/administrative overrides.
+    pub fn force_reset(&self, host: &str) {
+        let host = host.to_lowercase();
+        self.hosts.write().remove(&host);
+        info!("Tracker host {} circuit breaker force-reset via manual override.", host);
+    }
+
+    /// The configured recovery ramp window, for callers deriving a recovery-progress
+    /// percentage from a `HostCircuitInfo` snapshot's `recovery_started_at`.
+    pub fn recovery_duration(&self) -> Duration {
+        self.recovery_duration
+    }
+
+    /// Derives a 0-100 recovery-progress percentage from a status snapshot, or `None`
+    /// if the host isn't currently `Recovering`.
+    pub fn recovery_progress_pct(&self, info: &HostCircuitInfo) -> Option<f32> {
+        if info.state != CircuitState::Recovering {
+            return None;
+        }
+        let started_at = info.recovery_started_at?;
+        let elapsed = started_at.elapsed().as_secs_f32();
+        let total = self.recovery_duration.as_secs_f32().max(0.001);
+        Some((elapsed / total * 100.0).clamp(0.0, 100.0))
+    }
+
+    /// Derives remaining backoff time in milliseconds from a status snapshot, or `0` if
+    /// the host isn't currently `Tripped` (or has no recorded failure yet).
+    pub fn backoff_remaining_ms(&self, info: &HostCircuitInfo) -> u64 {
+        if info.state != CircuitState::Tripped {
+            return 0;
+        }
+        let Some(last_failure) = info.last_failure else {
+            return 0;
+        };
+        let elapsed = last_failure.elapsed();
+        info.backoff_duration.saturating_sub(elapsed).as_millis() as u64
+    }
 }
 
 #[cfg(test)]
@@ -330,5 +397,62 @@ mod tests {
         let status = cb.get_host_status(tracker_url);
         assert_eq!(status.state, CircuitState::Tripped);
         assert_eq!(status.backoff_duration, Duration::from_millis(100)); // 50ms * 2
+    }
+
+    #[test]
+    fn test_all_hosts_lists_every_tracked_host() {
+        let cb = CanaryCircuitBreaker::new(3, Duration::from_millis(50), Duration::from_millis(500));
+        cb.record_failure("http://tracker-a.org/announce");
+        cb.record_failure("http://tracker-b.org/announce");
+
+        let hosts = cb.all_hosts();
+        let host_names: Vec<&str> = hosts.iter().map(|(h, _)| h.as_str()).collect();
+        assert!(host_names.contains(&"tracker-a.org"));
+        assert!(host_names.contains(&"tracker-b.org"));
+        assert_eq!(hosts.len(), 2);
+    }
+
+    #[test]
+    fn test_force_trip_and_force_reset() {
+        let cb = CanaryCircuitBreaker::new(3, Duration::from_millis(50), Duration::from_millis(500));
+        let tracker_url = "http://tracker.override.org/announce";
+
+        // Healthy by default
+        assert!(cb.can_announce(tracker_url));
+
+        cb.force_trip("tracker.override.org");
+        assert_eq!(cb.get_host_status(tracker_url).state, CircuitState::Tripped);
+        assert!(!cb.can_announce(tracker_url));
+
+        cb.force_reset("tracker.override.org");
+        assert_eq!(cb.get_host_status(tracker_url).state, CircuitState::Healthy);
+        assert!(cb.can_announce(tracker_url));
+    }
+
+    #[test]
+    fn test_recovery_progress_and_backoff_remaining_derivation() {
+        let cb = CanaryCircuitBreaker::new(3, Duration::from_millis(100), Duration::from_millis(1000))
+            .with_recovery_duration(Duration::from_millis(200));
+        let tracker_url = "http://tracker.derived.org/announce";
+
+        // Tripped: backoff_remaining_ms should be close to the full initial backoff.
+        cb.record_failure(tracker_url);
+        cb.record_failure(tracker_url);
+        cb.record_failure(tracker_url);
+        let status = cb.get_host_status(tracker_url);
+        assert_eq!(status.state, CircuitState::Tripped);
+        let remaining = cb.backoff_remaining_ms(&status);
+        assert!(remaining > 0 && remaining <= 100);
+        assert_eq!(cb.recovery_progress_pct(&status), None);
+
+        // Recovering: recovery_progress_pct should be Some and increase over time.
+        std::thread::sleep(Duration::from_millis(110));
+        assert!(cb.can_announce(tracker_url));
+        cb.record_success(tracker_url);
+        let status = cb.get_host_status(tracker_url);
+        assert_eq!(status.state, CircuitState::Recovering);
+        assert_eq!(cb.backoff_remaining_ms(&status), 0);
+        let pct = cb.recovery_progress_pct(&status).expect("should be Some while Recovering");
+        assert!((0.0..=100.0).contains(&pct));
     }
 }

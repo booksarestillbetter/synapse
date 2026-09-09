@@ -177,6 +177,26 @@ fn swarm_stats_to_summary(s: &synapse_engine::SwarmStats) -> TorrentSummary {
     }
 }
 
+fn circuit_state_to_proto(state: synapse_tracker::CircuitState) -> CircuitBreakerState {
+    match state {
+        synapse_tracker::CircuitState::Healthy => CircuitBreakerState::CbHealthy,
+        synapse_tracker::CircuitState::Tripped => CircuitBreakerState::CbTripped,
+        synapse_tracker::CircuitState::HalfOpenCanary => CircuitBreakerState::CbHalfOpenCanary,
+        synapse_tracker::CircuitState::Recovering => CircuitBreakerState::CbRecovering,
+    }
+}
+
+fn host_status_to_proto(host: String, breaker: &synapse_tracker::CanaryCircuitBreaker, info: synapse_tracker::HostCircuitInfo) -> CircuitBreakerStatus {
+    CircuitBreakerStatus {
+        host,
+        state: circuit_state_to_proto(info.state) as i32,
+        consecutive_successes: info.consecutive_successes,
+        consecutive_failures: info.consecutive_failures,
+        backoff_remaining_ms: breaker.backoff_remaining_ms(&info),
+        recovery_progress_pct: breaker.recovery_progress_pct(&info),
+    }
+}
+
 /// `None` when nothing actually changed — callers use this to avoid emitting a no-op delta
 /// every sync tick for a torrent that's genuinely idle (e.g. fully seeded, no peers).
 fn diff_summary(old: &TorrentSummary, new: &TorrentSummary) -> Option<TorrentDelta> {
@@ -441,6 +461,8 @@ impl SynapseControl for SynapseService {
                                 next_announce_in: rep.next_announce_in,
                                 failure_reason: rep.failure_reason,
                                 is_circuit_broken: rep.is_circuit_broken,
+                                cb_state: rep.cb_state.map(circuit_state_to_proto).map(|s| s as i32),
+                                recovery_progress_pct: rep.recovery_progress_pct,
                             });
                         }
 
@@ -911,6 +933,53 @@ impl SynapseControl for SynapseService {
         Ok(Response::new(UpdateSessionSettingsResponse {
             success: true,
             warnings,
+            error: None,
+        }))
+    }
+
+    async fn get_capabilities(
+        &self,
+        _request: Request<Empty>,
+    ) -> Result<Response<CapabilitiesResponse>, Status> {
+        Ok(Response::new(CapabilitiesResponse {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            features: vec!["tracker_circuit_breaker_v1".to_string()],
+        }))
+    }
+
+    async fn list_circuit_breakers(
+        &self,
+        _request: Request<Empty>,
+    ) -> Result<Response<CircuitBreakerListResponse>, Status> {
+        let Some(ref engine) = self.swarm_engine else {
+            return Ok(Response::new(CircuitBreakerListResponse { breakers: vec![] }));
+        };
+        let breaker = engine.tracker_circuit_breaker();
+        let breakers = breaker
+            .all_hosts()
+            .into_iter()
+            .map(|(host, info)| host_status_to_proto(host, breaker, info))
+            .collect();
+        Ok(Response::new(CircuitBreakerListResponse { breakers }))
+    }
+
+    async fn force_circuit_breaker_action(
+        &self,
+        request: Request<CircuitBreakerActionRequest>,
+    ) -> Result<Response<CommandResponse>, Status> {
+        self.verify_auth(&request)?;
+        let Some(ref engine) = self.swarm_engine else {
+            return Err(Status::unavailable("SwarmEngine not configured"));
+        };
+        let req = request.into_inner();
+        let breaker = engine.tracker_circuit_breaker();
+        match circuit_breaker_action_request::Action::try_from(req.action) {
+            Ok(circuit_breaker_action_request::Action::Trip) => breaker.force_trip(&req.host),
+            Ok(circuit_breaker_action_request::Action::Reset) => breaker.force_reset(&req.host),
+            Err(_) => return Err(Status::invalid_argument("unknown circuit breaker action")),
+        }
+        Ok(Response::new(CommandResponse {
+            success: true,
             error: None,
         }))
     }

@@ -40,6 +40,11 @@ pub struct TrackerReport {
     pub next_announce_in: i64,
     pub failure_reason: Option<String>,
     pub is_circuit_broken: bool,
+    /// Circuit breaker state for this tracker's host, derived from `CanaryCircuitBreaker`
+    /// at report-build time (not stored on the report while it's cached in swarm metadata).
+    pub cb_state: Option<synapse_tracker::CircuitState>,
+    /// 0-100, only `Some` while `cb_state` is `Recovering`.
+    pub recovery_progress_pct: Option<f32>,
 }
 
 pub struct Announcer {
@@ -164,6 +169,8 @@ impl Announcer {
                         next_announce_in: 30,
                         failure_reason: Some("Tracker circuit broken or cooling down in recovery ramp-up".into()),
                         is_circuit_broken: true,
+                        cb_state: None,
+                        recovery_progress_pct: None,
                     };
                     return (peers, interval, rep);
                 }
@@ -182,6 +189,8 @@ impl Announcer {
                                     next_announce_in: 300,
                                     failure_reason: Some("Missing host in tracker URL".into()),
                                     is_circuit_broken: false,
+                                    cb_state: None,
+                                    recovery_progress_pct: None,
                                 };
                                 return (peers, interval, rep);
                             }
@@ -238,6 +247,8 @@ impl Announcer {
                                                 next_announce_in: resp.interval as i64,
                                                 failure_reason: None,
                                                 is_circuit_broken: is_cb,
+                                                cb_state: None,
+                                                recovery_progress_pct: None,
                                             };
                                             (peers, interval, rep)
                                         }
@@ -255,6 +266,8 @@ impl Announcer {
                                                 next_announce_in: 300,
                                                 failure_reason: Some(e.to_string()),
                                                 is_circuit_broken: is_cb,
+                                                cb_state: None,
+                                                recovery_progress_pct: None,
                                             };
                                             (peers, interval, rep)
                                         }
@@ -272,6 +285,8 @@ impl Announcer {
                                                 next_announce_in: 300,
                                                 failure_reason: Some("Tracker timed out after 5s".into()),
                                                 is_circuit_broken: is_cb,
+                                                cb_state: None,
+                                                recovery_progress_pct: None,
                                             };
                                             (peers, interval, rep)
                                         }
@@ -286,6 +301,8 @@ impl Announcer {
                                         next_announce_in: 300,
                                         failure_reason: Some("No address found for host".into()),
                                         is_circuit_broken: false,
+                                        cb_state: None,
+                                        recovery_progress_pct: None,
                                     };
                                     (peers, interval, rep)
                                 }
@@ -300,6 +317,8 @@ impl Announcer {
                                     next_announce_in: 300,
                                     failure_reason: Some(format!("DNS lookup failed: {}", e)),
                                     is_circuit_broken: false,
+                                    cb_state: None,
+                                    recovery_progress_pct: None,
                                 };
                                 (peers, interval, rep)
                             }
@@ -313,6 +332,8 @@ impl Announcer {
                                     next_announce_in: 300,
                                     failure_reason: Some("DNS lookup timed out".into()),
                                     is_circuit_broken: false,
+                                    cb_state: None,
+                                    recovery_progress_pct: None,
                                 };
                                 (peers, interval, rep)
                             }
@@ -350,6 +371,8 @@ impl Announcer {
                                     next_announce_in: resp.interval as i64,
                                     failure_reason: None,
                                     is_circuit_broken: false,
+                                    cb_state: None,
+                                    recovery_progress_pct: None,
                                 };
                                 (peers, interval, rep)
                             }
@@ -367,6 +390,8 @@ impl Announcer {
                                     next_announce_in: 300,
                                     failure_reason: Some(e.to_string()),
                                     is_circuit_broken: false,
+                                    cb_state: None,
+                                    recovery_progress_pct: None,
                                 };
                                 (peers, interval, rep)
                             }
@@ -384,6 +409,8 @@ impl Announcer {
                                     next_announce_in: 300,
                                     failure_reason: Some("HTTP announce timed out after 10s".into()),
                                     is_circuit_broken: false,
+                                    cb_state: None,
+                                    recovery_progress_pct: None,
                                 };
                                 (peers, interval, rep)
                             }
@@ -398,6 +425,8 @@ impl Announcer {
                             next_announce_in: 3600,
                             failure_reason: Some(format!("Unsupported tracker scheme: {}", tracker_url.scheme())),
                             is_circuit_broken: false,
+                            cb_state: None,
+                            recovery_progress_pct: None,
                         };
                         (peers, interval, rep)
                     }
@@ -659,6 +688,8 @@ impl AnnounceScheduler {
                 next_announce_in: initial_remaining,
                 failure_reason: None,
                 is_circuit_broken: false,
+                cb_state: None,
+                recovery_progress_pct: None,
             })
             .collect();
 
@@ -1121,11 +1152,15 @@ impl AnnounceScheduler {
             } else {
                 0
             };
+            let tracker_breaker = self.announcer.tracker_breaker();
             meta.tracker_reports
                 .iter()
                 .cloned()
                 .map(|mut r| {
                     r.next_announce_in = remaining_secs;
+                    let status = tracker_breaker.get_host_status(&r.url);
+                    r.cb_state = Some(status.state);
+                    r.recovery_progress_pct = tracker_breaker.recovery_progress_pct(&status);
                     r
                 })
                 .collect()

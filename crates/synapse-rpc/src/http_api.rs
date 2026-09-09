@@ -50,6 +50,17 @@ pub struct PaginationQuery {
 pub struct HealthResponse {
     pub status: String,
     pub version: String,
+    pub features: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CircuitBreakerStatusApi {
+    pub host: String,
+    pub state: String,
+    pub consecutive_successes: u32,
+    pub consecutive_failures: u32,
+    pub backoff_remaining_ms: u64,
+    pub recovery_progress_pct: Option<f32>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -181,6 +192,9 @@ pub fn create_http_router_all(
         .route("/api/v1/torrents/:info_hash/resume", post(resume_torrent_handler))
         .route("/api/v1/torrents/:info_hash/recheck", post(recheck_torrent_handler))
         .route("/api/v1/torrents/:info_hash/location", post(set_location_handler))
+        .route("/api/v1/circuit-breakers", get(list_circuit_breakers_handler))
+        .route("/api/v1/circuit-breakers/:host/trip", post(trip_circuit_breaker_handler))
+        .route("/api/v1/circuit-breakers/:host/reset", post(reset_circuit_breaker_handler))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_auth));
 
     let mut public = Router::new()
@@ -225,6 +239,55 @@ async fn health_handler() -> Json<HealthResponse> {
     Json(HealthResponse {
         status: "ok".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
+        features: vec!["tracker_circuit_breaker_v1".to_string()],
+    })
+}
+
+fn circuit_state_label(state: synapse_tracker::CircuitState) -> &'static str {
+    match state {
+        synapse_tracker::CircuitState::Healthy => "healthy",
+        synapse_tracker::CircuitState::Tripped => "tripped",
+        synapse_tracker::CircuitState::HalfOpenCanary => "half_open_canary",
+        synapse_tracker::CircuitState::Recovering => "recovering",
+    }
+}
+
+async fn list_circuit_breakers_handler(State(state): State<ApiState>) -> Json<Vec<CircuitBreakerStatusApi>> {
+    let breaker = state.engine.tracker_circuit_breaker();
+    let breakers = breaker
+        .all_hosts()
+        .into_iter()
+        .map(|(host, info)| CircuitBreakerStatusApi {
+            host,
+            state: circuit_state_label(info.state).to_string(),
+            consecutive_successes: info.consecutive_successes,
+            consecutive_failures: info.consecutive_failures,
+            backoff_remaining_ms: breaker.backoff_remaining_ms(&info),
+            recovery_progress_pct: breaker.recovery_progress_pct(&info),
+        })
+        .collect();
+    Json(breakers)
+}
+
+async fn trip_circuit_breaker_handler(
+    State(state): State<ApiState>,
+    Path(host): Path<String>,
+) -> Json<ActionResponse> {
+    state.engine.tracker_circuit_breaker().force_trip(&host);
+    Json(ActionResponse {
+        success: true,
+        message: format!("Circuit breaker for '{}' force-tripped", host),
+    })
+}
+
+async fn reset_circuit_breaker_handler(
+    State(state): State<ApiState>,
+    Path(host): Path<String>,
+) -> Json<ActionResponse> {
+    state.engine.tracker_circuit_breaker().force_reset(&host);
+    Json(ActionResponse {
+        success: true,
+        message: format!("Circuit breaker for '{}' force-reset", host),
     })
 }
 

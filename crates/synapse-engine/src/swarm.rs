@@ -535,6 +535,8 @@ impl SwarmEngine {
                     next_announce_in: 0,
                     failure_reason: None,
                     is_circuit_broken: false,
+                    cb_state: None,
+                    recovery_progress_pct: None,
                 })
                 .collect()
         } else {

@@ -31,6 +31,7 @@ synapse-engine = { path = "../synapse-engine" }
 synapse-config = { path = "../synapse-config" }
 synapse-proto = { path = "../synapse-proto" }
 synapse-picker = { path = "../synapse-picker" }
+synapse-tracker = { path = "../synapse-tracker" }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }

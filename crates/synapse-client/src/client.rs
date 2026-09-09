@@ -338,4 +338,45 @@ impl SynapseClient {
         let resp = self.inner.clone().subscribe_session_stats(req).await?;
         Ok(resp.into_inner())
     }
+
+    // --- Capability Negotiation & Circuit Breaker Control ---
+
+    /// Returns this daemon's version and the feature names it supports (e.g.
+    /// `"tracker_circuit_breaker_v1"`). A daemon predating this RPC responds with
+    /// `Status::unimplemented`, which callers should treat as "no optional features".
+    pub async fn get_capabilities(&self) -> Result<CapabilitiesResponse> {
+        let req = self.request(Empty {});
+        let resp = self.inner.clone().get_capabilities(req).await?;
+        Ok(resp.into_inner())
+    }
+
+    /// Lists the live circuit breaker status for every tracker host this daemon is
+    /// currently tracking.
+    pub async fn list_circuit_breakers(&self) -> Result<Vec<CircuitBreakerStatus>> {
+        let req = self.request(Empty {});
+        let resp = self.inner.clone().list_circuit_breakers(req).await?;
+        Ok(resp.into_inner().breakers)
+    }
+
+    /// Forces a tracker host's circuit breaker into `Tripped`, as if it had just failed
+    /// `failure_threshold` consecutive times.
+    pub async fn force_trip_circuit_breaker(&self, host: &str) -> Result<CommandResponse> {
+        let req = self.request(CircuitBreakerActionRequest {
+            host: host.to_string(),
+            action: circuit_breaker_action_request::Action::Trip as i32,
+        });
+        let resp = self.inner.clone().force_circuit_breaker_action(req).await?;
+        Ok(resp.into_inner())
+    }
+
+    /// Clears a tracker host's circuit breaker state entirely, returning it to `Healthy`
+    /// on the next check.
+    pub async fn force_reset_circuit_breaker(&self, host: &str) -> Result<CommandResponse> {
+        let req = self.request(CircuitBreakerActionRequest {
+            host: host.to_string(),
+            action: circuit_breaker_action_request::Action::Reset as i32,
+        });
+        let resp = self.inner.clone().force_circuit_breaker_action(req).await?;
+        Ok(resp.into_inner())
+    }
 }

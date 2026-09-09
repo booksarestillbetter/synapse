@@ -13,6 +13,13 @@ All notable changes to this project are documented here. Format follows
   - Fast relapse abort: any failure during recovery immediately aborts back to `Tripped` with doubled exponential backoff.
   - Announce scheduler anti-herd dispersion: when trackers are tripped or rate-limited by the circuit breaker, announce jobs are staggered with randomized jitter (5–15s delay) to prevent stampeding and flap-trip-flap-trip oscillation across swarms.
   - Published comprehensive documentation in `docs/CIRCUIT_BREAKER.md`.
+- **Circuit Breaker Capability Negotiation & Remote Control (`synapse-proto`, `synapse-rpc`, `synapse-tracker::breaker`, `synapse-client`)**:
+  - New `GetCapabilities` RPC (and `features` field on `GET /api/v1/health`) lets an external control-plane client detect whether this daemon has the tracker circuit breaker, without parsing the version string.
+  - New `ListCircuitBreakers` RPC and `GET /api/v1/circuit-breakers` REST endpoint expose live per-host breaker state (`healthy`/`tripped`/`half_open_canary`/`recovering`), consecutive success/failure counts, remaining backoff, and recovery ramp progress.
+  - New `ForceCircuitBreakerAction` RPC and `POST /api/v1/circuit-breakers/{host}/trip` \| `/reset` REST endpoints allow manual override from an external control plane.
+  - `TrackerStatus` (per-torrent tracker detail, both gRPC and REST) now also carries `cb_state`/`recovery_progress_pct`.
+  - Added `CanaryCircuitBreaker::all_hosts`, `force_trip`, and `force_reset` to `synapse-tracker`, and matching wrapper methods to the `synapse-client` SDK.
+  - Documented the new surface in `docs/CIRCUIT_BREAKER.md` §6 and `docs/CLIENT_PROTOCOLS_AND_SDK.md`.
 - **Swarm Statistics & Paused State Persistence Across Restarts (`synapse-engine`, `synapsed`)**:
   - Preserved historical swarm metrics across daemon restarts: `uploaded_bytes`, `downloaded_bytes`, `ratio`, `added_at` timestamp, and `is_paused` lifecycle state.
   - Resolved session restore overwriting: `SwarmEngine::restore_session` now passes restored state via `add_torrent_with_resume`, preventing in-memory zero resets and eliminating the initial redundant database overwrite.

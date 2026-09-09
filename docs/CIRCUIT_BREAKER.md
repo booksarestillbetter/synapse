@@ -124,7 +124,57 @@ docker run -d \
 
 ---
 
-## 6. Observability & Monitoring
+## 6. Capability Negotiation & External Control
+
+An external control-plane client (e.g. [Conduit](https://github.com/booksarestillbetter/conduit))
+can detect whether a given Synapse daemon has the tracker circuit breaker described above,
+read its live per-host status, and issue basic overrides — without needing to know Synapse's
+internal version number.
+
+### Capability discovery
+
+`GET /api/v1/health` (REST, unauthenticated) and the `GetCapabilities` gRPC RPC both return
+a `features` list. A daemon that has this circuit breaker responds with:
+
+```json
+{"status":"ok","version":"2.2.2","features":["tracker_circuit_breaker_v1"]}
+```
+
+A daemon that predates this feature simply won't have `"tracker_circuit_breaker_v1"` in the
+list (REST), or won't have the `GetCapabilities`/`ListCircuitBreakers`/
+`ForceCircuitBreakerAction` RPCs at all (gRPC — callers should treat `Status::unimplemented`
+as "feature not supported", not as an error).
+
+### Reading live status
+
+- REST: `GET /api/v1/circuit-breakers` (protected) returns every currently-tracked tracker
+  host's status:
+  ```json
+  [{"host":"tracker.example.org","state":"recovering","consecutive_successes":2,
+    "consecutive_failures":0,"backoff_remaining_ms":0,"recovery_progress_pct":41.7}]
+  ```
+- gRPC: `ListCircuitBreakers(Empty)` returns the same data as `CircuitBreakerStatus` messages.
+  The per-torrent `TorrentDetailEvent`'s `TrackerStatus` messages also carry `cb_state` and
+  `recovery_progress_pct` for the trackers of that specific torrent.
+
+`state` mirrors the state machine from §2: `healthy`, `tripped`, `half_open_canary`, or
+`recovering`. `recovery_progress_pct` is only present while `recovering`;
+`backoff_remaining_ms` is only nonzero while `tripped`.
+
+### Overrides
+
+- REST: `POST /api/v1/circuit-breakers/{host}/trip` and
+  `POST /api/v1/circuit-breakers/{host}/reset` (both protected).
+- gRPC: `ForceCircuitBreakerAction({host, action: TRIP | RESET})`.
+
+`trip` forces a host straight to `Tripped`, as if it had just failed its configured failure
+threshold. `reset` clears the host's breaker state entirely (back to `Healthy` on the next
+check). Both are intended for manual/administrative use from an external control plane, not
+for the swarm's own announce loop.
+
+---
+
+## 7. Observability & Monitoring
 
 ### Prometheus Metrics
 

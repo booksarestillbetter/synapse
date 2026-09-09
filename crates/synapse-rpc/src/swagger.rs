@@ -24,7 +24,12 @@ pub const OPENAPI_JSON: &str = r#"{
                   "type": "object",
                   "properties": {
                     "status": { "type": "string", "example": "ok" },
-                    "version": { "type": "string", "example": "2.0.0" }
+                    "version": { "type": "string", "example": "2.0.0" },
+                    "features": {
+                      "type": "array",
+                      "items": { "type": "string" },
+                      "example": ["tracker_circuit_breaker_v1"]
+                    }
                   }
                 }
               }
@@ -275,6 +280,59 @@ pub const OPENAPI_JSON: &str = r#"{
         "responses": {
           "200": { "description": "Peers retrieved successfully" },
           "404": { "description": "Torrent not found" }
+        }
+      }
+    },
+    "/api/v1/circuit-breakers": {
+      "get": {
+        "summary": "List tracker circuit breakers",
+        "description": "Returns the live circuit breaker status for every tracker host currently being tracked.",
+        "responses": {
+          "200": {
+            "description": "Circuit breaker statuses retrieved successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "host": { "type": "string", "example": "tracker.example.org" },
+                      "state": { "type": "string", "enum": ["healthy", "tripped", "half_open_canary", "recovering"] },
+                      "consecutive_successes": { "type": "integer" },
+                      "consecutive_failures": { "type": "integer" },
+                      "backoff_remaining_ms": { "type": "integer" },
+                      "recovery_progress_pct": { "type": "number", "nullable": true }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/circuit-breakers/{host}/trip": {
+      "post": {
+        "summary": "Force-trip a tracker's circuit breaker",
+        "description": "Forces the given tracker host's circuit breaker into the Tripped state, as if it had just failed its configured failure threshold.",
+        "parameters": [
+          { "name": "host", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "Circuit breaker force-tripped" }
+        }
+      }
+    },
+    "/api/v1/circuit-breakers/{host}/reset": {
+      "post": {
+        "summary": "Force-reset a tracker's circuit breaker",
+        "description": "Clears the given tracker host's circuit breaker state entirely, returning it to Healthy on the next check.",
+        "parameters": [
+          { "name": "host", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "Circuit breaker force-reset" }
         }
       }
     },
