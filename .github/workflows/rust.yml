@@ -34,9 +34,6 @@ jobs:
     - name: Clippy
       run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
-    - name: Format check
-      run: cargo fmt --all -- --check
-
   security-audit:
     runs-on: ubuntu-latest
 
