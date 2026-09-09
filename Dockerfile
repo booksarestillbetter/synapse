@@ -17,12 +17,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 
 COPY --from=builder /app/target/release/synapsed /usr/local/bin/synapsed
 
-# Default config template
+# Default config template (stored outside of /etc/synapse so volume mounts cannot mask it)
+RUN mkdir -p /usr/share/synapse
+COPY example_config.toml /usr/share/synapse/synapse.toml.default
+COPY example_config.toml /etc/synapse.default.toml
 COPY example_config.toml /etc/synapse/synapse.toml.default
 
 RUN useradd --system --create-home --home-dir /var/lib/synapse synapse \
     && mkdir -p /data/downloads /var/lib/synapse/session /etc/synapse /media \
-    && chown -R synapse:synapse /data /var/lib/synapse /etc/synapse /media
+    && chown -R synapse:synapse /data /var/lib/synapse /etc/synapse /media /usr/share/synapse
 
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
