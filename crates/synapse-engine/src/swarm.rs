@@ -460,6 +460,18 @@ impl SwarmEngine {
         self
     }
 
+    pub fn with_circuit_breaker(
+        self,
+        enabled: bool,
+        failure_threshold: u32,
+        initial_backoff: Duration,
+        max_backoff: Duration,
+    ) -> Self {
+        self.circuit_breaker
+            .configure(enabled, failure_threshold, initial_backoff, max_backoff);
+        self
+    }
+
     /// Replaces the active session and queue settings dynamically and recalculates rate limits.
     pub fn update_settings(&self, settings: DynamicSessionSettings) {
         *self.settings.write() = settings.clone();

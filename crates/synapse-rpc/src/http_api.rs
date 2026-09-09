@@ -807,7 +807,7 @@ async fn metrics_handler(State(state): State<ApiState>) -> Response {
         download_rate: m.download_rate,
         upload_rate: m.upload_rate,
         connected_peers: m.peers_connected,
-        circuit_breakers_tripped: 0,
+        circuit_breakers_tripped: state.engine.circuit_breaker().tripped_count(),
         dht_nodes: 0,
     };
 

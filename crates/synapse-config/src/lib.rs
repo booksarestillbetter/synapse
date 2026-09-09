@@ -35,6 +35,7 @@ pub struct Config {
     pub queue: QueueConfig,
     pub bandwidth: BandwidthConfig,
     pub web: WebConfig,
+    pub circuit_breaker: CircuitBreakerConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -525,6 +526,26 @@ impl Default for NetworkConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+pub struct CircuitBreakerConfig {
+    pub enabled: bool,
+    pub failure_threshold: u32,
+    pub initial_backoff_seconds: u64,
+    pub max_backoff_seconds: u64,
+}
+
+impl Default for CircuitBreakerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            failure_threshold: 3,
+            initial_backoff_seconds: 30,
+            max_backoff_seconds: 600,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct RpcConfig {
     pub enabled: bool,
     pub listen_addr: String,
@@ -881,6 +902,28 @@ impl Config {
         }
         if let Ok(val) = std::env::var("SYNAPSE_WEB_ROOT") {
             self.web.web_root = Some(PathBuf::from(val));
+        }
+
+        // Circuit Breaker
+        if let Ok(val) = std::env::var("SYNAPSE_CIRCUIT_BREAKER_ENABLED") {
+            if let Ok(b) = val.parse::<bool>() {
+                self.circuit_breaker.enabled = b;
+            }
+        }
+        if let Ok(val) = std::env::var("SYNAPSE_CIRCUIT_BREAKER_FAILURE_THRESHOLD") {
+            if let Ok(n) = val.parse::<u32>() {
+                self.circuit_breaker.failure_threshold = n;
+            }
+        }
+        if let Ok(val) = std::env::var("SYNAPSE_CIRCUIT_BREAKER_INITIAL_BACKOFF_SECS") {
+            if let Ok(n) = val.parse::<u64>() {
+                self.circuit_breaker.initial_backoff_seconds = n;
+            }
+        }
+        if let Ok(val) = std::env::var("SYNAPSE_CIRCUIT_BREAKER_MAX_BACKOFF_SECS") {
+            if let Ok(n) = val.parse::<u64>() {
+                self.circuit_breaker.max_backoff_seconds = n;
+            }
         }
 
         // Bandwidth
@@ -1262,6 +1305,28 @@ mod tests {
             Some("0.0.0.0:9091".parse().unwrap())
         );
         assert_eq!(parsed.web.web_root, Some(PathBuf::from("/var/www/synapse-custom")));
+    }
+
+    #[test]
+    fn test_circuit_breaker_config_defaults_and_parsing() {
+        let default_cfg = Config::default();
+        assert!(default_cfg.circuit_breaker.enabled);
+        assert_eq!(default_cfg.circuit_breaker.failure_threshold, 3);
+        assert_eq!(default_cfg.circuit_breaker.initial_backoff_seconds, 30);
+        assert_eq!(default_cfg.circuit_breaker.max_backoff_seconds, 600);
+
+        let toml_str = r#"
+        [circuit_breaker]
+        enabled = false
+        failure_threshold = 5
+        initial_backoff_seconds = 15
+        max_backoff_seconds = 300
+        "#;
+        let parsed: Config = toml::from_str(toml_str).unwrap();
+        assert!(!parsed.circuit_breaker.enabled);
+        assert_eq!(parsed.circuit_breaker.failure_threshold, 5);
+        assert_eq!(parsed.circuit_breaker.initial_backoff_seconds, 15);
+        assert_eq!(parsed.circuit_breaker.max_backoff_seconds, 300);
     }
 }
 

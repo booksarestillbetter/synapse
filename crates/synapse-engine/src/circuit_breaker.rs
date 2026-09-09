@@ -41,9 +41,10 @@ impl Default for EndpointCircuitInfo {
 #[derive(Debug, Clone)]
 pub struct PeerCircuitBreaker {
     endpoints: Arc<RwLock<HashMap<SocketAddr, EndpointCircuitInfo>>>,
-    failure_threshold: u32,
-    initial_backoff: Duration,
-    max_backoff: Duration,
+    failure_threshold: Arc<RwLock<u32>>,
+    initial_backoff: Arc<RwLock<Duration>>,
+    max_backoff: Arc<RwLock<Duration>>,
+    enabled: Arc<RwLock<bool>>,
 }
 
 impl Default for PeerCircuitBreaker {
@@ -56,14 +57,52 @@ impl PeerCircuitBreaker {
     pub fn new(failure_threshold: u32, initial_backoff: Duration, max_backoff: Duration) -> Self {
         Self {
             endpoints: Arc::new(RwLock::new(HashMap::new())),
-            failure_threshold,
-            initial_backoff,
-            max_backoff,
+            failure_threshold: Arc::new(RwLock::new(failure_threshold)),
+            initial_backoff: Arc::new(RwLock::new(initial_backoff)),
+            max_backoff: Arc::new(RwLock::new(max_backoff)),
+            enabled: Arc::new(RwLock::new(true)),
         }
+    }
+
+    /// Dynamically update circuit breaker configuration parameters in-flight.
+    pub fn configure(
+        &self,
+        enabled: bool,
+        failure_threshold: u32,
+        initial_backoff: Duration,
+        max_backoff: Duration,
+    ) {
+        *self.enabled.write() = enabled;
+        *self.failure_threshold.write() = failure_threshold;
+        *self.initial_backoff.write() = initial_backoff;
+        *self.max_backoff.write() = max_backoff;
+    }
+
+    /// Returns whether the circuit breaker is currently enabled.
+    pub fn is_enabled(&self) -> bool {
+        *self.enabled.read()
+    }
+
+    /// Returns the number of currently tripped peer circuit breakers.
+    pub fn tripped_count(&self) -> usize {
+        self.endpoints
+            .read()
+            .values()
+            .filter(|e| e.state == CircuitState::Tripped)
+            .count()
+    }
+
+    /// Resets all endpoint breaker history back to healthy.
+    pub fn reset(&self) {
+        self.endpoints.write().clear();
     }
 
     /// Checks if a connection attempt is allowed to the given peer address.
     pub fn can_connect(&self, addr: &SocketAddr) -> bool {
+        if !*self.enabled.read() {
+            return true;
+        }
+
         let mut map = self.endpoints.write();
         let entry = map.entry(*addr).or_default();
 
@@ -99,6 +138,11 @@ impl PeerCircuitBreaker {
 
     /// Records a successful connection / handshake with the peer, resetting the breaker.
     pub fn record_success(&self, addr: &SocketAddr) {
+        if !*self.enabled.read() {
+            return;
+        }
+
+        let initial_backoff = *self.initial_backoff.read();
         let mut map = self.endpoints.write();
         if let Some(entry) = map.get_mut(addr) {
             if entry.state != CircuitState::Healthy {
@@ -107,13 +151,21 @@ impl PeerCircuitBreaker {
             entry.consecutive_failures = 0;
             entry.state = CircuitState::Healthy;
             entry.last_failure = None;
-            entry.backoff_duration = self.initial_backoff;
+            entry.backoff_duration = initial_backoff;
             entry.canary_in_flight = false;
         }
     }
 
     /// Records a failed connection attempt, handshake error, or I/O reset.
     pub fn record_failure(&self, addr: &SocketAddr) {
+        if !*self.enabled.read() {
+            return;
+        }
+
+        let threshold = *self.failure_threshold.read();
+        let initial_backoff = *self.initial_backoff.read();
+        let max_backoff = *self.max_backoff.read();
+
         let mut map = self.endpoints.write();
         let entry = map.entry(*addr).or_default();
 
@@ -121,17 +173,17 @@ impl PeerCircuitBreaker {
         entry.last_failure = Some(Instant::now());
         entry.canary_in_flight = false;
 
-        if entry.consecutive_failures >= self.failure_threshold {
+        if entry.consecutive_failures >= threshold {
             if entry.state == CircuitState::Healthy {
                 warn!(
                     "Peer {} failed {} consecutive times. Tripping Peer Circuit Breaker (backoff: {:?}).",
-                    addr, entry.consecutive_failures, self.initial_backoff
+                    addr, entry.consecutive_failures, initial_backoff
                 );
                 entry.state = CircuitState::Tripped;
-                entry.backoff_duration = self.initial_backoff;
+                entry.backoff_duration = initial_backoff;
             } else if entry.state == CircuitState::HalfOpenCanary {
                 entry.state = CircuitState::Tripped;
-                entry.backoff_duration = (entry.backoff_duration * 2).min(self.max_backoff);
+                entry.backoff_duration = (entry.backoff_duration * 2).min(max_backoff);
                 warn!(
                     "Canary connection failed for peer {}. Doubling backoff to {:?}.",
                     addr, entry.backoff_duration

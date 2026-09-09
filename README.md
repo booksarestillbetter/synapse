@@ -56,6 +56,7 @@ Engineered from first principles to comfortably scale past **50,000+ concurrent 
 - **Per-File Selection & Priorities (`synapse-meta` & `synapse-picker`)**: Support for `DoNotDownload`, `Low`, `Normal`, and `High` priorities, automatically translating file byte offsets to piece ranges.
 - **Token-Bucket Rate Limiter & Turtle Mode (`synapse-engine`)**: Lockless atomic token-bucket upload/download rate limiters with scheduled alternative speed windows and bitmask day calculations.
 - **Queue Manager & Auto-Stop Rules (`synapse-engine`)**: Enforces concurrency limits (`max_active_downloads`, `max_active_seeds`), stalled torrent auto-bypass, and auto-pauses swarms upon reaching target share ratio or maximum seed duration.
+- **Dual-Tier Circuit Breakers (`synapse-engine`, `synapse-tracker`)**: Prevents announce storms and peer socket/FD starvation using host-level tracker and endpoint-level peer circuit breakers with 3-state canary probing (`Healthy` -> `Tripped` -> `HalfOpenCanary`). See [`docs/CIRCUIT_BREAKER.md`](docs/CIRCUIT_BREAKER.md).
 - **IP Blocklist Filter (`synapse-engine`)**: CIDR and range matching engine to reject blacklisted IP addresses.
 - **Filesystem Watch Directory (`synapsed`)**: Background directory watcher automatically ingesting `.torrent` files and archiving them into `.imported`.
 
@@ -87,6 +88,7 @@ synapse/
 │   ├── ARCHITECTURE.md         # System internals, 3-tier virtualization & 50k scaling architecture
 │   ├── BENCHMARKS.md           # Performance benchmarks, 50k scale harness & reproduction guide
 │   ├── BEP_SUPPORT_MATRIX.md   # Master protocol compliance matrix across all BEPs
+│   ├── CIRCUIT_BREAKER.md      # Dual-tier peer & tracker circuit breakers, state machine & config
 │   ├── CLIENT_PROTOCOLS_AND_SDK.md # Client SDK reference (Rust, Go, Python, TS), REST API & Swagger
 │   ├── COMPLETION_INSTRUCTIONS.md # Wire spec for completion webhook placement
 │   ├── HACKING.md              # Contributor & developer guide (quality gates, invariants)

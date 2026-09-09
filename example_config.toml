@@ -240,4 +240,17 @@ time_begin_minutes = 540      # 09:00 AM (minutes from midnight)
 time_end_minutes = 1020       # 05:00 PM (minutes from midnight)
 time_days = 127               # Bitmask: Sun=1, Mon=2, Tue=4, Wed=8, Thu=16, Fri=32, Sat=64 (127=All)
 
-
+[circuit_breaker]
+# Dynamic peer circuit breaker that mitigates connection storms, socket starvation,
+# and cascading failures by isolating unresponsive or failing peers.
+# Default: true
+enabled = true
+# Consecutive connection or handshake failures before tripping the breaker for a peer.
+# Default: 3
+failure_threshold = 3
+# Initial backoff duration in seconds before a canary probe is permitted.
+# Default: 30
+initial_backoff_seconds = 30
+# Maximum exponential backoff ceiling in seconds for persistently failing peers.
+# Default: 600 (10 minutes)
+max_backoff_seconds = 600

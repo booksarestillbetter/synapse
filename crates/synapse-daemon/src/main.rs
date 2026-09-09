@@ -306,7 +306,13 @@ async fn main() -> std::process::ExitCode {
     let mut swarm_builder = SwarmEngine::new(disk.clone(), peer_id)
         .with_session_store(session_store)
         .with_lifecycle(lifecycle)
-        .with_settings(dynamic_settings);
+        .with_settings(dynamic_settings)
+        .with_circuit_breaker(
+            config.circuit_breaker.enabled,
+            config.circuit_breaker.failure_threshold,
+            Duration::from_secs(config.circuit_breaker.initial_backoff_seconds),
+            Duration::from_secs(config.circuit_breaker.max_backoff_seconds),
+        );
     if let Some(ref watch_dir) = config.disk.watch_dir {
         swarm_builder = swarm_builder.with_watch_dir(watch_dir.clone());
     }

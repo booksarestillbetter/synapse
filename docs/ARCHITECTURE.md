@@ -163,6 +163,11 @@ Synapse replaces traditional flat-file JSON session directories with an embedded
 - **Strict Isolation**: Swarms flagged with `info.private = 1` permanently and unconditionally disable DHT announces, PEX peer sharing, and LSD multicasting.
 - **Passkey Redaction**: Passkeys, auth tokens, and session keys are masked in all logs, error traces, and telemetry.
 
+### 3.6 Dual-Tier Circuit Breakers (`synapse-engine`, `synapse-tracker`)
+- **Tracker Host Breaker (`CanaryCircuitBreaker`)**: Protects against announce storms and thundering-herd surges by throttling dead or failing trackers across all swarms simultaneously. Uses a 3-state (`Healthy` -> `Tripped` -> `HalfOpenCanary`) model with exponential backoff.
+- **Peer Endpoint Breaker (`PeerCircuitBreaker`)**: Prevents socket churn and file descriptor starvation by isolating unresponsive or failing peer IP:port endpoints after 3 consecutive failures.
+- **Full Reference**: See [`docs/CIRCUIT_BREAKER.md`](CIRCUIT_BREAKER.md).
+
 ---
 
 ## 4. OS & Container Tuning for 50,000 Swarms
