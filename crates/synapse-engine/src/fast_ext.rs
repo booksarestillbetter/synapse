@@ -43,7 +43,7 @@ pub fn compute_allowed_fast_set(
 
     while result.len() < count as usize {
         let digest: [u8; 20] = Sha1::digest(&x).into();
-        for chunk in digest.chunks_exact(4) {
+        for chunk in digest.as_chunks::<4>().0 {
             let val = u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
             let index = val % total_pieces;
             if !result.contains(&index) {

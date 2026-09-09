@@ -386,7 +386,7 @@ impl Info {
                 if p.len() % 20 != 0 {
                     return None;
                 }
-                Some(p.chunks_exact(20).map(|c| c.try_into().unwrap()).collect())
+                Some(p.as_chunks::<20>().0.to_vec())
             })
             .ok_or(MetaError::InvalidHashes)?;
 
@@ -513,7 +513,7 @@ impl Info {
                 if p.len() % 20 != 0 {
                     return None;
                 }
-                Some(p.chunks_exact(20).map(|c| c.try_into().unwrap()).collect())
+                Some(p.as_chunks::<20>().0.to_vec())
             })
             .ok_or(MetaError::InvalidHashes)?;
 

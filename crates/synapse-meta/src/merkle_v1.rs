@@ -42,7 +42,7 @@ pub fn compute_file_merkle_root_v1(file_bytes: &[u8]) -> [u8; 20] {
 
     while current_layer.len() > 1 {
         let mut next_layer = Vec::with_capacity(current_layer.len() / 2);
-        for chunk in current_layer.chunks_exact(2) {
+        for chunk in current_layer.as_chunks::<2>().0 {
             next_layer.push(hash_parent_v1(&chunk[0], &chunk[1]));
         }
         current_layer = next_layer;

@@ -239,7 +239,9 @@ fn parse_response(data: &[u8]) -> Result<AnnounceResponse, TrackerError> {
     let peers = match dict.remove(b"peers".as_ref()) {
         // Compact format (BEP23): 6 bytes/peer, 4-byte IPv4 + 2-byte port.
         Some(BEncode::String(bytes)) => bytes
-            .chunks_exact(6)
+            .as_chunks::<6>()
+            .0
+            .iter()
             .map(|c| {
                 let ip = Ipv4Addr::new(c[0], c[1], c[2], c[3]);
                 SocketAddr::from((ip, u16::from_be_bytes([c[4], c[5]])))

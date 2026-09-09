@@ -80,10 +80,8 @@ pub fn decode_sample_infohashes_response(
         .unwrap_or_default();
 
     let mut samples = Vec::new();
-    for chunk in samples_bytes.chunks_exact(20) {
-        let mut arr = [0u8; 20];
-        arr.copy_from_slice(chunk);
-        samples.push(arr);
+    for chunk in samples_bytes.as_chunks::<20>().0 {
+        samples.push(*chunk);
     }
 
     let nodes = match dict.remove(b"nodes".as_ref()).and_then(BEncode::into_bytes) {

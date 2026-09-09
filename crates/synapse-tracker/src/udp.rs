@@ -74,7 +74,7 @@ async fn do_scrape(
                 return Err(TrackerError::Malformed("scrape payload length not multiple of 12"));
             }
             let mut files = std::collections::HashMap::new();
-            for (i, chunk) in data.chunks_exact(12).enumerate() {
+            for (i, chunk) in data.as_chunks::<12>().0.iter().enumerate() {
                 if i < info_hashes.len() {
                     let seeders = u32::from_be_bytes(chunk[0..4].try_into().unwrap());
                     let completed = u32::from_be_bytes(chunk[4..8].try_into().unwrap());
@@ -156,11 +156,13 @@ async fn do_announce(
             let interval = u32::from_be_bytes(buf[8..12].try_into().unwrap());
             let leechers = u32::from_be_bytes(buf[12..16].try_into().unwrap());
             let seeders = u32::from_be_bytes(buf[16..20].try_into().unwrap());
-            // `chunks_exact` (not `chunks`) silently drops a ragged trailing chunk
+            // `as_chunks` (not `chunks`) silently drops a ragged trailing chunk
             // instead of yielding it - the pre-rewrite fix for exactly this panic risk
             // (CHANGELOG.md) applies here too, from the start this time.
             let peers = buf[20..n]
-                .chunks_exact(6)
+                .as_chunks::<6>()
+                .0
+                .iter()
                 .map(|c| {
                     let ip = std::net::Ipv4Addr::new(c[0], c[1], c[2], c[3]);
                     SocketAddr::from((ip, u16::from_be_bytes([c[4], c[5]])))

@@ -109,7 +109,9 @@ pub fn compact_nodes_decode(data: &[u8]) -> Result<Vec<NodeInfo>, ProtoError> {
         return Err(ProtoError::Malformed("compact node list length not a multiple of 26"));
     }
     Ok(data
-        .chunks_exact(26)
+        .as_chunks::<26>()
+        .0
+        .iter()
         .map(|c| NodeInfo {
             id: c[0..20].try_into().unwrap(),
             addr: SocketAddrV4::new(Ipv4Addr::new(c[20], c[21], c[22], c[23]), u16::from_be_bytes([c[24], c[25]])),
@@ -132,7 +134,9 @@ pub fn compact_nodes6_decode(data: &[u8]) -> Result<Vec<NodeInfoV6>, ProtoError>
         return Err(ProtoError::Malformed("compact IPv6 node list length not a multiple of 38"));
     }
     Ok(data
-        .chunks_exact(38)
+        .as_chunks::<38>()
+        .0
+        .iter()
         .map(|c| NodeInfoV6 {
             id: c[0..20].try_into().unwrap(),
             addr: SocketAddrV6::new(

@@ -99,7 +99,7 @@ impl UtPexMessage {
         let mut dropped_v6 = Vec::new();
 
         if let Some(added) = dict.remove(b"added".as_ref()).and_then(|v| v.into_bytes()) {
-            for chunk in added.chunks_exact(6) {
+            for chunk in added.as_chunks::<6>().0 {
                 let ip = Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3]);
                 let port = u16::from_be_bytes([chunk[4], chunk[5]]);
                 added_v4.push(SocketAddrV4::new(ip, port));
@@ -111,7 +111,7 @@ impl UtPexMessage {
         }
 
         if let Some(dropped) = dict.remove(b"dropped".as_ref()).and_then(|v| v.into_bytes()) {
-            for chunk in dropped.chunks_exact(6) {
+            for chunk in dropped.as_chunks::<6>().0 {
                 let ip = Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3]);
                 let port = u16::from_be_bytes([chunk[4], chunk[5]]);
                 dropped_v4.push(SocketAddrV4::new(ip, port));
@@ -119,7 +119,7 @@ impl UtPexMessage {
         }
 
         if let Some(added6) = dict.remove(b"added6".as_ref()).and_then(|v| v.into_bytes()) {
-            for chunk in added6.chunks_exact(18) {
+            for chunk in added6.as_chunks::<18>().0 {
                 let ip_bytes: [u8; 16] = chunk[0..16].try_into().unwrap();
                 let ip = Ipv6Addr::from(ip_bytes);
                 let port = u16::from_be_bytes([chunk[16], chunk[17]]);
@@ -132,7 +132,7 @@ impl UtPexMessage {
         }
 
         if let Some(dropped6) = dict.remove(b"dropped6".as_ref()).and_then(|v| v.into_bytes()) {
-            for chunk in dropped6.chunks_exact(18) {
+            for chunk in dropped6.as_chunks::<18>().0 {
                 let ip_bytes: [u8; 16] = chunk[0..16].try_into().unwrap();
                 let ip = Ipv6Addr::from(ip_bytes);
                 let port = u16::from_be_bytes([chunk[16], chunk[17]]);

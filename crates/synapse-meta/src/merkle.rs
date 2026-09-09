@@ -45,7 +45,7 @@ pub fn compute_file_merkle_root(file_bytes: &[u8]) -> [u8; 32] {
 
     while current_layer.len() > 1 {
         let mut next_layer = Vec::with_capacity(current_layer.len() / 2);
-        for chunk in current_layer.chunks_exact(2) {
+        for chunk in current_layer.as_chunks::<2>().0.iter() {
             next_layer.push(hash_parent(&chunk[0], &chunk[1]));
         }
         current_layer = next_layer;
@@ -76,7 +76,7 @@ pub fn compute_file_piece_layer(file_bytes: &[u8], piece_length: usize) -> Vec<[
 
         while piece_layer.len() > 1 {
             let mut next = Vec::with_capacity(piece_layer.len() / 2);
-            for chunk in piece_layer.chunks_exact(2) {
+            for chunk in piece_layer.as_chunks::<2>().0.iter() {
                 next.push(hash_parent(&chunk[0], &chunk[1]));
             }
             piece_layer = next;
