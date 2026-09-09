@@ -16,6 +16,9 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
+    - name: Install protoc
+      run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler
+
     - name: Rust Cache
       uses: Swatinem/rust-cache@v2
 
@@ -28,6 +31,12 @@ jobs:
     - name: Test
       run: cargo test --workspace --locked --verbose
 
+    - name: Clippy
+      run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+    - name: Format check
+      run: cargo fmt --all -- --check
+
   security-audit:
     runs-on: ubuntu-latest
 
@@ -37,35 +46,24 @@ jobs:
       with:
         token: ${{ secrets.GITHUB_TOKEN }}
 
-  package:
+  release-binary:
     runs-on: ubuntu-latest
     needs: test
 
     steps:
     - uses: actions/checkout@v4
 
+    - name: Install protoc
+      run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler
+
     - name: Rust Cache
       uses: Swatinem/rust-cache@v2
 
-    - name: Install cargo-deb
-      run: cargo install cargo-deb --locked
+    - name: Build release binary
+      run: cargo build --release --locked -p synapsed --verbose
 
-    - name: Build
-      run: cargo build --locked --release --all --verbose
-
-    - name: Package as deb file
-      run: cargo deb --no-build --verbose
-
-    - name: Upload Artifact Linux
+    - name: Upload synapsed binary
       uses: actions/upload-artifact@v4
       with:
-        name: synapse_sycli
-        path: |
-          target/release/synapse
-          target/release/sycli
-
-    - name: Upload Artifact Linux as .deb package
-      uses: actions/upload-artifact@v4
-      with:
-        name: synapse_deb
-        path: target/debian/*.deb
+        name: synapsed-linux-x86_64
+        path: target/release/synapsed
