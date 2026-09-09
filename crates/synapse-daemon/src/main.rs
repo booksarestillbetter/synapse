@@ -452,7 +452,10 @@ async fn main() -> std::process::ExitCode {
     }
 
     // Optional Alternative REST HTTP API / Web UI / Swagger UI & Prometheus Metrics
-    if config.http_api.enabled || config.web.enabled {
+    let cli_http_override = args.http_addr.is_some() || args.http_port.is_some();
+    let http_server_enabled = config.http_api.enabled || config.web.enabled || cli_http_override;
+
+    if http_server_enabled {
         let mut http_addr = config
             .web
             .listen_addr

@@ -391,7 +391,7 @@ pub struct HttpApiConfig {
 impl Default for HttpApiConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: false,
             listen_addr: SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)), 8080),
             cors_enabled: true,
         }
@@ -414,24 +414,13 @@ impl Default for MetricsConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WebConfig {
     pub enabled: bool,
     pub listen_addr: Option<SocketAddr>,
     pub port: Option<u16>,
     pub web_root: Option<PathBuf>,
-}
-
-impl Default for WebConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            listen_addr: None,
-            port: None,
-            web_root: None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -865,6 +854,11 @@ impl Config {
         if let Ok(val) = std::env::var("SYNAPSE_RPC_AUTH_TOKEN") {
             self.rpc.auth_token = Some(val);
         }
+        if let Ok(val) = std::env::var("SYNAPSE_HTTP_ENABLED").or_else(|_| std::env::var("SYNAPSE_HTTP_API_ENABLED")) {
+            if let Ok(b) = val.parse::<bool>() {
+                self.http_api.enabled = b;
+            }
+        }
         if let Ok(val) = std::env::var("SYNAPSE_HTTP_LISTEN_ADDR") {
             if let Ok(addr) = val.parse::<SocketAddr>() {
                 self.http_api.listen_addr = addr;
@@ -1239,27 +1233,29 @@ mod tests {
             assert_eq!(cfg.bandwidth.upload_limit_bytes, 125_000_000);
             assert_eq!(cfg.bandwidth.alt_speed.download_limit_bytes, 625_000);
             assert_eq!(cfg.bandwidth.alt_speed.upload_limit_bytes, 125_000);
-            assert!(cfg.web.enabled);
+            assert!(!cfg.web.enabled);
+            assert!(!cfg.http_api.enabled);
         }
     }
 
     #[test]
     fn test_web_config_defaults_and_parsing() {
         let default_cfg = Config::default();
-        assert!(default_cfg.web.enabled);
+        assert!(!default_cfg.web.enabled);
+        assert!(!default_cfg.http_api.enabled);
         assert_eq!(default_cfg.web.listen_addr, None);
         assert_eq!(default_cfg.web.port, None);
         assert_eq!(default_cfg.web.web_root, None);
 
         let toml_str = r#"
         [web]
-        enabled = false
+        enabled = true
         port = 9091
         listen_addr = "0.0.0.0:9091"
         web_root = "/var/www/synapse-custom"
         "#;
         let parsed: Config = toml::from_str(toml_str).unwrap();
-        assert!(!parsed.web.enabled);
+        assert!(parsed.web.enabled);
         assert_eq!(parsed.web.port, Some(9091));
         assert_eq!(
             parsed.web.listen_addr,

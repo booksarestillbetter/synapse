@@ -170,7 +170,7 @@ disable_dht_globally = false
 [http_api]
 # Secondary, thinner REST + Swagger UI + /metrics surface for scripts/curl (see
 # docs/CLIENT_PROTOCOLS_AND_SDK.md section 2). Default: false
-enabled = true
+enabled = false
 # Default: "127.0.0.1:8080"
 listen_addr = "0.0.0.0:8080"
 # Default: true
@@ -179,8 +179,8 @@ cors_enabled = true
 [web]
 # Lightweight, zero-dependency TransGUI / qBittorrent-style Web Interface.
 # Served directly on the HTTP server root ("/") alongside the REST API.
-# Default: true
-enabled = true
+# Default: false
+enabled = false
 # Port to listen on (optional override for [http_api].listen_addr port)
 # Default: unset (uses [http_api].listen_addr port, default 8080)
 # port = 8080
