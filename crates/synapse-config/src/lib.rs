@@ -418,6 +418,8 @@ impl Default for MetricsConfig {
 #[serde(default)]
 pub struct WebConfig {
     pub enabled: bool,
+    pub listen_addr: Option<SocketAddr>,
+    pub port: Option<u16>,
     pub web_root: Option<PathBuf>,
 }
 
@@ -425,6 +427,8 @@ impl Default for WebConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            listen_addr: None,
+            port: None,
             web_root: None,
         }
     }
@@ -871,6 +875,16 @@ impl Config {
                 self.web.enabled = b;
             }
         }
+        if let Ok(val) = std::env::var("SYNAPSE_WEB_LISTEN_ADDR") {
+            if let Ok(addr) = val.parse::<SocketAddr>() {
+                self.web.listen_addr = Some(addr);
+            }
+        }
+        if let Ok(val) = std::env::var("SYNAPSE_WEB_PORT") {
+            if let Ok(p) = val.parse::<u16>() {
+                self.web.port = Some(p);
+            }
+        }
         if let Ok(val) = std::env::var("SYNAPSE_WEB_ROOT") {
             self.web.web_root = Some(PathBuf::from(val));
         }
@@ -1233,15 +1247,24 @@ mod tests {
     fn test_web_config_defaults_and_parsing() {
         let default_cfg = Config::default();
         assert!(default_cfg.web.enabled);
+        assert_eq!(default_cfg.web.listen_addr, None);
+        assert_eq!(default_cfg.web.port, None);
         assert_eq!(default_cfg.web.web_root, None);
 
         let toml_str = r#"
         [web]
         enabled = false
+        port = 9091
+        listen_addr = "0.0.0.0:9091"
         web_root = "/var/www/synapse-custom"
         "#;
         let parsed: Config = toml::from_str(toml_str).unwrap();
         assert!(!parsed.web.enabled);
+        assert_eq!(parsed.web.port, Some(9091));
+        assert_eq!(
+            parsed.web.listen_addr,
+            Some("0.0.0.0:9091".parse().unwrap())
+        );
         assert_eq!(parsed.web.web_root, Some(PathBuf::from("/var/www/synapse-custom")));
     }
 }

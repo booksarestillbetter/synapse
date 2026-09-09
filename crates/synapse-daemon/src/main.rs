@@ -28,6 +28,14 @@ struct Args {
     #[arg(short, long)]
     config: Option<PathBuf>,
 
+    /// Optional HTTP API & Web UI listen address override (e.g. 0.0.0.0:8080 or 127.0.0.1:8080)
+    #[arg(long)]
+    http_addr: Option<SocketAddr>,
+
+    /// Optional HTTP API & Web UI listen port override (e.g. 8080 or 9091)
+    #[arg(long)]
+    http_port: Option<u16>,
+
     #[command(subcommand)]
     command: Option<Subcommand>,
 }
@@ -444,8 +452,25 @@ async fn main() -> std::process::ExitCode {
     }
 
     // Optional Alternative REST HTTP API / Web UI / Swagger UI & Prometheus Metrics
-    if config.http_api.enabled {
-        let http_addr = config.http_api.listen_addr;
+    if config.http_api.enabled || config.web.enabled {
+        let mut http_addr = config
+            .web
+            .listen_addr
+            .or_else(|| {
+                config.web.port.map(|p| {
+                    let mut a = config.http_api.listen_addr;
+                    a.set_port(p);
+                    a
+                })
+            })
+            .unwrap_or(config.http_api.listen_addr);
+
+        if let Some(cli_addr) = args.http_addr {
+            http_addr = cli_addr;
+        } else if let Some(cli_port) = args.http_port {
+            http_addr.set_port(cli_port);
+        }
+
         let http_engine = swarm.clone();
         let http_auth = auth_token.clone();
         let metrics_enabled = config.metrics.enabled;
@@ -485,7 +510,7 @@ async fn main() -> std::process::ExitCode {
             }
         });
     } else if config.metrics.enabled {
-        tracing::debug!("[metrics] enabled = true, but [http_api] enabled = false — HTTP server will not start");
+        tracing::debug!("[metrics] enabled = true, but [http_api] and [web] are disabled — HTTP server will not start");
     }
 
     // Optional Watch Directory Background Ingestor

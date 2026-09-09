@@ -178,9 +178,14 @@ cors_enabled = true
 
 [web]
 # Lightweight, zero-dependency TransGUI / qBittorrent-style Web Interface.
-# Served directly on [http_api].listen_addr root ("/") when enabled.
+# Served directly on the HTTP server root ("/") alongside the REST API.
 # Default: true
 enabled = true
+# Port to listen on (optional override for [http_api].listen_addr port)
+# Default: unset (uses [http_api].listen_addr port, default 8080)
+# port = 8080
+# Or full listen address (e.g. "0.0.0.0:8080", "127.0.0.1:9091")
+# listen_addr = "0.0.0.0:8080"
 # Optional path to override embedded web assets with custom static files.
 # Default: unset (uses embedded high-performance assets)
 # web_root = "/var/lib/synapse/web"
