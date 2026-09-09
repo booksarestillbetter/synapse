@@ -1,6 +1,6 @@
 # Synapse 2.0
 [![Rust Build](https://github.com/booksarestillbetter/synapse/actions/workflows/rust.yml/badge.svg)](https://github.com/booksarestillbetter/synapse/actions/workflows/rust.yml)
-[![Version 2.2.0](https://img.shields.io/badge/version-2.2.0-blue.svg)](CHANGELOG.md)
+[![Version 2.2.1](https://img.shields.io/badge/version-2.2.1-blue.svg)](CHANGELOG.md)
 [![License: ISC](https://img.shields.io/badge/License-ISC-yellow.svg)](LICENSE)
 
 Synapse 2.0 is an ultra-high-performance, headless BitTorrent daemon built from the ground up in modern async Rust (Tokio/Tonic). It runs completely standalone as a **next-generation BitTorrent engine**, and its gRPC/REST control plane is built to be driven by any compatible media-management front-end that wants a high-scale retriever backend — see [`docs/CLIENT_PROTOCOLS_AND_SDK.md`](docs/CLIENT_PROTOCOLS_AND_SDK.md). Synapse ships with a lightweight built-in web interface (zero setup, embedded in the daemon binary — see below), or drive it with [**Conduit**](https://github.com/booksarestillbetter/conduit) (recommended) for the full multi-node, Arr-aware experience; any other front-end implementing the client contract works the same way.

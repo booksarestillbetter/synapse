@@ -3,6 +3,23 @@
 All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [2.2.1] - 2026-09-09
+
+### Fixed
+
+- **Docker config discovery**: the default config template is now also stored in `/usr/share/synapse`
+  and `/etc/synapse.default.toml` so a host volume mounted onto `/etc/synapse` can no longer mask it.
+  The entrypoint now searches `SYNAPSE_CONFIG`, `/etc/synapse/synapse.toml`,
+  `/etc/synapse/config/synapse.toml`, `/var/lib/synapse/synapse.toml`, and direct file mounts, and only
+  passes `-c` to `synapsed` once a real file is confirmed to exist — previously a missing config could
+  crash the daemon with a fatal `os error 2`. Ownership (`PUID:PGID`) is now also enforced on
+  `/etc/synapse` and the active config file.
+- **`http_api` / `web` no longer enabled by default**: `HttpApiConfig.enabled` and `WebConfig.enabled`
+  now correctly default to `false`, honoring both the documented defaults and existing configs that set
+  `enabled = false`. The HTTP server now only starts when explicitly enabled via `[http_api]`, `[web]`,
+  or a CLI override. Added `SYNAPSE_HTTP_ENABLED` / `SYNAPSE_HTTP_API_ENABLED` environment variable
+  support.
+
 ## [2.2.0] - 2026-09-08
 
 Brings the `v2` branch's remaining work into `master` (merge commit `278d6a8`, "Merge branch

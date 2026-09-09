@@ -368,7 +368,7 @@ Point any web browser to `http://<host>:<port>/` (e.g. `http://localhost:8080/`)
 | Method | Path | Description | Request Body | Response |
 |---|---|---|---|---|
 | `GET` | `/` | Web Client HTML | None | `text/html` |
-| `GET` | `/api/v1/health` | Health check & version | None | `{"status":"ok","version":"2.2.0"}` |
+| `GET` | `/api/v1/health` | Health check & version | None | `{"status":"ok","version":"2.2.1"}` |
 | `GET` | `/api/v1/session` | Full dynamic session settings, bitrates & turtle state | None | `{"download_limit_pretty":"50 Mbps","alt_speed_enabled":false,...}` |
 | `PATCH` | `/api/v1/session` | In-flight session settings update (accepts "50m", "1g", etc.) | JSON object with desired updates | `{"success":true,"warnings":[]}` |
 | `GET` | `/api/v1/session/stats` | Global throughput & swarm counts | None | `{"total_torrents":10,"download_rate":0,"upload_rate":0,...}` |

@@ -150,7 +150,7 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
         <div class="daemon-info-card">
           <div><small>Engine:</small> <strong>Synapse 2.0</strong></div>
           <div><small>Peer ID:</small> <code>-SY2000-</code></div>
-          <div id="daemon-version"><small>Version:</small> 2.2.0</div>
+          <div id="daemon-version"><small>Version:</small> 2.2.1</div>
         </div>
       </div>
     </aside>
