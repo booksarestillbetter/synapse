@@ -119,7 +119,7 @@ docker run -d \
   -e SYNAPSE_CIRCUIT_BREAKER_FAILURE_THRESHOLD=5 \
   -e SYNAPSE_CIRCUIT_BREAKER_INITIAL_BACKOFF_SECONDS=15 \
   -e SYNAPSE_CIRCUIT_BREAKER_MAX_BACKOFF_SECONDS=300 \
-  ghcr.io/drewbeer/synapse:latest
+  booksarestillbetter/synapse:latest
 ```
 
 ---
