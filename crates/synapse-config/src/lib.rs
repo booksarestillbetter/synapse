@@ -982,21 +982,34 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    // `Config::load` unconditionally calls `apply_env_overrides`, which reads process-global
+    // `SYNAPSE_*` env vars — and `cargo test` runs tests in this module in parallel by default.
+    // Any test that sets/removes those env vars (test_env_overrides) can race with any other
+    // test that calls `Config::load` while they're set, silently overriding TOML-configured
+    // values with leaked env vars from a concurrently-running test. Every test in this module
+    // that either mutates `SYNAPSE_*` env vars or calls `Config::load`/`Config::default` +
+    // `apply_env_overrides` holds this lock for its duration to serialize against that race.
+    static ENV_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn missing_default_config_falls_back_to_defaults() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let cfg = Config::load(None);
         assert!(cfg.is_ok());
     }
 
     #[test]
     fn explicit_missing_path_is_an_error() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let err = Config::load(Some(Path::new("/nonexistent/does-not-exist.toml")));
         assert!(matches!(err, Err(ConfigError::Io { .. })));
     }
 
     #[test]
     fn parses_a_real_config_file() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("synapse.toml");
         fs::write(
@@ -1044,6 +1057,7 @@ mod tests {
 
     #[test]
     fn test_env_overrides() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut cfg = Config::default();
         std::env::set_var("SYNAPSE_PEER_PORT", "59999");
         std::env::set_var("SYNAPSE_DOWNLOAD_QUEUE_SIZE", "12");
@@ -1065,6 +1079,7 @@ mod tests {
 
     #[test]
     fn malformed_config_file_is_a_hard_error() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("synapse.toml");
         fs::write(&path, "this is not valid toml {{{").unwrap();
@@ -1075,6 +1090,7 @@ mod tests {
 
     #[test]
     fn test_variable_interpolation_and_root_dir() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("synapse.toml");
         fs::write(
@@ -1141,6 +1157,7 @@ mod tests {
 
     #[test]
     fn test_bandwidth_toml_parsing() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("synapse.toml");
         fs::write(
@@ -1169,6 +1186,7 @@ mod tests {
 
     #[test]
     fn test_load_example_config_file() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         let example_path = manifest_dir.join("../../example_config.toml");
         if example_path.exists() {
