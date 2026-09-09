@@ -248,11 +248,11 @@ async fn main() -> std::process::ExitCode {
     tracing::info!("✅ Storage subsystem verified (io_uring / direct I/O active)");
 
     // Generate local daemon peer_id: -SY2000-<12 random bytes>
-    let mut peer_id = [0u8; 20];
-    peer_id[0..8].copy_from_slice(b"-SY2000-");
-    for byte in &mut peer_id[8..20] {
-        *byte = rand::random::<u8>();
-    }
+    // INVARIANT: Synapse follows strict Azureus-style BEP 20 identification (-SY2000-).
+    // The peer ID prefix is intentionally hardcoded and non-customizable by end users
+    // or configuration to prevent tracker fingerprint distortion, swarm desynchronization,
+    // or client spoofing. Changes to this prefix must only occur upon engine version bumps.
+    let peer_id = synapse_engine::generate_peer_id();
 
     // Initialize Session Store and Conduit Lifecycle Dispatcher
     let session_store = match synapse_engine::SessionStore::new(&config.disk.session_dir) {

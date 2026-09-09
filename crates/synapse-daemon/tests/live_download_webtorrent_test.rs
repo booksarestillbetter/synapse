@@ -64,9 +64,7 @@ async fn test_live_download_webtorrent_swarms_and_queue_pipeline() {
 
     // 2. Initialize Disk Engine and Swarm Engine with Transmission-style Queueing
     let disk = Arc::new(DiskEngine::auto().await);
-    let mut peer_id = [0x53; 20]; // '-SY2000-...'
-    peer_id[0..8].copy_from_slice(b"-SY2000-");
-    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut peer_id[8..]);
+    let peer_id = synapse_engine::generate_peer_id();
 
     let swarm = Arc::new(SwarmEngine::new(disk.clone(), peer_id));
 

@@ -33,7 +33,10 @@ pub use local_webseed::LocalWebSeedResolver;
 pub use lsd::{DiscoveredLocalPeer, LsdManager};
 pub use metadata::MetadataFetcher;
 pub use nat::{NatManager, PortMapping, PortProtocol};
-pub use peer::{accept, accept_router, connect, parse_client_name, PeerError, PeerEvent, PeerHandle, PeerId, PeerInfo};
+pub use peer::{
+    accept, accept_router, connect, generate_peer_id, parse_client_name, PeerError, PeerEvent,
+    PeerHandle, PeerId, PeerInfo, SYNAPSE_PEER_ID_PREFIX,
+};
 pub use pex::PexManager;
 pub use queue::{QueueAction, QueueConfig, QueueManager};
 pub use ratelimit::TokenBucket;

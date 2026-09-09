@@ -322,14 +322,40 @@ pub fn parse_client_name(peer_id: &[u8; 20]) -> String {
     }
 }
 
+/// Standard BEP 20 Azureus-style peer ID prefix for Synapse 2.0 (`-SY2000-`).
+///
+/// NOTE: Peer ID is intentionally invariant and strictly non-customizable by users
+/// or runtime configuration. This ensures consistent tracker protocol compatibility,
+/// proper swarm identification, and prevents tracker spoofing or fingerprint distortion.
+/// Any change to this prefix must only occur across official major/minor version bumps.
+pub const SYNAPSE_PEER_ID_PREFIX: &[u8; 8] = b"-SY2000-";
+
+/// Generates a local peer ID using the fixed BEP 20 Synapse prefix (`-SY2000-`)
+/// followed by 12 random bytes.
+pub fn generate_peer_id() -> [u8; 20] {
+    let mut peer_id = [0u8; 20];
+    peer_id[0..8].copy_from_slice(SYNAPSE_PEER_ID_PREFIX);
+    for byte in &mut peer_id[8..20] {
+        *byte = rand::random::<u8>();
+    }
+    peer_id
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
+    fn test_generate_peer_id() {
+        let peer_id = generate_peer_id();
+        assert_eq!(&peer_id[0..8], SYNAPSE_PEER_ID_PREFIX);
+        assert_eq!(parse_client_name(&peer_id), "Synapse 2.0.0");
+    }
+
+    #[test]
     fn test_parse_client_name() {
         let mut id = [0u8; 20];
-        id[..8].copy_from_slice(b"-SY2000-");
+        id[..8].copy_from_slice(SYNAPSE_PEER_ID_PREFIX);
         assert_eq!(parse_client_name(&id), "Synapse 2.0.0");
 
         id[..8].copy_from_slice(b"-qB4430-");
@@ -345,3 +371,4 @@ mod tests {
         assert_eq!(parse_client_name(&id), "Deluge 1.3.6");
     }
 }
+

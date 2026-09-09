@@ -125,6 +125,7 @@ Memory (RSS) at 50,000 Torrents:
   - Automatic URL sanitization: Passkeys and auth tokens are stripped from logs and telemetry.
   - Encrypted Session Store: Swarm resume states and configuration are encrypted on disk via ChaCha20-Poly1305 AEAD.
   - Socket leak prevention: Clean TCP FIN/RST shutdown with timeout safeguards against lingering `CLOSE_WAIT` states.
+  - Strict Invariant Peer Identification: Adheres strictly to Azureus-style BEP 20 conventions (`-SY2000-...`). The peer identifier prefix is intentionally hardcoded and non-customizable by end users via configuration, CLI flags, or RPC to protect against swarm spoofing, tracker desynchronization, and fingerprint manipulation until official engine version bumps.
 - **Transmission**:
   - Historically vulnerable to DNS rebinding attacks (mitigated via `rpc-host-whitelist`). Written in C/C++, requiring vigilant memory auditing.
 - **qBittorrent**:
@@ -155,7 +156,6 @@ Memory (RSS) at 50,000 Torrents:
 | Swarm Virtualization (Hot/Warm/Cold) | ✅ 3-Tier | ❌ Monolithic | ❌ Monolithic | ❌ Monolithic |
 | Sub-50 MB Memory @ 50k Torrents | ✅ Yes (~35 MB) | ❌ No (> 1.2 GB) | ❌ No (> 1.8 GB) | ❌ No (> 2.5 GB) |
 | Encrypted State Storage | ✅ redb + AEAD | ❌ Plaintext | ❌ Plaintext | ❌ Plaintext |
-| Peer ID Customization | ✅ `-SY2000-` | `-TR4050-` | `-qB5000-` | `-DE2000-` |
 | **APIs & Integration** | | | | |
 | gRPC / Protocol Buffers | ✅ HTTP/2 gRPC | ❌ No | ❌ No | ❌ No |
 | Delta Streaming Sync | ✅ Bidirectional | ❌ Polling only | ⚠️ RID Polling | ❌ Full Broadcast |
