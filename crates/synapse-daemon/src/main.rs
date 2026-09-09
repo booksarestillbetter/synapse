@@ -247,8 +247,8 @@ async fn main() -> std::process::ExitCode {
     }
     tracing::info!("✅ Storage subsystem verified (io_uring / direct I/O active)");
 
-    // Generate local daemon peer_id: -SY2000-<12 random bytes>
-    // INVARIANT: Synapse follows strict Azureus-style BEP 20 identification (-SY2000-).
+    // Generate local daemon peer_id: -SY2200-<12 random bytes>
+    // INVARIANT: Synapse follows strict Azureus-style BEP 20 identification (-SY2200-).
     // The peer ID prefix is intentionally hardcoded and non-customizable by end users
     // or configuration to prevent tracker fingerprint distortion, swarm desynchronization,
     // or client spoofing. Changes to this prefix must only occur upon engine version bumps.

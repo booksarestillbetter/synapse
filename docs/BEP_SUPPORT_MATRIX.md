@@ -20,7 +20,7 @@ Synapse 2.0 provides standard-compliant implementations and compatibility across
 | **17** | HTTP Seeding (Hoffman Style) | WebSeed | **Supported** | `synapse-engine::hoffman` | HTTP GET piece and byte range formatting (`?info_hash=...&piece=...&ranges=...`). |
 | **18** | Search Engine Specification | Search | **Supported** | `synapse-meta::bep18` | Bencode and XML torrent search engine schema models and serialization. |
 | **19** | WebSeed (GetRight HTTP/FTP Seeding) | WebSeed | **Supported** | `synapse-engine::webseed` | `url-list` HTTP/HTTPS `Range: bytes={start}-{end}` piece mirror downloading. |
-| **20** | Peer ID Conventions | Wire | **Supported** | `synapse-engine::peer` | Azureus-style peer identification (`-SY2000-...`). |
+| **20** | Peer ID Conventions | Wire | **Supported** | `synapse-engine::peer` | Azureus-style peer identification (`-SY2200-...`). |
 | **21** | Extension for Partial Seeds (`dont_have`) | Picker | **Supported** | `synapse-picker::priority` | Deselected piece masking so partial seeders are properly represented in swarms. |
 | **22** | Local Peer Discovery (IPv6) | Discovery | **Supported** | `synapse-wire::lsd`, `synapse-engine::lsd` | IPv6 SSDP multicast local peer discovery on `[ff15::efc0:988f]:6771`. |
 | **23** | Tracker Returns Compact Peer List | Tracker | **Supported** | `synapse-tracker::http` | 6-byte IPv4 (`4-byte IP + 2-byte port`) compact peer representation. |

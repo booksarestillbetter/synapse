@@ -125,7 +125,7 @@ Memory (RSS) at 50,000 Torrents:
   - Automatic URL sanitization: Passkeys and auth tokens are stripped from logs and telemetry.
   - Encrypted Session Store: Swarm resume states and configuration are encrypted on disk via ChaCha20-Poly1305 AEAD.
   - Socket leak prevention: Clean TCP FIN/RST shutdown with timeout safeguards against lingering `CLOSE_WAIT` states.
-  - Strict Invariant Peer Identification: Adheres strictly to Azureus-style BEP 20 conventions (`-SY2000-...`). The peer identifier prefix is intentionally hardcoded and non-customizable by end users via configuration, CLI flags, or RPC to protect against swarm spoofing, tracker desynchronization, and fingerprint manipulation until official engine version bumps.
+  - Strict Invariant Peer Identification: Adheres strictly to Azureus-style BEP 20 conventions (`-SY2200-...`). The peer identifier prefix is intentionally hardcoded and non-customizable by end users via configuration, CLI flags, or RPC to protect against swarm spoofing, tracker desynchronization, and fingerprint manipulation until official engine version bumps.
 - **Transmission**:
   - Historically vulnerable to DNS rebinding attacks (mitigated via `rpc-host-whitelist`). Written in C/C++, requiring vigilant memory auditing.
 - **qBittorrent**:
