@@ -176,6 +176,15 @@ listen_addr = "0.0.0.0:8080"
 # Default: true
 cors_enabled = true
 
+[web]
+# Lightweight, zero-dependency TransGUI / qBittorrent-style Web Interface.
+# Served directly on [http_api].listen_addr root ("/") when enabled.
+# Default: true
+enabled = true
+# Optional path to override embedded web assets with custom static files.
+# Default: unset (uses embedded high-performance assets)
+# web_root = "/var/lib/synapse/web"
+
 [metrics]
 # Prometheus exposition on [http_api].listen_addr + this path — also requires
 # [http_api].enabled = true above, since it's served from the same Axum router.

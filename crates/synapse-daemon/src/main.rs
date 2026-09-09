@@ -443,16 +443,21 @@ async fn main() -> std::process::ExitCode {
         });
     }
 
-    // Optional Alternative REST HTTP API / Swagger UI & Prometheus Metrics
+    // Optional Alternative REST HTTP API / Web UI / Swagger UI & Prometheus Metrics
     if config.http_api.enabled {
         let http_addr = config.http_api.listen_addr;
         let http_engine = swarm.clone();
         let http_auth = auth_token.clone();
         let metrics_enabled = config.metrics.enabled;
+        let web_config = config.web.clone();
         let mut http_shutdown = shutdown_rx.clone();
         tokio::spawn(async move {
-            let app = synapse_rpc::create_http_router_full(http_engine, http_auth, metrics_enabled);
-            tracing::info!("🌐 REST API & Swagger UI listening on http://{}", http_addr);
+            let web_enabled = web_config.enabled;
+            let app = synapse_rpc::create_http_router_all(http_engine, http_auth, metrics_enabled, web_config);
+            tracing::info!("🌐 REST API & Web Server listening on http://{}", http_addr);
+            if web_enabled {
+                tracing::info!("   - Web Interface:          http://{}/", http_addr);
+            }
             tracing::info!("   - Interactive Swagger UI: http://{}/swagger-ui", http_addr);
             if metrics_enabled {
                 tracing::info!("   - Prometheus Metrics:     http://{}/metrics", http_addr);

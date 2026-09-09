@@ -5,9 +5,13 @@ pub mod proto;
 pub mod service;
 pub mod swagger;
 pub mod url_fetcher;
+pub mod web;
 
 pub use event_bus::EventBus;
-pub use http_api::{create_http_router, create_http_router_full, create_http_router_with_auth};
+pub use http_api::{
+    create_http_router, create_http_router_all, create_http_router_full,
+    create_http_router_with_auth,
+};
 pub use metrics::{render_prometheus_metrics, PrometheusSnapshot};
 pub use proto::v2 as proto_v2;
 pub use service::SynapseService;

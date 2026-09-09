@@ -20,6 +20,23 @@ use crate::swagger::{get_swagger_ui_html, OPENAPI_JSON};
 pub struct ApiState {
     pub engine: Arc<SwarmEngine>,
     pub auth_token: Option<String>,
+    pub web_config: synapse_config::WebConfig,
+}
+
+#[derive(Debug, Serialize, Deserialize, Default)]
+pub struct DeleteTorrentQuery {
+    pub delete_data: Option<bool>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Default)]
+pub struct UploadTorrentQuery {
+    pub download_dir: Option<String>,
+    pub paused: Option<bool>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SetLocationRequest {
+    pub new_download_dir: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]
@@ -121,7 +138,25 @@ pub fn create_http_router_full(
     auth_token: Option<String>,
     metrics_enabled: bool,
 ) -> Router {
-    let state = ApiState { engine, auth_token };
+    create_http_router_all(
+        engine,
+        auth_token,
+        metrics_enabled,
+        synapse_config::WebConfig::default(),
+    )
+}
+
+pub fn create_http_router_all(
+    engine: Arc<SwarmEngine>,
+    auth_token: Option<String>,
+    metrics_enabled: bool,
+    web_config: synapse_config::WebConfig,
+) -> Router {
+    let state = ApiState {
+        engine,
+        auth_token,
+        web_config: web_config.clone(),
+    };
 
     let protected = Router::new()
         .route(
@@ -129,13 +164,23 @@ pub fn create_http_router_full(
             get(get_session_settings_handler).patch(update_session_settings_handler),
         )
         .route("/api/v1/session/stats", get(session_stats_handler))
-        .route("/api/v1/torrents", get(list_torrents_handler).post(add_torrent_handler))
+        .route(
+            "/api/v1/torrents",
+            get(list_torrents_handler).post(add_torrent_handler),
+        )
+        .route("/api/v1/torrents/upload", post(upload_torrent_handler))
         .route(
             "/api/v1/torrents/:info_hash",
             get(get_torrent_handler).delete(delete_torrent_handler),
         )
+        .route(
+            "/api/v1/torrents/:info_hash/detail",
+            get(get_torrent_detail_handler),
+        )
         .route("/api/v1/torrents/:info_hash/pause", post(pause_torrent_handler))
         .route("/api/v1/torrents/:info_hash/resume", post(resume_torrent_handler))
+        .route("/api/v1/torrents/:info_hash/recheck", post(recheck_torrent_handler))
+        .route("/api/v1/torrents/:info_hash/location", post(set_location_handler))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_auth));
 
     let mut public = Router::new()
@@ -145,6 +190,16 @@ pub fn create_http_router_full(
 
     if metrics_enabled {
         public = public.route("/metrics", get(metrics_handler));
+    }
+
+    if web_config.enabled {
+        public = public
+            .route("/", get(crate::web::web_index_handler))
+            .route("/index.html", get(crate::web::web_index_handler))
+            .route("/web", get(crate::web::web_index_handler))
+            .route("/style.css", get(crate::web::web_css_handler))
+            .route("/app.js", get(crate::web::web_js_handler))
+            .route("/favicon.ico", get(crate::web::web_favicon_handler));
     }
 
     protected.merge(public).with_state(state)
@@ -289,6 +344,10 @@ async fn list_torrents_handler(
                 "downloaded_bytes": s.downloaded_bytes,
                 "uploaded_bytes": s.uploaded_bytes,
                 "peers_connected": s.peers_connected,
+                "peers_sending": s.peers_sending,
+                "eta_seconds": s.eta_seconds,
+                "ratio": s.ratio,
+                "download_dir": s.download_dir,
                 "state": format!("{:?}", s.state),
                 "tier": format!("{:?}", s.tier),
             })
@@ -421,6 +480,7 @@ async fn get_torrent_handler(
 async fn delete_torrent_handler(
     State(state): State<ApiState>,
     Path(info_hash_str): Path<String>,
+    Query(query): Query<DeleteTorrentQuery>,
 ) -> Result<Json<ActionResponse>, StatusCode> {
     let hash_bytes = hex::decode(&info_hash_str).map_err(|_| StatusCode::BAD_REQUEST)?;
     if hash_bytes.len() != 20 {
@@ -429,10 +489,251 @@ async fn delete_torrent_handler(
     let mut hash = [0u8; 20];
     hash.copy_from_slice(&hash_bytes);
 
+    let target_path = if let Some(handle) = state.engine.get_torrent(&hash) {
+        let stats = handle.stats.read();
+        Some(std::path::PathBuf::from(&stats.download_dir).join(&stats.name))
+    } else {
+        None
+    };
+
     if state.engine.remove_torrent(&hash) {
+        if query.delete_data.unwrap_or(false) {
+            if let Some(path) = target_path {
+                if path.is_dir() {
+                    let _ = std::fs::remove_dir_all(&path);
+                } else if path.is_file() {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+        }
         Ok(Json(ActionResponse {
             success: true,
             message: "Torrent removed successfully".to_string(),
+        }))
+    } else {
+        Err(StatusCode::NOT_FOUND)
+    }
+}
+
+async fn get_torrent_detail_handler(
+    State(state): State<ApiState>,
+    Path(info_hash_str): Path<String>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let hash_bytes = hex::decode(&info_hash_str).map_err(|_| StatusCode::BAD_REQUEST)?;
+    if hash_bytes.len() != 20 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let mut hash = [0u8; 20];
+    hash.copy_from_slice(&hash_bytes);
+
+    let Some(handle) = state.engine.get_torrent(&hash) else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+
+    let stats = handle.stats.read().clone();
+    let piece_count = handle.info.pieces();
+    let piece_size = handle.info.piece_len;
+    let total_pieces = piece_count as usize;
+    let is_seeding = stats.state == synapse_engine::SwarmState::Seeding;
+
+    let bf_guard = handle.compressed_bitfield.read();
+    let uncompressed_bf = bf_guard.as_ref().map(|b| b.to_bitfield());
+    let piece_bitfield_bytes = if let Some(ref bf) = uncompressed_bf {
+        bf.as_bytes().to_vec()
+    } else if is_seeding {
+        let mut full_bf = synapse_picker::Bitfield::new(total_pieces);
+        for i in 0..total_pieces {
+            full_bf.set(i);
+        }
+        full_bf.as_bytes().to_vec()
+    } else {
+        let empty_bf = synapse_picker::Bitfield::new(total_pieces);
+        empty_bf.as_bytes().to_vec()
+    };
+    let piece_bitfield_hex = hex::encode(&piece_bitfield_bytes);
+
+    let mut files_json = Vec::new();
+    for (idx, f) in handle.info.files.iter().enumerate() {
+        let (bytes_completed, progress) = if is_seeding {
+            (f.length, 1.0)
+        } else if f.length == 0 {
+            (0, 1.0)
+        } else if let Some(ref bf) = uncompressed_bf {
+            let f_start = handle.info.file_offsets.get(idx).copied().unwrap_or(0);
+            let f_end = f_start + f.length;
+            let piece_len = handle.info.piece_len as u64;
+            let first_piece = (f_start / piece_len) as usize;
+            let last_piece = ((f_end.saturating_sub(1)) / piece_len) as usize;
+            let mut done = 0u64;
+            for p in first_piece..=last_piece.min(total_pieces.saturating_sub(1)) {
+                if bf.has(p) {
+                    let p_start = p as u64 * piece_len;
+                    let p_end = (p_start + piece_len).min(handle.info.total_len);
+                    let overlap_start = f_start.max(p_start);
+                    let overlap_end = f_end.min(p_end);
+                    if overlap_end > overlap_start {
+                        done += overlap_end - overlap_start;
+                    }
+                }
+            }
+            let prog = if f.length > 0 { (done as f64 / f.length as f64) as f32 } else { 1.0 };
+            (done, prog.min(1.0))
+        } else {
+            (0, 0.0)
+        };
+
+        files_json.push(serde_json::json!({
+            "index": idx,
+            "path": f.path.to_string_lossy(),
+            "size_bytes": f.length,
+            "bytes_completed": bytes_completed,
+            "progress": progress,
+            "priority": 4,
+        }));
+    }
+
+    let mut trackers_json = Vec::new();
+    let reports = state.engine.get_tracker_reports(&hash);
+    for rep in reports {
+        trackers_json.push(serde_json::json!({
+            "url": rep.url,
+            "status": rep.status,
+            "seeders": rep.seeders,
+            "leechers": rep.leechers,
+            "next_announce_in": rep.next_announce_in,
+            "failure_reason": rep.failure_reason,
+        }));
+    }
+
+    let mut peers_json = Vec::new();
+    let live_peers_snapshot = handle.live_peers.read().clone();
+    for p in live_peers_snapshot {
+        peers_json.push(serde_json::json!({
+            "address": p.addr.to_string(),
+            "client_name": p.client_name,
+            "flags": p.flags,
+            "rate_to_client": p.rate_to_client,
+            "rate_to_peer": p.rate_to_peer,
+            "progress": p.progress,
+            "is_encrypted": p.is_encrypted,
+            "is_utp": p.is_utp,
+        }));
+    }
+
+    Ok(Json(serde_json::json!({
+        "info_hash": hex::encode(stats.info_hash),
+        "name": stats.name,
+        "download_dir": stats.download_dir,
+        "total_bytes": stats.total_size,
+        "progress": stats.progress,
+        "download_rate": stats.download_rate,
+        "upload_rate": stats.upload_rate,
+        "downloaded_bytes": stats.downloaded_bytes,
+        "uploaded_bytes": stats.uploaded_bytes,
+        "ratio": stats.ratio,
+        "eta_seconds": stats.eta_seconds,
+        "peers_connected": stats.peers_connected,
+        "peers_sending": stats.peers_sending,
+        "state": format!("{:?}", stats.state),
+        "tier": format!("{:?}", stats.tier),
+        "piece_count": piece_count,
+        "piece_size": piece_size,
+        "piece_bitfield": piece_bitfield_hex,
+        "files": files_json,
+        "trackers": trackers_json,
+        "active_peers": peers_json,
+    })))
+}
+
+async fn upload_torrent_handler(
+    State(state): State<ApiState>,
+    Query(query): Query<UploadTorrentQuery>,
+    bytes: axum::body::Bytes,
+) -> Result<Json<ActionResponse>, (StatusCode, Json<ActionResponse>)> {
+    if bytes.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ActionResponse {
+                success: false,
+                message: "Empty torrent payload".to_string(),
+            }),
+        ));
+    }
+
+    let bencode = synapse_bencode::decode_buf(&bytes).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ActionResponse {
+                success: false,
+                message: format!("Invalid bencode: {e}"),
+            }),
+        )
+    })?;
+
+    let info = synapse_meta::Info::from_bencode(bencode).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ActionResponse {
+                success: false,
+                message: format!("Invalid .torrent metadata: {e}"),
+            }),
+        )
+    })?;
+
+    let dir = query
+        .download_dir
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+
+    let handle = state.engine.add_torrent(std::sync::Arc::new(info), dir, None);
+    let hash = handle.stats.read().info_hash;
+    if query.paused.unwrap_or(false) {
+        state.engine.transition_to_cold(&hash);
+    }
+
+    Ok(Json(ActionResponse {
+        success: true,
+        message: format!("Torrent added successfully with info_hash={}", hex::encode(hash)),
+    }))
+}
+
+async fn recheck_torrent_handler(
+    State(state): State<ApiState>,
+    Path(info_hash_str): Path<String>,
+) -> Result<Json<ActionResponse>, StatusCode> {
+    let hash_bytes = hex::decode(&info_hash_str).map_err(|_| StatusCode::BAD_REQUEST)?;
+    if hash_bytes.len() != 20 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let mut hash = [0u8; 20];
+    hash.copy_from_slice(&hash_bytes);
+
+    if state.engine.recheck_torrent(&hash) {
+        Ok(Json(ActionResponse {
+            success: true,
+            message: "Recheck dispatched".to_string(),
+        }))
+    } else {
+        Err(StatusCode::NOT_FOUND)
+    }
+}
+
+async fn set_location_handler(
+    State(state): State<ApiState>,
+    Path(info_hash_str): Path<String>,
+    Json(payload): Json<SetLocationRequest>,
+) -> Result<Json<ActionResponse>, StatusCode> {
+    let hash_bytes = hex::decode(&info_hash_str).map_err(|_| StatusCode::BAD_REQUEST)?;
+    if hash_bytes.len() != 20 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let mut hash = [0u8; 20];
+    hash.copy_from_slice(&hash_bytes);
+
+    if state.engine.set_location(&hash, &payload.new_download_dir) {
+        Ok(Json(ActionResponse {
+            success: true,
+            message: "Location updated".to_string(),
         }))
     } else {
         Err(StatusCode::NOT_FOUND)

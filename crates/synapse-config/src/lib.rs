@@ -34,6 +34,7 @@ pub struct Config {
     pub metrics: MetricsConfig,
     pub queue: QueueConfig,
     pub bandwidth: BandwidthConfig,
+    pub web: WebConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -409,6 +410,22 @@ impl Default for MetricsConfig {
         Self {
             enabled: true,
             path: "/metrics".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WebConfig {
+    pub enabled: bool,
+    pub web_root: Option<PathBuf>,
+}
+
+impl Default for WebConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            web_root: None,
         }
     }
 }
@@ -849,6 +866,14 @@ impl Config {
                 self.http_api.listen_addr = addr;
             }
         }
+        if let Ok(val) = std::env::var("SYNAPSE_WEB_ENABLED") {
+            if let Ok(b) = val.parse::<bool>() {
+                self.web.enabled = b;
+            }
+        }
+        if let Ok(val) = std::env::var("SYNAPSE_WEB_ROOT") {
+            self.web.web_root = Some(PathBuf::from(val));
+        }
 
         // Bandwidth
         if let Ok(val) = std::env::var("SYNAPSE_DOWNLOAD_LIMIT_ENABLED") {
@@ -1200,7 +1225,24 @@ mod tests {
             assert_eq!(cfg.bandwidth.upload_limit_bytes, 125_000_000);
             assert_eq!(cfg.bandwidth.alt_speed.download_limit_bytes, 625_000);
             assert_eq!(cfg.bandwidth.alt_speed.upload_limit_bytes, 125_000);
+            assert!(cfg.web.enabled);
         }
+    }
+
+    #[test]
+    fn test_web_config_defaults_and_parsing() {
+        let default_cfg = Config::default();
+        assert!(default_cfg.web.enabled);
+        assert_eq!(default_cfg.web.web_root, None);
+
+        let toml_str = r#"
+        [web]
+        enabled = false
+        web_root = "/var/www/synapse-custom"
+        "#;
+        let parsed: Config = toml::from_str(toml_str).unwrap();
+        assert!(!parsed.web.enabled);
+        assert_eq!(parsed.web.web_root, Some(PathBuf::from("/var/www/synapse-custom")));
     }
 }
 

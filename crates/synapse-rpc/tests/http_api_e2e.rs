@@ -106,3 +106,131 @@ async fn test_rest_api_full_crud_and_metrics_lifecycle() {
     let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(val["torrents"].as_array().unwrap().len(), 0);
 }
+
+#[tokio::test]
+async fn test_web_interface_enabled_and_disabled_modes() {
+    let disk = Arc::new(diskio::DiskEngine::auto().await);
+    let engine = Arc::new(SwarmEngine::new(disk, [0u8; 20]));
+
+    // 1. Test with Web UI ENABLED
+    let web_cfg = synapse_config::WebConfig {
+        enabled: true,
+        ..Default::default()
+    };
+    let app_enabled = synapse_rpc::create_http_router_all(engine.clone(), None, true, web_cfg);
+
+    // Root /
+    let req = Request::builder().uri("/").body(Body::empty()).unwrap();
+    let resp = app_enabled.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), 100_000).await.unwrap();
+    let html = String::from_utf8_lossy(&body);
+    assert!(html.contains("Synapse 2.0 Web Client"));
+    assert!(html.contains("Turtle Mode"));
+
+    // Style CSS
+    let req_css = Request::builder().uri("/style.css").body(Body::empty()).unwrap();
+    let resp_css = app_enabled.clone().oneshot(req_css).await.unwrap();
+    assert_eq!(resp_css.status(), StatusCode::OK);
+    assert_eq!(resp_css.headers().get("content-type").unwrap(), "text/css; charset=utf-8");
+
+    // App JS
+    let req_js = Request::builder().uri("/app.js").body(Body::empty()).unwrap();
+    let resp_js = app_enabled.clone().oneshot(req_js).await.unwrap();
+    assert_eq!(resp_js.status(), StatusCode::OK);
+    assert_eq!(resp_js.headers().get("content-type").unwrap(), "application/javascript; charset=utf-8");
+
+    // Favicon
+    let req_fav = Request::builder().uri("/favicon.ico").body(Body::empty()).unwrap();
+    let resp_fav = app_enabled.clone().oneshot(req_fav).await.unwrap();
+    assert_eq!(resp_fav.status(), StatusCode::OK);
+
+    // 2. Test with Web UI DISABLED
+    let web_cfg_disabled = synapse_config::WebConfig {
+        enabled: false,
+        ..Default::default()
+    };
+    let app_disabled = synapse_rpc::create_http_router_all(engine.clone(), None, true, web_cfg_disabled);
+
+    let req_root_disabled = Request::builder().uri("/").body(Body::empty()).unwrap();
+    let resp_root_disabled = app_disabled.clone().oneshot(req_root_disabled).await.unwrap();
+    assert_eq!(resp_root_disabled.status(), StatusCode::NOT_FOUND);
+
+    let req_js_disabled = Request::builder().uri("/app.js").body(Body::empty()).unwrap();
+    let resp_js_disabled = app_disabled.clone().oneshot(req_js_disabled).await.unwrap();
+    assert_eq!(resp_js_disabled.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_rest_api_detail_upload_and_settings_patch() {
+    let disk = Arc::new(diskio::DiskEngine::auto().await);
+    let engine = Arc::new(SwarmEngine::new(disk, [0u8; 20]));
+    let app = synapse_rpc::create_http_router(engine.clone());
+
+    // 1. Add Magnet Torrent
+    let magnet_req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/torrents")
+        .header("Content-Type", "application/json")
+        .body(Body::from(
+            r#"{"magnet": "magnet:?xt=urn:btih:aabbccddeeff00112233aabbccddeeff00112233&dn=Debian+Netinst"}"#,
+        ))
+        .unwrap();
+    let resp = app.clone().oneshot(magnet_req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // 2. Query Detail endpoint
+    let detail_req = Request::builder()
+        .uri("/api/v1/torrents/aabbccddeeff00112233aabbccddeeff00112233/detail")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(detail_req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), 50_000).await.unwrap();
+    let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(val["name"], "Debian Netinst");
+    assert_eq!(val["info_hash"], "aabbccddeeff00112233aabbccddeeff00112233");
+    assert!(val.get("piece_bitfield").is_some());
+    assert!(val.get("files").is_some());
+    assert!(val.get("trackers").is_some());
+    assert!(val.get("active_peers").is_some());
+
+    // 3. Test In-flight Session Settings PATCH
+    let patch_req = Request::builder()
+        .method("PATCH")
+        .uri("/api/v1/session")
+        .header("Content-Type", "application/json")
+        .body(Body::from(
+            r#"{
+                "download_limit_enabled": true,
+                "download_limit_bytes": 10485760,
+                "alt_speed_enabled": true
+            }"#,
+        ))
+        .unwrap();
+    let resp = app.clone().oneshot(patch_req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Verify settings updated
+    let get_settings_req = Request::builder()
+        .uri("/api/v1/session")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(get_settings_req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), 10_000).await.unwrap();
+    let s: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(s["download_limit_enabled"], true);
+    assert_eq!(s["download_limit_bytes"], 10485760);
+    assert_eq!(s["alt_speed_enabled"], true);
+
+    // 4. Delete with delete_data query parameter
+    let del_req = Request::builder()
+        .method("DELETE")
+        .uri("/api/v1/torrents/aabbccddeeff00112233aabbccddeeff00112233?delete_data=true")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(del_req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
