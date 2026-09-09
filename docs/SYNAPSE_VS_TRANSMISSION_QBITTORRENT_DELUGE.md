@@ -21,6 +21,7 @@ This document provides an in-depth technical comparison between **Synapse 2.0**,
 | **Bitfield Storage** | Roaring Bitmaps + run-length encoding (~130 B / cold swarm) | Dense byte arrays / `std::vector<bool>` | Dense byte arrays in `libtorrent::torrent` | Dense byte arrays wrapped in Python objects |
 | **Session Persistence** | Embedded encrypted `redb` (ChaCha20-Poly1305 AEAD) | Flat `.resume` bencoded files in directory | Fastresume bencoded files or SQLite database | Pickle / JSON state files |
 | **Enterprise Automation** | Integrated Conduit post-processing, atomic hardlinks, webhooks | External `script-torrent-done-filename` | External "Run external program on completion" | Python plugins (Execute, AutoAdd) |
+| **Built-in Web Interface** | **Embedded Zero-Dep WebUI** (TransGUI / qBittorrent layout) | Built-in WebUI | Built-in WebUI | WebUI via plugin / separate port |
 
 ---
 

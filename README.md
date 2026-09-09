@@ -63,9 +63,10 @@ Engineered from first principles to comfortably scale past **50,000+ concurrent 
 - **Strict Private Swarm Isolation (`synapse-config` & `synapse-engine`)**: When a private torrent (`info.private = 1`) is loaded, Synapse automatically and permanently disables DHT announces, Peer Exchange (PEX), and Local Peer Discovery (LSD). `allow_pex_on_private` is permanently hardcoded to `false` and non-configurable.
 - **Automatic Passkey Redaction (`synapse-tracker`)**: All logs, diagnostic traces, and gRPC events automatically mask passkeys and authentication tokens (`passkey=[REDACTED]`).
 
-### 6. Control Plane: gRPC, REST API, Swagger UI & Prometheus Metrics
+### 6. Control Plane: Web Interface, gRPC, REST API, Swagger UI & Prometheus Metrics
+- **Lightweight Built-In Web Interface (`synapse-rpc::web`)**: Zero-dependency, single-page web application embedded directly in the daemon binary. Features TransGUI / qBittorrent-style layout: sortable torrent table, category status filters (All, Downloading, Seeding, Paused, Queued, Checking, Error) with real-time swarm counts, in-flight settings management, drag-and-drop torrent upload, and a 6-tab bottom inspector pane (General, Transfer, Trackers, Peers with client detection, Files with priorities, and real-time `<canvas>` piece map visualizer).
 - **Sub-20 KB/s Delta Coalescing Stream (`synapse-rpc`)**: 100ms sparse delta coalescing engine (`SubscribeTorrents`) streaming state transitions across 50,000 swarms with minimal bandwidth.
-- **Alternative REST HTTP API (OpenAPI 3.1 & Swagger UI)**: Optional built-in HTTP server (`[http_api] enabled = false` by default) providing full JSON REST endpoints and interactive browser documentation at `http://127.0.0.1:8080/swagger-ui`.
+- **Alternative REST HTTP API (OpenAPI 3.1 & Swagger UI)**: Built-in HTTP server providing full JSON REST endpoints and interactive browser documentation at `http://127.0.0.1:8080/swagger-ui`. Shared on the same port as the Web Interface without CORS complexity.
 - **Prometheus Metrics Endpoint**: Optional metrics exporter (`[metrics] enabled = true` by default) rendering standard Prometheus text format at `/metrics`.
 
 ### 7. Multi-Target Logging Subsystem (Console, File & Syslog 514)

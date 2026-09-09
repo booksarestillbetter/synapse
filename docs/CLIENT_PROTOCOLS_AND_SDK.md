@@ -1,10 +1,11 @@
 # Synapse 2.0 — Client Protocols & SDK Reference
 
-Synapse 2.0 exposes two full-featured, modern control planes for external frontends, web UIs, automation scripts, and mobile/desktop clients:
+Synapse 2.0 exposes multiple full-featured, modern control planes for external frontends, web UIs, automation scripts, and mobile/desktop clients:
 
-1. **High-Performance gRPC Control Plane** (Sub-20 KB/s delta-stream over Tonic gRPC / HTTP/2 on port `50051`).
-2. **Alternative JSON REST HTTP API & Swagger UI** (Standard HTTP/1.1 & HTTP/2 REST endpoints on port `8080`).
-3. **Prometheus Metrics Exporter** (Observability metrics in Prometheus exposition format on `/metrics`).
+1. **Lightweight Built-In Web Interface** (Zero-dependency TransGUI / qBittorrent-style web client on `/`).
+2. **High-Performance gRPC Control Plane** (Sub-20 KB/s delta-stream over Tonic gRPC / HTTP/2 on port `50051`).
+3. **Alternative JSON REST HTTP API & Swagger UI** (Standard HTTP/1.1 & HTTP/2 REST endpoints on port `8080`).
+4. **Prometheus Metrics Exporter** (Observability metrics in Prometheus exposition format on `/metrics`).
 
 ### Authentication
 
@@ -334,34 +335,55 @@ message UpdateSessionSettingsResponse {
 
 ---
 
-## 2. Alternative JSON REST HTTP API
+## 2. Built-In Web Interface & REST HTTP API
 
-For environments where gRPC is impractical (simple scripts, webhooks, cURL, third-party services), Synapse includes an optional, zero-overhead REST API built on Axum.
+Synapse includes a built-in, lightweight HTTP server powered by Axum that serves both the **TransGUI / qBittorrent-style Web UI** and a comprehensive **JSON REST API** on the exact same port.
 
-### 2.1 Enabling the REST API
+### 2.1 Enabling and Configuring Ports
 In `synapse.toml`:
 ```toml
+[web]
+enabled = true
+port = 8080               # Port to listen on (e.g. 8080 or 9091)
+# listen_addr = "0.0.0.0:8080"
+# web_root = "/custom/ui" # Optional: override embedded UI with custom static files
+
 [http_api]
 enabled = true
-listen_addr = "127.0.0.1:8080"
+listen_addr = "0.0.0.0:8080"
 ```
 
-### 2.2 Endpoints Reference
+You can also override the port or address at runtime via:
+- CLI: `synapsed --http-port 8080` or `synapsed --http-addr 0.0.0.0:8080`
+- Environment variables: `SYNAPSE_WEB_PORT=8080` or `SYNAPSE_HTTP_LISTEN_ADDR="0.0.0.0:8080"`
+
+### 2.2 Built-In Web Interface (`/`)
+Point any web browser to `http://<host>:<port>/` (e.g. `http://localhost:8080/`) to access the complete torrent client dashboard:
+- **TransGUI / qBittorrent Layout**: Central sortable torrent table, category status filters (All, Downloading, Seeding, Paused, Queued, Checking, Error) with live counter badges, and global speed/disk telemetry.
+- **Bottom Inspector Pane**: 6 tabbed panes for General, Transfer, Trackers, Peers (with client identification), Files (with priority selectors), and a real-time `<canvas>` piece map visualizer.
+- **Torrent Operations**: Add via drag-and-drop `.torrent`, magnet URI, or URL; Resume; Pause; Recheck; Set location; Delete (with optional disk file purge); and in-flight session settings.
+
+### 2.3 Endpoints Reference
 
 | Method | Path | Description | Request Body | Response |
 |---|---|---|---|---|
-| `GET` | `/api/v1/health` | Health check & version | None | `{"status":"ok","version":"2.0.0"}` |
+| `GET` | `/` | Web Client HTML | None | `text/html` |
+| `GET` | `/api/v1/health` | Health check & version | None | `{"status":"ok","version":"2.2.0"}` |
 | `GET` | `/api/v1/session` | Full dynamic session settings, bitrates & turtle state | None | `{"download_limit_pretty":"50 Mbps","alt_speed_enabled":false,...}` |
 | `PATCH` | `/api/v1/session` | In-flight session settings update (accepts "50m", "1g", etc.) | JSON object with desired updates | `{"success":true,"warnings":[]}` |
 | `GET` | `/api/v1/session/stats` | Global throughput & swarm counts | None | `{"total_torrents":10,"download_rate":0,"upload_rate":0,...}` |
-| `GET` | `/api/v1/torrents` | List all torrents with live progress | None | `{"torrents":[{"info_hash":"...","name":"...","progress":1.0,...}]}` |
-| `POST` | `/api/v1/torrents` | Add torrent via magnet or raw `.torrent` | `{"magnet":"magnet:?xt=...","download_dir":null,"paused":false}` | `{"success":true,"message":"..."}` |
-| `GET` | `/api/v1/torrents/{info_hash}` | Get deep swarm inspection | None | `{"info_hash":"...","files":[...],"peers":[...]}` |
-| `DELETE` | `/api/v1/torrents/{info_hash}` | Remove torrent | None | `{"success":true,"message":"..."}` |
+| `GET` | `/api/v1/torrents` | List all torrents with live progress, ETA, and speeds | None | `{"torrents":[{"info_hash":"...","name":"...","progress":1.0,...}]}` |
+| `POST` | `/api/v1/torrents` | Add torrent via magnet or URL | `{"magnet":"magnet:?xt=...","download_dir":null,"paused":false}` | `{"success":true,"message":"..."}` |
+| `POST` | `/api/v1/torrents/upload` | Add torrent via binary `.torrent` upload | Raw binary or multipart `.torrent` | `{"success":true,"message":"...","info_hash":"..."}` |
+| `GET` | `/api/v1/torrents/{info_hash}` | Get swarm summary | None | `{"info_hash":"...","name":"...","progress":1.0}` |
+| `GET` | `/api/v1/torrents/{info_hash}/detail` | Deep inspector telemetry (trackers, peers, files, piece bitfield) | None | `{"info_hash":"...","trackers":[...],"peers":[...],"files":[...],"bitfield_hex":"..."}` |
+| `DELETE` | `/api/v1/torrents/{info_hash}` | Remove torrent (pass `?delete_data=true` to purge disk data) | None | `{"success":true,"message":"..."}` |
 | `POST` | `/api/v1/torrents/{info_hash}/pause` | Pause torrent swarm | None | `{"success":true,"message":"..."}` |
 | `POST` | `/api/v1/torrents/{info_hash}/resume` | Resume torrent swarm | None | `{"success":true,"message":"..."}` |
+| `POST` | `/api/v1/torrents/{info_hash}/recheck` | Trigger piece integrity verification | None | `{"success":true,"message":"..."}` |
+| `POST` | `/api/v1/torrents/{info_hash}/location` | Move torrent data directory | `{"location":"/new/path"}` | `{"success":true,"message":"..."}` |
 
-### 2.3 OpenAPI 3.1 Specification & Interactive Swagger UI
+### 2.4 OpenAPI 3.1 Specification & Interactive Swagger UI
 - **Swagger UI Browser Interface**: `http://127.0.0.1:8080/swagger-ui`
 - **OpenAPI 3.1 JSON Schema**: `http://127.0.0.1:8080/api-docs/openapi.json`
 

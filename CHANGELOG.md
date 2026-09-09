@@ -10,6 +10,18 @@ Brings the `v2` branch's remaining work into `master` (merge commit `278d6a8`, "
 
 ### Added
 
+- **Lightweight Built-In Web Interface & Client Management UI (`synapse-rpc::web`, `synapse-config`, `synapsed`)**:
+  - Embedded a zero-dependency, self-contained single-page web interface (HTML5, CSS3, ES6, SVG) served directly by `synapsed` with zero external runtime dependencies.
+  - Implemented TransGUI / qBittorrent-style layout:
+    - **Top Toolbar**: Add torrent (drag-and-drop `.torrent` upload, magnet link, URL), Resume, Pause, Recheck integrity, Delete (with optional disk file purge), Turtle Mode toggle, Settings modal, live search filtering, and global DL/UL speed and free disk space telemetry.
+    - **Sidebar Status Filters**: All, Downloading, Seeding, Paused, Queued, Checking, and Error with real-time swarm count badges.
+    - **Sortable Torrent Grid**: Sortable by Queue `#`, Name, Size, Progress bar, Status, Seeds, Peers, Down Speed, Up Speed, ETA, and Ratio.
+    - **Bottom Inspector Pane**: Six tabbed detail views mirroring TransGUI: General, Transfer stats, Trackers, Peers with parsed client names/versions, Files with priority selectors, and a real-time `<canvas>` piece map visualizer.
+  - Unified HTTP server architecture: the Web UI, REST API (`/api/v1/...`), Swagger UI (`/swagger-ui`), and Prometheus metrics (`/metrics`) all run on the same port, eliminating cross-origin (CORS) complications.
+  - Flexible configuration: configure via `[web]` in `synapse.toml` (`enabled`, `port`, `listen_addr`, `web_root`), environment variables (`SYNAPSE_WEB_PORT`, `SYNAPSE_WEB_LISTEN_ADDR`, `SYNAPSE_WEB_ENABLED`), or CLI flags (`--http-port`, `--http-addr`). Starting with `[web].enabled = true` automatically starts the HTTP server even if `[http_api]` is not explicitly enabled.
+  - Extended REST API endpoints: added `POST /api/v1/torrents/upload` for binary `.torrent` uploads, `GET /api/v1/torrents/:info_hash/detail` for deep swarm telemetry, `POST /api/v1/torrents/:info_hash/recheck` for re-verification, `POST /api/v1/torrents/:info_hash/location` for directory relocation, and extended deletion to support purging disk data (`delete_data=true`).
+- **Strict Invariant Peer ID Enforcement (`synapse-engine::peer`)**:
+  - Enforced a hardcoded, non-customizable BEP 20 Azureus-style client identifier prefix (`-SY2200-` matching version 2.2.0) with random suffix generation, preventing user tampering and ensuring strict protocol telemetry fidelity.
 - **First-Class `synapse-client` SDK Crate (`synapse-client`, `synapse-proto`)**:
   - Extracted the generated protobuf/Tonic bindings out of `synapse-rpc` into a standalone `synapse-proto` crate, and built `synapse-client` on top of it as the official high-level async Rust SDK: type-safe gRPC commands (add/remove torrents, file priorities, rate limits), Transmission-parity dynamic session settings and scheduled Turtle Mode, automatic reconnection with exponential backoff, and an in-memory live replica cache (`SynapseLiveCache`) backed by the 100ms sparse delta stream.
   - Updated SDK examples, wire protocol spec, and the embedded Swagger schema (`docs/CLIENT_PROTOCOLS_AND_SDK.md`, `docs/RPC.md`, `crates/synapse-rpc/src/swagger.rs`) to match.
