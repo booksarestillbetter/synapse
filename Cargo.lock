@@ -1964,7 +1964,7 @@ dependencies = [
 
 [[package]]
 name = "synapse-bench"
-version = "2.2.2"
+version = "2.2.3"
 dependencies = [
  "bytes",
  "clap",
@@ -1990,11 +1990,11 @@ dependencies = [
 
 [[package]]
 name = "synapse-bencode"
-version = "2.2.2"
+version = "2.2.3"
 
 [[package]]
 name = "synapse-client"
-version = "2.2.2"
+version = "2.2.3"
 dependencies = [
  "futures",
  "parking_lot",
@@ -2013,7 +2013,7 @@ dependencies = [
 
 [[package]]
 name = "synapse-config"
-version = "2.2.2"
+version = "2.2.3"
 dependencies = [
  "directories",
  "serde",
@@ -2024,7 +2024,7 @@ dependencies = [
 
 [[package]]
 name = "synapse-dht"
-version = "2.2.2"
+version = "2.2.3"
 dependencies = [
  "rand 0.8.8",
  "sha1",
@@ -2036,7 +2036,7 @@ dependencies = [
 
 [[package]]
 name = "synapse-diskio"
-version = "2.2.2"
+version = "2.2.3"
 dependencies = [
  "bytes",
  "io-uring",
@@ -2049,7 +2049,7 @@ dependencies = [
 
 [[package]]
 name = "synapse-engine"
-version = "2.2.2"
+version = "2.2.3"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2084,7 +2084,7 @@ dependencies = [
 
 [[package]]
 name = "synapse-meta"
-version = "2.2.2"
+version = "2.2.3"
 dependencies = [
  "parking_lot",
  "rand 0.8.8",
@@ -2098,14 +2098,14 @@ dependencies = [
 
 [[package]]
 name = "synapse-picker"
-version = "2.2.2"
+version = "2.2.3"
 dependencies = [
  "roaring",
 ]
 
 [[package]]
 name = "synapse-proto"
-version = "2.2.2"
+version = "2.2.3"
 dependencies = [
  "prost",
  "tonic",
@@ -2114,7 +2114,7 @@ dependencies = [
 
 [[package]]
 name = "synapse-rpc"
-version = "2.2.2"
+version = "2.2.3"
 dependencies = [
  "async-stream",
  "axum",
@@ -2147,7 +2147,7 @@ dependencies = [
 
 [[package]]
 name = "synapse-tracker"
-version = "2.2.2"
+version = "2.2.3"
 dependencies = [
  "parking_lot",
  "rand 0.8.8",
@@ -2162,7 +2162,7 @@ dependencies = [
 
 [[package]]
 name = "synapse-wire"
-version = "2.2.2"
+version = "2.2.3"
 dependencies = [
  "bytes",
  "hex",
@@ -2174,7 +2174,7 @@ dependencies = [
 
 [[package]]
 name = "synapsed"
-version = "2.2.2"
+version = "2.2.3"
 dependencies = [
  "axum",
  "base64",

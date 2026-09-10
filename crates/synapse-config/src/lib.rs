@@ -508,6 +508,12 @@ pub struct NetworkConfig {
     pub encryption: String,
     pub max_peers_per_torrent: usize,
     pub max_global_peers: usize,
+    /// Inline CIDR ranges (e.g. `"10.0.0.0/8"`, `"fc00::/7"`) to block, checked before
+    /// any protocol negotiation on both inbound accepts and outbound dials.
+    pub blocked_ip_ranges: Vec<String>,
+    /// Optional path to an `ipfilter.dat`-style blocklist file (eMule/PeerGuardian range
+    /// format or plain CIDR, one rule per line), merged with `blocked_ip_ranges` at startup.
+    pub ip_filter_file: Option<String>,
 }
 
 impl Default for NetworkConfig {
@@ -522,6 +528,8 @@ impl Default for NetworkConfig {
             encryption: "prefer_encrypted".to_string(),
             max_peers_per_torrent: 80,
             max_global_peers: 2000,
+            blocked_ip_ranges: Vec::new(),
+            ip_filter_file: None,
         }
     }
 }

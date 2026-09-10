@@ -42,6 +42,18 @@ pub struct PeerSnapshot {
 /// (the last block of a piece may be shorter).
 const BLOCK_LEN: u32 = 16 * 1024;
 
+/// Minimum time between BEP 19 webseed fetch attempts once a torrent has no peers --
+/// see `Torrent::maybe_fetch_via_webseed`.
+const WEBSEED_RETRY_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Fixed BEP 10 extension message IDs *we* declare for ourselves in our own handshake
+/// (`ExtensionHandshake::for_torrent`). An incoming `Message::Extension { id, .. }` is
+/// dispatched by matching against these -- per BEP 10, the sender addresses us using
+/// the IDs *we* published, not IDs from their own handshake (those instead say what
+/// *we* must use when sending *to them* -- see `peer.peer_extensions`).
+const EXT_ID_UT_METADATA: u8 = 1;
+const EXT_ID_UT_PEX: u8 = 2;
+
 /// Out-of-band control commands from the RPC layer (via `SwarmEngine`) to a running
 /// `Torrent` task — distinct from `PeerEvent` (wire-protocol events from a peer connection)
 /// since these originate from the control plane instead. Delivered on their own channel
@@ -89,6 +101,19 @@ pub struct TorrentConfig {
     pub live_peers: Arc<RwLock<Vec<PeerSnapshot>>>,
     /// Shared piece availability counts inspected by RPC / UI clients.
     pub piece_availability: Arc<RwLock<Vec<u32>>>,
+    /// Live peer-limit settings (`max_peers_per_torrent` / `max_global_peers`), read at
+    /// each connection to enforce the configured caps -- see `on_connected`.
+    pub settings: Arc<RwLock<crate::settings::DynamicSessionSettings>>,
+    /// BEP 11 Peer Exchange: peers discovered via `ut_pex` messages from connected peers
+    /// are forwarded here so the owning `SwarmEngine` can feed them into the same
+    /// candidate pool trackers use.
+    pub on_peers_discovered: Option<mpsc::Sender<Vec<SocketAddr>>>,
+    /// Shared HTTP client used for BEP 19 webseed range requests.
+    pub http_client: reqwest::Client,
+    /// BEP 9: fires once when a magnet-added torrent (constructed with a placeholder
+    /// `Info` that has no files) finishes assembling and verifying its real metadata
+    /// over the wire. `None` for a normal torrent that already has full metadata.
+    pub on_metadata_resolved: Option<oneshot::Sender<Info>>,
 }
 
 struct PeerState {
@@ -115,6 +140,10 @@ struct PeerState {
     peer_allowed_fast: HashSet<u32>,
     /// Last instant data or an unchoke was received from this peer
     last_received_at: std::time::Instant,
+    /// This peer's BEP 10 extension handshake `m` dict (extension name -> the message ID
+    /// *they* will use when sending us that extension), captured once their handshake
+    /// (`Message::Extension { id: 0, .. }`) arrives. Empty until then.
+    peer_extensions: HashMap<String, u8>,
 }
 
 struct InProgressPiece {
@@ -164,6 +193,17 @@ pub struct Torrent {
     last_activity: std::time::Instant,
     live_peers: Arc<RwLock<Vec<PeerSnapshot>>>,
     piece_availability: Arc<RwLock<Vec<u32>>>,
+    settings: Arc<RwLock<crate::settings::DynamicSessionSettings>>,
+    pex: crate::pex::PexManager,
+    last_pex_broadcast: std::time::Instant,
+    on_peers_discovered: Option<mpsc::Sender<Vec<SocketAddr>>>,
+    /// BEP 19: `None` when the torrent metadata declares no `url-list`.
+    webseed: Option<crate::webseed::WebSeedManager>,
+    last_webseed_attempt: std::time::Instant,
+    http_client: reqwest::Client,
+    metadata_fetcher: Option<crate::metadata::MetadataFetcher>,
+    on_metadata_resolved: Option<oneshot::Sender<Info>>,
+    metadata_resolved: bool,
 }
 
 impl Torrent {
@@ -177,6 +217,26 @@ impl Torrent {
             on_complete.push(tx);
         }
         let starting_uploaded = config.stats.read().uploaded_bytes;
+        let is_private = config.info.private;
+        // NB: `Info::url_list` is (confusingly) the tracker `announce-list`; the actual
+        // BEP 19 webseed URLs live in `Info::web_seeds`, parsed from the torrent's
+        // `url-list` key. Unlike DHT/PEX/LSD, BEP 27 does not restrict webseeds on
+        // private torrents -- a webseed entry is an HTTP mirror the torrent publisher
+        // controls directly, not a peer-discovery mechanism that leaks swarm membership.
+        let webseed = if config.info.web_seeds.is_empty() {
+            None
+        } else {
+            Some(crate::webseed::WebSeedManager::new(&config.info.web_seeds))
+        };
+        // A magnet-added torrent is constructed with a placeholder `Info` that carries
+        // an info_hash but no files (see `SwarmEngine::add_magnet` / `Info::from_magnet`).
+        // Real parsed torrents always have at least one file (`Info::from_bencode`
+        // rejects an empty file list), so this is a reliable "awaiting metadata" test.
+        let metadata_fetcher = if config.info.files.is_empty() {
+            Some(crate::metadata::MetadataFetcher::new(config.info.hash))
+        } else {
+            None
+        };
         Torrent {
             info: config.info,
             download_dir: config.download_dir,
@@ -200,6 +260,18 @@ impl Torrent {
             last_activity: std::time::Instant::now(),
             live_peers: config.live_peers,
             piece_availability: config.piece_availability,
+            settings: config.settings,
+            pex: crate::pex::PexManager::new(is_private),
+            last_pex_broadcast: std::time::Instant::now(),
+            on_peers_discovered: config.on_peers_discovered,
+            webseed,
+            // Set in the past so a torrent with no peers can try its webseed on the very
+            // first tick, rather than waiting a full retry interval after construction.
+            last_webseed_attempt: std::time::Instant::now() - WEBSEED_RETRY_INTERVAL,
+            http_client: config.http_client,
+            metadata_fetcher,
+            on_metadata_resolved: config.on_metadata_resolved,
+            metadata_resolved: false,
         }
     }
 
@@ -232,6 +304,10 @@ impl Torrent {
         // once `commands` closes but `events` hasn't yet.
         let mut commands_open = true;
         loop {
+            if self.metadata_resolved {
+                tracing::debug!(name = %self.info.name, "Metadata-only actor exiting after successful resolution");
+                break;
+            }
             tokio::select! {
                 ev = events.recv() => {
                     self.last_activity = std::time::Instant::now();
@@ -297,6 +373,31 @@ impl Torrent {
     }
 
     async fn on_connected(&mut self, handle: PeerHandle, info: PeerInfo) {
+        let (max_per_torrent, max_global) = {
+            let s = self.settings.read();
+            (s.max_peers_per_torrent, s.max_global_peers)
+        };
+        if self.peers.len() >= max_per_torrent {
+            tracing::debug!(
+                name = %self.info.name,
+                addr = %info.addr,
+                limit = max_per_torrent,
+                "Rejecting peer connection: per-torrent peer cap reached"
+            );
+            return; // dropping `handle` closes the connection, see peer::spawn
+        }
+        if let Some(ref m) = self.global_metrics {
+            if m.global_peers_connected.load(std::sync::atomic::Ordering::Relaxed) >= max_global {
+                tracing::debug!(
+                    name = %self.info.name,
+                    addr = %info.addr,
+                    limit = max_global,
+                    "Rejecting peer connection: global peer cap reached"
+                );
+                return;
+            }
+        }
+
         let id = handle.id;
         let num_pieces = self.info.pieces() as usize;
         let our_bitfield = if self.picker.is_complete() {
@@ -318,6 +419,7 @@ impl Torrent {
             10,
         );
         let allowed_fast_set: HashSet<u32> = allowed_fast_vec.iter().copied().collect();
+        let addr = info.addr;
 
         self.peers.insert(
             id,
@@ -339,11 +441,21 @@ impl Torrent {
                 allowed_fast: allowed_fast_set,
                 peer_allowed_fast: HashSet::new(),
                 last_received_at: std::time::Instant::now(),
+                peer_extensions: HashMap::new(),
             },
         );
+        self.pex.peer_connected(addr);
 
-        // BEP 10: Immediately send Extension Handshake message (ID 0)
-        let ext_hs = ExtensionHandshake::for_torrent(self.info.private, None).encode();
+        // BEP 10: Immediately send Extension Handshake message (ID 0). When we already
+        // have real metadata (i.e. we're not ourselves awaiting it), advertise its size
+        // so a magnet-downloading peer on the other end knows how many pieces to ask
+        // for -- see `maybe_request_metadata`, which reads this same field from peers.
+        let metadata_size = if self.metadata_fetcher.is_none() {
+            Some(self.info.to_info_dict_bytes().len() as u32)
+        } else {
+            None
+        };
+        let ext_hs = ExtensionHandshake::for_torrent(self.info.private, metadata_size).encode();
         handle
             .send(Message::Extension {
                 id: 0,
@@ -372,6 +484,7 @@ impl Torrent {
         let Some(mut peer) = self.peers.remove(&id) else {
             return;
         };
+        self.pex.peer_disconnected(peer.peer_info.addr);
         for i in 0..self.info.pieces() {
             if peer.has.has(i as usize) {
                 self.picker.peer_lost(i);
@@ -521,8 +634,54 @@ impl Torrent {
                 // when info.private is true.
                 if self.info.private {
                     tracing::trace!(peer = %id, ext_id, "Ignoring extension message on private swarm (BEP 27)");
+                } else if ext_id == 0 {
+                    // BEP 10: the peer's own extension handshake. `hs.m` names the ids
+                    // *we* must use when sending extension messages *to this peer* --
+                    // stored for that purpose (see `maybe_broadcast_pex` and the ut_metadata
+                    // request below), independent of the fixed ids we expect incoming
+                    // messages addressed to *us* to use (`EXT_ID_UT_METADATA`/`EXT_ID_UT_PEX`).
+                    match ExtensionHandshake::decode(&payload) {
+                        Ok(hs) => {
+                            let their_metadata_id = hs.m.get("ut_metadata").copied();
+                            let their_metadata_size = hs.metadata_size;
+                            if let Some(p) = self.peers.get_mut(&id) {
+                                p.peer_extensions = hs.m;
+                            }
+                            self.maybe_request_metadata(id, their_metadata_id, their_metadata_size).await;
+                        }
+                        Err(e) => {
+                            tracing::debug!(peer = %id, "Malformed extension handshake: {e}");
+                        }
+                    }
                 } else {
-                    tracing::trace!(peer = %id, ext_id, len = payload.len(), "Received extension message");
+                    match ext_id {
+                        EXT_ID_UT_METADATA => {
+                            match synapse_wire::UtMetadataMessage::decode(&payload) {
+                                Ok(msg) => self.on_ut_metadata_message(id, msg).await,
+                                Err(e) => {
+                                    tracing::debug!(peer = %id, "Malformed ut_metadata message: {e}");
+                                }
+                            }
+                        }
+                        EXT_ID_UT_PEX => {
+                            match synapse_wire::UtPexMessage::decode(&payload) {
+                                Ok(pex_msg) => {
+                                    let discovered = self.pex.ingest_pex_message(pex_msg);
+                                    if !discovered.is_empty() {
+                                        if let Some(ref tx) = self.on_peers_discovered {
+                                            let _ = tx.try_send(discovered);
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::debug!(peer = %id, "Malformed ut_pex message: {e}");
+                                }
+                            }
+                        }
+                        _ => {
+                            tracing::trace!(peer = %id, ext_id, len = payload.len(), "Received unhandled extension message");
+                        }
+                    }
                 }
             }
         }
@@ -900,7 +1059,245 @@ impl Torrent {
         });
     }
 
+    /// BEP 9: if this torrent is still awaiting metadata (magnet-added) and the peer
+    /// whose handshake we just decoded advertises `ut_metadata` with a known size,
+    /// requests every metadata piece we're still missing from them. Idempotent w.r.t.
+    /// `metadata_size` (set once) and safe to call again for a later peer if earlier
+    /// requests went unanswered -- `missing_pieces()` reflects live fetcher state.
+    async fn maybe_request_metadata(&mut self, id: PeerId, their_metadata_id: Option<u8>, their_metadata_size: Option<u32>) {
+        let (Some(metadata_id), Some(size)) = (their_metadata_id, their_metadata_size) else {
+            return;
+        };
+        let Some(fetcher) = self.metadata_fetcher.as_mut() else {
+            return;
+        };
+        fetcher.set_metadata_size(size);
+        let missing = fetcher.missing_pieces();
+        if missing.is_empty() {
+            return;
+        }
+        let Some(peer) = self.peers.get(&id) else {
+            return;
+        };
+        for piece in missing {
+            peer.handle
+                .send(Message::Extension {
+                    id: metadata_id,
+                    payload: synapse_wire::UtMetadataMessage::Request { piece }.encode(),
+                })
+                .await;
+        }
+    }
+
+    /// BEP 9: handles an incoming `ut_metadata` message. `Data` pieces are fed to the
+    /// in-progress `MetadataFetcher`; once fully assembled and hash-verified, the
+    /// resolved `Info` is handed to the owning `SwarmEngine` via `on_metadata_resolved`
+    /// and this (metadata-only, zero-piece) actor marks itself for shutdown -- the
+    /// engine re-adds the torrent under the same info_hash with the real metadata,
+    /// spawning a normal downloading `Torrent` actor in its place. `Request`s are
+    /// served from our own metadata when we have it (so we can act as a source for
+    /// other magnet-downloading peers, and so our own magnet leechers can resolve
+    /// metadata from a normal Synapse seeder at all), and rejected when we don't.
+    async fn on_ut_metadata_message(&mut self, id: PeerId, msg: synapse_wire::UtMetadataMessage) {
+        use synapse_wire::UtMetadataMessage;
+        match msg {
+            UtMetadataMessage::Request { piece } => {
+                let Some(peer) = self.peers.get(&id) else {
+                    return;
+                };
+                let Some(&their_id) = peer.peer_extensions.get("ut_metadata") else {
+                    return;
+                };
+                let response = if self.metadata_fetcher.is_none() {
+                    let info_bytes = self.info.to_info_dict_bytes();
+                    let piece_start = piece as usize * synapse_wire::UT_METADATA_PIECE_LEN;
+                    if piece_start < info_bytes.len() {
+                        let piece_end = (piece_start + synapse_wire::UT_METADATA_PIECE_LEN).min(info_bytes.len());
+                        UtMetadataMessage::Data {
+                            piece,
+                            total_size: info_bytes.len() as u32,
+                            data: Bytes::copy_from_slice(&info_bytes[piece_start..piece_end]),
+                        }
+                    } else {
+                        UtMetadataMessage::Reject { piece }
+                    }
+                } else {
+                    UtMetadataMessage::Reject { piece }
+                };
+                peer.handle
+                    .send(Message::Extension {
+                        id: their_id,
+                        payload: response.encode(),
+                    })
+                    .await;
+            }
+            UtMetadataMessage::Data { piece, data, .. } => {
+                let Some(fetcher) = self.metadata_fetcher.as_mut() else {
+                    return;
+                };
+                match fetcher.add_piece(piece, data) {
+                    Ok(Some(info)) => {
+                        tracing::info!(name = %info.name, hash = %hex::encode(info.hash), "Magnet metadata resolved via ut_metadata");
+                        if let Some(tx) = self.on_metadata_resolved.take() {
+                            let _ = tx.send(info);
+                        }
+                        self.metadata_resolved = true;
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::warn!(peer = %id, "ut_metadata assembly failed: {e}");
+                    }
+                }
+            }
+            UtMetadataMessage::Reject { piece } => {
+                tracing::debug!(peer = %id, piece, "Peer rejected ut_metadata request");
+            }
+        }
+    }
+
+    /// BEP 11: every 60s, broadcasts the accumulated added/dropped peer delta to every
+    /// connected peer that advertised `ut_pex` support in its own extension handshake.
+    /// No-ops on private swarms (`PexManager::generate_pex_message` returns `None`).
+    async fn maybe_broadcast_pex(&mut self) {
+        const PEX_INTERVAL: Duration = Duration::from_secs(60);
+        if self.last_pex_broadcast.elapsed() < PEX_INTERVAL {
+            return;
+        }
+        self.last_pex_broadcast = std::time::Instant::now();
+
+        let Some(msg) = self.pex.generate_pex_message() else {
+            return;
+        };
+        let payload = msg.encode();
+
+        // Per BEP 10, a peer's own handshake `m` dict names the extended message ID
+        // *it* wants used when messages are sent to *it* -- not necessarily the ID we
+        // declared for ourselves, though most clients pick matching IDs by convention.
+        let recipients: Vec<(PeerHandle, u8)> = self
+            .peers
+            .values()
+            .filter_map(|p| p.peer_extensions.get("ut_pex").map(|&ext_id| (p.handle.clone(), ext_id)))
+            .collect();
+
+        for (handle, ext_id) in recipients {
+            handle
+                .send(Message::Extension {
+                    id: ext_id,
+                    payload: payload.clone(),
+                })
+                .await;
+        }
+    }
+
+    /// BEP 19: when this torrent has no connected peers but a webseed is configured,
+    /// periodically pulls one missing piece directly over HTTP so a "dead" swarm (or a
+    /// freshly-added torrent with no peers yet) can still make progress. Deliberately
+    /// scoped to the no-peers case only -- bootstrapping/last-resort, not a permanent
+    /// substitute for swarm peers, so it never competes with the peer-based picker for
+    /// the same piece (nothing else could be requesting it if there are no peers).
+    ///
+    /// Note: the HTTP fetch runs inline on the torrent actor's event loop (bounded by a
+    /// request timeout) rather than as a background task, since reusing `finish_piece`'s
+    /// verification/disk-write/bookkeeping requires `&mut self`. This only blocks new
+    /// peer connections to this specific torrent for the duration of one piece fetch,
+    /// and only while it has zero peers to service anyway.
+    async fn maybe_fetch_via_webseed(&mut self) {
+        if !self.peers.is_empty() || self.picker.is_complete() {
+            return;
+        }
+        let Some(ref webseed) = self.webseed else {
+            return;
+        };
+        if !webseed.has_webseeds() || self.last_webseed_attempt.elapsed() < WEBSEED_RETRY_INTERVAL {
+            return;
+        }
+        self.last_webseed_attempt = std::time::Instant::now();
+
+        let full = Bitfield::full(self.info.pieces() as usize);
+        let Some(index) = self.picker.pick(&full, false) else {
+            return;
+        };
+
+        self.fetch_piece_via_webseed(index).await;
+    }
+
+    async fn fetch_piece_via_webseed(&mut self, index: u32) {
+        let Some((seed_idx, base_url)) = self.webseed.as_ref().and_then(|w| w.pick_active_seed()) else {
+            return;
+        };
+
+        self.picker.mark_requested(index);
+
+        let piece_len = self.info.piece_len(index);
+        let locations = self.info.block_locations(index, 0, piece_len);
+        let single_file = self.info.files.len() == 1;
+        let mut buf = vec![0u8; piece_len as usize];
+
+        for loc in &locations {
+            let file_path_rel = if single_file {
+                None
+            } else {
+                Some(self.info.files[loc.file].path.to_string_lossy().into_owned())
+            };
+
+            let range_request = self.webseed.as_ref().unwrap().format_range_request(
+                &base_url,
+                file_path_rel.as_deref(),
+                loc.file_offset,
+                loc.piece_range.len() as u32,
+            );
+            let (target_url, range_header) = match range_request {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::debug!(index, "webseed URL formatting failed: {e}");
+                    self.webseed.as_mut().unwrap().on_failure(seed_idx);
+                    self.picker.mark_missing(index);
+                    return;
+                }
+            };
+
+            let result = self
+                .http_client
+                .get(target_url)
+                .header(reqwest::header::RANGE, range_header)
+                .timeout(Duration::from_secs(20))
+                .send()
+                .await;
+
+            let fetched = match result {
+                Ok(resp) if resp.status().is_success() => resp.bytes().await.ok(),
+                _ => None,
+            };
+
+            match fetched {
+                Some(data) if data.len() == loc.piece_range.len() => {
+                    buf[loc.piece_range.clone()].copy_from_slice(&data);
+                }
+                _ => {
+                    tracing::debug!(index, url = %base_url, "webseed piece fetch failed");
+                    self.webseed.as_mut().unwrap().on_failure(seed_idx);
+                    self.picker.mark_missing(index);
+                    return;
+                }
+            }
+        }
+
+        self.webseed.as_mut().unwrap().on_success(seed_idx);
+        self.in_progress.insert(
+            index,
+            InProgressPiece {
+                buf,
+                received_blocks: HashSet::new(),
+                expected_blocks: 0,
+            },
+        );
+        self.finish_piece(index).await;
+    }
+
     async fn tick(&mut self) {
+        self.maybe_broadcast_pex().await;
+        self.maybe_fetch_via_webseed().await;
+
         let we_are_seeding = self.picker.is_complete();
         let stats: Vec<PeerStats<PeerId>> = self
             .peers

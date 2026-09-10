@@ -98,8 +98,14 @@ enum OpResponder {
 /// Everything that must stay alive, unmoved, until this operation's CQE arrives.
 struct PendingOp {
     _file: Arc<File>,
+    /// Absolute file offset for the *next* SQE this op submits -- advanced on each
+    /// short completion so a retry resumes exactly where the last one left off.
+    offset: u64,
     _write_buf: Option<Bytes>,
     read_buf: Option<BytesMut>,
+    /// Bytes already completed for this op across however many short completions
+    /// preceded this one (0 on first submission).
+    progress: usize,
     expected_len: usize,
     path: PathBuf,
     responder: OpResponder,
@@ -224,7 +230,26 @@ fn run_ring(mut ring: IoUring, rx: std_mpsc::Receiver<(Job, OpResponder)>, max_o
             .collect();
         for (user_data, result) in completed {
             if let Some(op) = pending.remove(&user_data) {
-                complete_op(op, result);
+                let fd = types::Fd(op._file.as_raw_fd());
+                if let Some((entry, retry_op)) = process_completion(fd, op, result) {
+                    let retry_id = next_id;
+                    next_id += 1;
+                    let entry = entry.user_data(retry_id);
+                    // SAFETY: same invariant as the initial submission in `submit_job` --
+                    // `retry_op` (and its buffer/file) is inserted into `pending` before
+                    // this SQE is pushed, and is only dropped after the matching CQE is
+                    // reaped in a future pass through this same loop.
+                    let push_result = unsafe { ring.submission().push(&entry) };
+                    if push_result.is_err() {
+                        fail_responder(
+                            retry_op.responder,
+                            retry_op.path,
+                            io::Error::other("io_uring submission queue full (short-completion retry)"),
+                        );
+                    } else {
+                        pending.insert(retry_id, retry_op);
+                    }
+                }
             }
         }
     }
@@ -268,7 +293,9 @@ fn submit_job(
                 .user_data(id);
             let op = PendingOp {
                 _file: file,
+                offset,
                 expected_len: data.len(),
+                progress: 0,
                 _write_buf: Some(data),
                 read_buf: None,
                 path: (*path).clone(),
@@ -284,7 +311,9 @@ fn submit_job(
                 .user_data(id);
             let op = PendingOp {
                 _file: file,
+                offset,
                 expected_len: len,
+                progress: 0,
                 _write_buf: None,
                 read_buf: Some(buf),
                 path: (*path).clone(),
@@ -296,7 +325,9 @@ fn submit_job(
             let entry = opcode::Fsync::new(fd).build().user_data(id);
             let op = PendingOp {
                 _file: file,
+                offset: 0,
                 expected_len: 0,
+                progress: 0,
                 _write_buf: None,
                 read_buf: None,
                 path: (*path).clone(),
@@ -338,28 +369,58 @@ fn fail_responder(responder: OpResponder, path: PathBuf, source: io::Error) {
     }
 }
 
-fn complete_op(op: PendingOp, result: i32) {
+/// Handles one CQE. Returns `Some((entry, op))` when the completion was short and a
+/// retry SQE for the remaining bytes must be submitted (the op stays in `pending`
+/// under a freshly minted id); returns `None` once the op is fully done (error or
+/// success already delivered to its responder).
+///
+/// `io_uring`'s plain (unregistered) Read/Write opcodes can complete with a short
+/// count, exactly like a raw `read(2)`/`write(2)` syscall can -- this resubmits an SQE
+/// covering just the unfinished remainder, exactly as a caller of `read(2)`/`write(2)`
+/// directly would be expected to loop and retry, rather than silently accepting
+/// truncated data or an incomplete write as success.
+fn process_completion(fd: types::Fd, mut op: PendingOp, result: i32) -> Option<(io_uring::squeue::Entry, PendingOp)> {
     if result < 0 {
         fail_responder(op.responder, op.path, io::Error::from_raw_os_error(-result));
-        return;
+        return None;
     }
 
-    // `io_uring`'s plain (unregistered) Read/Write opcodes can complete with a short
-    // count, exactly like a raw `read(2)`/`write(2)` syscall can. This first pass
-    // treats a short completion as an error rather than silently accepting truncated
-    // data or an incomplete write as success - proper short-write/short-read retry
-    // (resubmitting the remainder) is a known follow-up, not yet implemented.
     let n = result as usize;
-    if n != op.expected_len {
+    op.progress += n;
+
+    // A zero-length completion that still leaves bytes unaccounted for means the
+    // kernel can make no further progress at this offset (e.g. EOF on a short file) --
+    // looping again would spin forever, so this is treated as an error rather than a
+    // retry, exactly like a bare `read(2)`/`write(2)` loop must.
+    if op.progress < op.expected_len && n == 0 {
         fail_responder(
             op.responder,
             op.path,
             io::Error::other(format!(
-                "short io_uring completion: expected {} bytes, got {}",
-                op.expected_len, n
+                "io_uring op made no progress: {} of {} bytes completed",
+                op.progress, op.expected_len
             )),
         );
-        return;
+        return None;
+    }
+
+    if op.progress < op.expected_len {
+        // Short completion: resubmit an SQE for exactly the remaining bytes, resuming
+        // at the advanced file offset.
+        op.offset += n as u64;
+        let remaining = op.expected_len - op.progress;
+        let entry = match (&mut op._write_buf, &mut op.read_buf) {
+            (Some(write_buf), None) => {
+                *write_buf = write_buf.slice(n..);
+                opcode::Write::new(fd, write_buf.as_ptr(), remaining as u32).offset(op.offset).build()
+            }
+            (None, Some(read_buf)) => {
+                let ptr = unsafe { read_buf.as_mut_ptr().add(op.progress) };
+                opcode::Read::new(fd, ptr, remaining as u32).offset(op.offset).build()
+            }
+            _ => unreachable!("a pending op has exactly one of write_buf/read_buf set"),
+        };
+        return Some((entry, op));
     }
 
     match op.responder {
@@ -377,4 +438,5 @@ fn complete_op(op: PendingOp, result: i32) {
             let _ = tx.send(Ok(()));
         }
     }
+    None
 }

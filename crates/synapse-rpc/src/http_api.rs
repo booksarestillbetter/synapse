@@ -872,7 +872,7 @@ async fn metrics_handler(State(state): State<ApiState>) -> Response {
         connected_peers: m.peers_connected,
         circuit_breakers_tripped: state.engine.circuit_breaker().tripped_count()
             + state.engine.tracker_circuit_breaker().tripped_count(),
-        dht_nodes: 0,
+        dht_nodes: state.engine.dht_node_count().await,
     };
 
     let text = render_prometheus_metrics(&snapshot);

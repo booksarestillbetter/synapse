@@ -47,6 +47,8 @@ Synapse categorizes all configuration into two tiers:
 | `start_added_torrents` | `bool` | **Yes** | `start-added-torrents` | Automatically start newly added torrents |
 | `trash_original_torrent_files` | `bool` | **Yes** | `trash-original-torrent-files` | Delete `.torrent` file after successful ingestion |
 | `peer_port` / `listen_port` | `u16` | **No** | `peer-port` | Listening port for inbound peer wire connections (Default: `54345`) |
+| `blocked_ip_ranges` | `Vec<string>` | **No** | N/A | Inline CIDR ranges (e.g. `"10.0.0.0/8"`) blocked before any protocol negotiation, on both inbound accepts and outbound dials (Default: empty) |
+| `ip_filter_file` | `string` | **No** | `blocklist-url` (path only, no auto-download) | Path to an `ipfilter.dat`-style blocklist file (eMule/PeerGuardian range format or plain CIDR, one rule per line); merged with `blocked_ip_ranges` at startup (Default: none) |
 | `rpc_listen_addr` | `string` | **No** | `rpc-port` / `rpc-bind-address` | gRPC service listen address (Default: `0.0.0.0:50051`) |
 | `http_listen_addr` | `string` | **No** | N/A | REST API / Swagger UI listen address (Default: `0.0.0.0:8080`) |
 | `session_dir` | `string` | **No** | N/A | Embedded session database directory (`session.db`) |

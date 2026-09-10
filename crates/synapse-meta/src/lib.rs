@@ -594,6 +594,11 @@ impl Info {
             d.insert(b"created by".to_vec(), BEncode::String(cr.clone().into_bytes()));
         }
 
+        d.insert(b"info".to_vec(), BEncode::Dict(self.build_info_dict()));
+        BEncode::Dict(d)
+    }
+
+    fn build_info_dict(&self) -> BTreeMap<Vec<u8>, BEncode> {
         let mut i = BTreeMap::new();
         i.insert(b"name".to_vec(), BEncode::String(self.name.clone().into_bytes()));
         i.insert(b"piece length".to_vec(), BEncode::Int(self.piece_len as i64));
@@ -628,8 +633,26 @@ impl Info {
             i.insert(b"files".to_vec(), BEncode::List(files_list));
         }
 
-        d.insert(b"info".to_vec(), BEncode::Dict(i));
-        BEncode::Dict(d)
+        i
+    }
+
+    /// Encodes just the inner `info` dictionary -- the bytes a BEP 9 `ut_metadata`
+    /// exchange transfers and hashes to produce the info_hash, as opposed to
+    /// `to_torrent_bytes()`'s full `.torrent` file (announce/comment/info/...).
+    ///
+    /// Reconstructs these bytes from the parsed `Info` fields rather than retaining the
+    /// original wire bytes, so for a source torrent whose info dict used non-canonical
+    /// key ordering or carried extra/unrecognized keys this crate doesn't model, the
+    /// re-encoded bytes -- and therefore their SHA-1 -- may not exactly match the
+    /// original `info_hash`. A peer we serve metadata to always independently verifies
+    /// the hash on their end, so this fails safely (they reject it and try elsewhere)
+    /// rather than silently corrupting anything.
+    pub fn to_info_dict_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        BEncode::Dict(self.build_info_dict())
+            .encode(&mut buf)
+            .expect("in-memory encoding cannot fail");
+        buf
     }
 
     /// Encodes this `Info` struct into raw `.torrent` bencoded bytes.

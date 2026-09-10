@@ -159,6 +159,10 @@ impl Announcer {
                 let mut peers = Vec::new();
                 let mut interval = None;
                 let url_str = tracker_url.to_string();
+                // Logged in place of `tracker_url` everywhere below: private trackers
+                // commonly embed a passkey in the announce URL's query string, and
+                // docs/TRUST_AND_SAFETY.md promises it never appears in logs.
+                let safe_url = synapse_tracker::sanitize_tracker_url(&tracker_url);
 
                 if !tracker_breaker.can_announce(&url_str) {
                     let rep = TrackerReport {
@@ -210,7 +214,7 @@ impl Announcer {
                                     let is_cb = !circuit_breaker.can_connect(&resolved_addr);
                                     debug!(
                                         "[{}] Announcing to UDP tracker {} ({})",
-                                        label_c, tracker_url, resolved_addr
+                                        label_c, safe_url, resolved_addr
                                     );
                                     match tokio::time::timeout(
                                         Duration::from_secs(5),
@@ -227,7 +231,7 @@ impl Announcer {
                                             info!(
                                                 "[{}] UDP tracker {} returned {} seeders, {} leechers, {} peers (interval: {}s)",
                                                 label_c,
-                                                tracker_url,
+                                                safe_url,
                                                 resp.seeders,
                                                 resp.leechers,
                                                 resp.peers.len(),
@@ -256,7 +260,7 @@ impl Announcer {
                                             tracker_breaker.record_failure(&url_str);
                                             warn!(
                                                 "[{}] UDP tracker {} announce failed: {}",
-                                                label_c, tracker_url, e
+                                                label_c, safe_url, e
                                             );
                                             let rep = TrackerReport {
                                                 url: tracker_url.to_string(),
@@ -275,7 +279,7 @@ impl Announcer {
                                             tracker_breaker.record_failure(&url_str);
                                             warn!(
                                                 "[{}] UDP tracker {} announce timed out",
-                                                label_c, tracker_url
+                                                label_c, safe_url
                                             );
                                             let rep = TrackerReport {
                                                 url: tracker_url.to_string(),
@@ -351,7 +355,7 @@ impl Announcer {
                                 info!(
                                     "[{}] HTTP/HTTPS tracker {} returned {} seeders, {} leechers, {} peers (interval: {}s)",
                                     label_c,
-                                    tracker_url,
+                                    safe_url,
                                     resp.seeders,
                                     resp.leechers,
                                     resp.peers.len(),
@@ -380,7 +384,7 @@ impl Announcer {
                                 tracker_breaker.record_failure(&url_str);
                                 warn!(
                                     "[{}] HTTP/HTTPS tracker {} error: {}",
-                                    label_c, tracker_url, e
+                                    label_c, safe_url, e
                                 );
                                 let rep = TrackerReport {
                                     url: tracker_url.to_string(),
@@ -399,7 +403,7 @@ impl Announcer {
                                 tracker_breaker.record_failure(&url_str);
                                 warn!(
                                     "[{}] HTTP/HTTPS tracker {} timed out after 10s",
-                                    label_c, tracker_url
+                                    label_c, safe_url
                                 );
                                 let rep = TrackerReport {
                                     url: tracker_url.to_string(),
@@ -618,6 +622,8 @@ pub struct AnnounceScheduler {
     default_interval: Duration,
     max_startup_jitter: Duration,
     peer_router: RwLock<Option<PeerEventRouter>>,
+    settings: RwLock<Option<Arc<RwLock<crate::settings::DynamicSessionSettings>>>>,
+    ip_filter: RwLock<Option<Arc<RwLock<crate::ipfilter::IpFilter>>>>,
 }
 
 impl AnnounceScheduler {
@@ -637,12 +643,26 @@ impl AnnounceScheduler {
             default_interval,
             max_startup_jitter,
             peer_router: RwLock::new(None),
+            settings: RwLock::new(None),
+            ip_filter: RwLock::new(None),
         })
     }
 
     /// Sets the dynamic peer event router used to awaken dormant Warm/Cold swarms when tracker peers are found.
     pub fn set_peer_router(&self, router: PeerEventRouter) {
         *self.peer_router.write() = Some(router);
+    }
+
+    /// Sets the live session settings used to bound outbound dial targets by the
+    /// configured `max_peers_per_torrent` / `max_global_peers` caps -- see `dial_step`.
+    pub fn set_settings(&self, settings: Arc<RwLock<crate::settings::DynamicSessionSettings>>) {
+        *self.settings.write() = Some(settings);
+    }
+
+    /// Sets the shared IP filter used to skip blocklisted candidate peers before ever
+    /// dialing them -- see `dial_step`.
+    pub fn set_ip_filter(&self, ip_filter: Arc<RwLock<crate::ipfilter::IpFilter>>) {
+        *self.ip_filter.write() = Some(ip_filter);
     }
 
     /// Returns a reference to the inner Announcer instance.
@@ -854,6 +874,18 @@ impl AnnounceScheduler {
     }
 
     async fn dial_step(self: &Arc<Self>) {
+        // Bound outbound dial targets by the configured per-torrent cap -- without this,
+        // the dialer would keep opening connections up to a hardcoded target regardless
+        // of what the user has configured (or lowered) `max_peers_per_torrent` to.
+        let max_per_torrent = self
+            .settings
+            .read()
+            .as_ref()
+            .map(|s| s.read().max_peers_per_torrent)
+            .unwrap_or(crate::settings::DynamicSessionSettings::default().max_peers_per_torrent);
+
+        let ip_filter = self.ip_filter.read().clone();
+
         let dials_to_start = {
             let mut swarms = self.swarms.write();
             let mut to_dial = Vec::new();
@@ -866,8 +898,8 @@ impl AnnounceScheduler {
                 };
 
                 let target_peers = match state {
-                    crate::swarm::SwarmState::Downloading => 40,
-                    crate::swarm::SwarmState::Seeding => 30,
+                    crate::swarm::SwarmState::Downloading => max_per_torrent.min(40),
+                    crate::swarm::SwarmState::Seeding => max_per_torrent.min(30),
                     _ => 0,
                 };
 
@@ -914,6 +946,11 @@ impl AnnounceScheduler {
                     if let Some(addr) = meta.candidate_peers.pop_front() {
                         if meta.active_dials.contains(&addr) || !self.announcer.circuit_breaker.can_connect(&addr) {
                             continue;
+                        }
+                        if let Some(ref filter) = ip_filter {
+                            if filter.read().is_blocked(addr.ip()) {
+                                continue;
+                            }
                         }
                         meta.active_dials.insert(addr);
                         to_dial.push((*info_hash, meta.info.clone(), addr, meta.events_tx.clone()));

@@ -87,6 +87,16 @@ impl WebSeedManager {
     pub fn active_seeds(&self) -> Vec<&WebSeedTarget> {
         self.seeds.iter().filter(|s| s.is_active).collect()
     }
+
+    /// Picks the first active webseed target, returning its index (for `on_success`/
+    /// `on_failure`) and base URL.
+    pub fn pick_active_seed(&self) -> Option<(usize, Arc<Url>)> {
+        self.seeds
+            .iter()
+            .enumerate()
+            .find(|(_, s)| s.is_active)
+            .map(|(i, s)| (i, s.base_url.clone()))
+    }
 }
 
 #[cfg(test)]

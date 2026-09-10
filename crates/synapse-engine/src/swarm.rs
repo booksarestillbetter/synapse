@@ -1,5 +1,5 @@
 use dashmap::DashMap;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use diskio::DiskEngine;
 use synapse_meta::Info;
@@ -15,7 +15,9 @@ use synapse_picker::Bitfield;
 
 use crate::announcer::{AnnounceScheduler, Announcer, TrackerReport};
 use crate::circuit_breaker::PeerCircuitBreaker;
+use crate::ipfilter::IpFilter;
 use crate::lifecycle::ConduitLifecycleDispatcher;
+use crate::lsd::LsdManager;
 use crate::peer::{accept_router, PeerEvent};
 use crate::queue::{QueueAction, QueueConfig, QueueManager};
 use crate::ratelimit::TokenBucket;
@@ -324,6 +326,10 @@ pub struct SwarmEngine {
     announce_scheduler: Arc<AnnounceScheduler>,
     idle_timeout: Duration,
     watch_dir: Option<PathBuf>,
+    ip_filter: Arc<RwLock<IpFilter>>,
+    lsd_manager: Arc<Mutex<LsdManager>>,
+    http_client: reqwest::Client,
+    dht: Arc<RwLock<Option<synapse_dht::DhtHandle>>>,
 }
 
 impl SwarmEngine {
@@ -343,6 +349,19 @@ impl SwarmEngine {
         );
         announce_scheduler.clone().start();
 
+        let settings = Arc::new(RwLock::new(DynamicSessionSettings::default()));
+        announce_scheduler.set_settings(settings.clone());
+
+        let ip_filter = Arc::new(RwLock::new(IpFilter::new()));
+        announce_scheduler.set_ip_filter(ip_filter.clone());
+
+        let lsd_cookie: String = {
+            use rand::Rng;
+            let mut rng = rand::thread_rng();
+            (0..8).map(|_| rng.sample(rand::distributions::Alphanumeric) as char).collect()
+        };
+        let lsd_manager = Arc::new(Mutex::new(LsdManager::new(0, lsd_cookie)));
+
         let engine = Self {
             torrents: Arc::new(DashMap::new()),
             disk,
@@ -354,11 +373,15 @@ impl SwarmEngine {
             upload_bucket: Arc::new(TokenBucket::unthrottled()),
             circuit_breaker,
             queue_manager: Arc::new(RwLock::new(QueueManager::new(QueueConfig::default()))),
-            settings: Arc::new(RwLock::new(DynamicSessionSettings::default())),
+            settings,
             metrics: Arc::new(GlobalEngineMetrics::default()),
             announce_scheduler: announce_scheduler.clone(),
             idle_timeout: Duration::from_secs(60),
             watch_dir: None,
+            ip_filter,
+            lsd_manager,
+            http_client: reqwest::Client::new(),
+            dht: Arc::new(RwLock::new(None)),
         };
 
         let engine_clone = engine.clone();
@@ -372,6 +395,33 @@ impl SwarmEngine {
     pub fn with_watch_dir(mut self, watch_dir: PathBuf) -> Self {
         self.watch_dir = Some(watch_dir);
         self
+    }
+
+    /// Returns the shared IP filter used to gate both inbound accepts (`start_listener`)
+    /// and outbound dials (`AnnounceScheduler::dial_step`), for inspection or RPC exposure.
+    pub fn ip_filter(&self) -> Arc<RwLock<IpFilter>> {
+        self.ip_filter.clone()
+    }
+
+    /// Rebuilds the IP filter from config: inline CIDR strings plus an optional
+    /// `ipfilter.dat`-style blocklist file. Replaces any previously loaded rules.
+    /// Malformed inline entries or file-load errors are logged and skipped rather than
+    /// failing startup -- a bad blocklist entry should never prevent the daemon running.
+    pub fn load_ip_filter_config(&self, cidr_ranges: &[String], file_path: Option<&std::path::Path>) {
+        let mut filter = IpFilter::new();
+        for cidr in cidr_ranges {
+            if let Err(e) = filter.add_cidr_str(cidr) {
+                warn!("Skipping invalid entry in blocked_ip_ranges: {e}");
+            }
+        }
+        if let Some(path) = file_path {
+            match filter.load_file(path) {
+                Ok(n) => info!("Loaded {n} rule(s) from ipfilter file {}", path.display()),
+                Err(e) => warn!("Failed to load ipfilter file {}: {e}", path.display()),
+            }
+        }
+        info!("IP filter active with {} total rule(s)", filter.total_rules());
+        *self.ip_filter.write() = filter;
     }
 
     /// Attempts to recover the full `Info` struct for a swarm:
@@ -631,6 +681,8 @@ impl SwarmEngine {
         let (peer_tx, peer_rx) = mpsc::channel(256);
         let (command_tx, command_rx) = mpsc::channel(32);
         let (piece_tx, mut piece_rx) = mpsc::channel(128);
+        let (pex_tx, mut pex_rx) = mpsc::channel::<Vec<SocketAddr>>(32);
+        let (metadata_tx, metadata_rx) = oneshot::channel::<Info>();
 
         let (complete_tx, complete_rx) = oneshot::channel();
         if let Some(lifecycle) = self.lifecycle.clone() {
@@ -683,6 +735,10 @@ impl SwarmEngine {
             idle_timeout: Some(self.idle_timeout),
             live_peers: handle.live_peers.clone(),
             piece_availability: handle.piece_availability.clone(),
+            settings: self.settings.clone(),
+            on_peers_discovered: Some(pex_tx),
+            http_client: self.http_client.clone(),
+            on_metadata_resolved: Some(metadata_tx),
         };
 
         let torrent = Torrent::new(config, have.as_ref());
@@ -694,6 +750,22 @@ impl SwarmEngine {
 
         tokio::spawn(async move {
             torrent.run(peer_rx, command_rx).await;
+        });
+
+        let scheduler_pex = self.announce_scheduler.clone();
+        let hash_pex = info.hash;
+        tokio::spawn(async move {
+            while let Some(peers) = pex_rx.recv().await {
+                scheduler_pex.add_candidate_peers(&hash_pex, peers);
+            }
+        });
+
+        let engine_metadata = self.clone();
+        let download_dir_metadata = download_dir.clone();
+        tokio::spawn(async move {
+            if let Ok(resolved_info) = metadata_rx.await {
+                engine_metadata.resolve_magnet_metadata(download_dir_metadata, resolved_info);
+            }
         });
 
         let bitfield_worker = handle.compressed_bitfield.clone();
@@ -953,6 +1025,20 @@ impl SwarmEngine {
         self.add_torrent_with_resume(info, download_dir, have, None)
     }
 
+    /// BEP 9: called once a magnet-added torrent's metadata-only actor finishes
+    /// assembling and verifying its real `Info` over the wire (see `TorrentConfig::
+    /// on_metadata_resolved`). Drops the placeholder registration and re-adds the
+    /// torrent under the same info_hash with the real metadata, which spawns a normal
+    /// downloading actor in its place via the usual `add_torrent_with_resume` path.
+    fn resolve_magnet_metadata(&self, download_dir: std::path::PathBuf, info: Info) {
+        let info_hash = info.hash;
+        tracing::info!(name = %info.name, hash = %hex::encode(info_hash), "Magnet metadata resolved; starting real download");
+        self.announce_scheduler.unregister(&info_hash);
+        self.lsd_manager.lock().unregister_torrent(&info_hash);
+        self.torrents.remove(&info_hash);
+        self.add_torrent(Arc::new(info), download_dir, None);
+    }
+
     pub fn add_torrent_with_resume(
         &self,
         info: Arc<Info>,
@@ -1088,6 +1174,7 @@ impl SwarmEngine {
         }
 
         self.torrents.insert(info_hash, handle.clone());
+        self.lsd_manager.lock().register_torrent(info_hash, info.private);
 
         // Awaken actor immediately if Hot
         let peer_tx = if initial_tier == SwarmTier::Hot {
@@ -1370,6 +1457,7 @@ impl SwarmEngine {
             drop(stats);
             handle.stop_actor();
             self.announce_scheduler.unregister(info_hash);
+            self.lsd_manager.lock().unregister_torrent(info_hash);
 
             if let Some(ref store) = self.session_store {
                 let hex_hash = hex::encode(info_hash);
@@ -1410,6 +1498,7 @@ impl SwarmEngine {
                 is_dl,
             );
             self.announce_scheduler.notify_resumed(info_hash);
+            self.lsd_manager.lock().register_torrent(*info_hash, handle.info.private);
 
             if let Some(ref store) = self.session_store {
                 let hex_hash = hex::encode(info_hash);
@@ -1426,6 +1515,7 @@ impl SwarmEngine {
 
     pub fn remove_torrent(&self, info_hash: &[u8; 20]) -> bool {
         self.announce_scheduler.unregister(info_hash);
+        self.lsd_manager.lock().unregister_torrent(info_hash);
         if let Some(ref store) = self.session_store {
             let _ = store.remove_torrent(info_hash);
         }
@@ -1535,6 +1625,10 @@ impl SwarmEngine {
             loop {
                 match listener.accept().await {
                     Ok((socket, remote_addr)) => {
+                        if self.ip_filter.read().is_blocked(remote_addr.ip()) {
+                            debug!(addr = %remote_addr, "Rejecting inbound connection: IP blocklisted");
+                            continue;
+                        }
                         let engine = self.clone();
                         tokio::spawn(async move {
                             let _ = accept_router(
@@ -1555,6 +1649,169 @@ impl SwarmEngine {
                     }
                     Err(e) => {
                         warn!("Error accepting inbound peer connection: {}", e);
+                    }
+                }
+            }
+        });
+
+        Ok(handle)
+    }
+
+    /// Returns the live DHT routing table size (0 if DHT isn't running), for metrics.
+    pub async fn dht_node_count(&self) -> usize {
+        let handle = self.dht.read().clone();
+        match handle {
+            Some(h) => h.routing_snapshot().await.map(|v| v.len()).unwrap_or(0),
+            None => 0,
+        }
+    }
+
+    /// Starts the BEP 5 Kademlia DHT: binds a UDP node, resolves the standard public
+    /// bootstrap routers, then periodically (every `DHT_CRAWL_INTERVAL`) walks the
+    /// network for peers on every registered non-private swarm and feeds discovered
+    /// addresses into the same candidate pool trackers/LSD/PEX use. Also announces our
+    /// own presence to the closest nodes found during each crawl, so other DHT clients
+    /// can discover us. Best-effort throughout: a crawl or announce failure for one
+    /// swarm is logged and skipped, never fatal to the loop or the daemon.
+    pub async fn start_dht(self: Arc<Self>, bind_addr: SocketAddr) -> std::io::Result<SocketAddr> {
+        const DHT_CRAWL_INTERVAL: Duration = Duration::from_secs(180);
+        const MAX_CONCURRENT_CRAWLS: usize = 4;
+        const BOOTSTRAP_HOSTS: &[&str] = &[
+            "router.bittorrent.com:6881",
+            "dht.transmissionbt.com:6881",
+            "router.utorrent.com:6881",
+        ];
+
+        let our_id: [u8; 20] = rand::random();
+        let (handle, local_addr) = synapse_dht::spawn(our_id, bind_addr).await?;
+        *self.dht.write() = Some(handle.clone());
+        info!("DHT node active on {} (id {})", local_addr, hex::encode(our_id));
+
+        let mut bootstrap_nodes = Vec::new();
+        for host in BOOTSTRAP_HOSTS {
+            if let Ok(addrs) = tokio::net::lookup_host(host).await {
+                for addr in addrs {
+                    if let SocketAddr::V4(v4) = addr {
+                        bootstrap_nodes.push(v4);
+                    }
+                }
+            }
+        }
+        if bootstrap_nodes.is_empty() {
+            warn!("DHT: could not resolve any bootstrap routers (no network access?); routing table will only grow from inbound traffic");
+        }
+
+        let engine = self;
+        tokio::spawn(async move {
+            let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CRAWLS));
+            let mut ticker = tokio::time::interval(DHT_CRAWL_INTERVAL);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                if !engine.settings.read().dht_enabled {
+                    continue;
+                }
+
+                let peer_port = *engine.listen_port.read();
+                let swarms: Vec<([u8; 20], bool)> = engine
+                    .torrents
+                    .iter()
+                    .filter(|r| r.value().allows_dht())
+                    .map(|r| {
+                        let downloading = !matches!(r.value().stats.read().state, SwarmState::Stopped | SwarmState::Queued);
+                        (*r.key(), downloading)
+                    })
+                    .filter(|(_, active)| *active)
+                    .collect();
+
+                for (info_hash, _) in swarms {
+                    let permit = semaphore.clone().acquire_owned().await;
+                    let Ok(permit) = permit else { continue };
+                    let handle = handle.clone();
+                    let engine = engine.clone();
+                    let bootstrap_nodes = bootstrap_nodes.clone();
+                    tokio::spawn(async move {
+                        let _permit = permit;
+                        match handle.iterative_get_peers(info_hash, &bootstrap_nodes).await {
+                            Ok(result) => {
+                                if !result.peers.is_empty() {
+                                    let addrs = result.peers.into_iter().map(SocketAddr::V4);
+                                    engine.announce_scheduler.add_candidate_peers(&info_hash, addrs);
+                                }
+                                for (node, token) in result.closest_nodes {
+                                    let _ = handle.announce_peer(node.addr, info_hash, peer_port, token).await;
+                                }
+                            }
+                            Err(e) => {
+                                debug!(hash = %hex::encode(info_hash), "DHT get_peers crawl failed: {e}");
+                            }
+                        }
+                    });
+                }
+            }
+        });
+
+        Ok(local_addr)
+    }
+
+    /// Starts BEP 14/22 Local Peer Discovery: binds the LSD multicast group, periodically
+    /// announces every registered public torrent, and ingests announcements from other
+    /// local clients, feeding discovered peers into the same candidate pool trackers use
+    /// (`AnnounceScheduler::add_candidate_peers`). Gated on `dynamic_settings.lsd_enabled`
+    /// at each tick, checked live so a runtime settings change takes effect without a
+    /// restart. Requires `start_listener` to have already run so the real peer port is
+    /// known -- the announced port would otherwise be wrong.
+    pub async fn start_lsd(self: Arc<Self>) -> Result<tokio::task::JoinHandle<()>, std::io::Error> {
+        use std::net::{Ipv4Addr, SocketAddrV4};
+        use tokio::net::UdpSocket;
+
+        let lsd_addr: std::net::SocketAddrV4 = synapse_wire::LSD_MULTICAST_IPV4
+            .parse()
+            .expect("LSD_MULTICAST_IPV4 constant must be a valid SocketAddrV4");
+        let multicast_ip = *lsd_addr.ip();
+
+        let peer_port = *self.listen_port.read();
+        self.lsd_manager.lock().set_listen_port(peer_port);
+
+        let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, synapse_wire::LSD_PORT)).await?;
+        socket.join_multicast_v4(multicast_ip, Ipv4Addr::UNSPECIFIED)?;
+        info!("LSD (Local Peer Discovery) active on {}", lsd_addr);
+
+        let handle = tokio::spawn(async move {
+            let mut announce_ticker = tokio::time::interval(Duration::from_secs(60));
+            announce_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut buf = [0u8; 2048];
+
+            loop {
+                tokio::select! {
+                    _ = announce_ticker.tick() => {
+                        if !self.settings.read().lsd_enabled {
+                            continue;
+                        }
+                        let packet = self.lsd_manager.lock().build_announce_packet();
+                        if let Some(packet) = packet {
+                            if let Err(e) = socket.send_to(packet.as_bytes(), lsd_addr).await {
+                                debug!("LSD announce send failed: {e}");
+                            }
+                        }
+                    }
+                    recv = socket.recv_from(&mut buf) => {
+                        match recv {
+                            Ok((n, from)) => {
+                                if !self.settings.read().lsd_enabled {
+                                    continue;
+                                }
+                                if let Ok(text) = std::str::from_utf8(&buf[..n]) {
+                                    let discovered = self.lsd_manager.lock().ingest_packet(from.ip(), text);
+                                    for peer in discovered {
+                                        self.announce_scheduler.add_candidate_peers(&peer.info_hash, [peer.addr]);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                warn!("LSD receive error: {e}");
+                            }
+                        }
                     }
                 }
             }

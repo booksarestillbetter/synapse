@@ -318,6 +318,11 @@ async fn main() -> std::process::ExitCode {
     }
     let swarm = Arc::new(swarm_builder);
 
+    swarm.load_ip_filter_config(
+        &config.network.blocked_ip_ranges,
+        config.network.ip_filter_file.as_ref().map(std::path::Path::new),
+    );
+
     let listen_v4 = SocketAddr::from(([0, 0, 0, 0], config.network.listen_port));
     let listen_v6 = SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], config.network.listen_port));
 
@@ -348,6 +353,22 @@ async fn main() -> std::process::ExitCode {
     if !v4_ok && !v6_ok {
         tracing::error!("Failed to bind any BitTorrent listen port (port {})", config.network.listen_port);
         return std::process::ExitCode::FAILURE;
+    }
+
+    match swarm.clone().start_lsd().await {
+        Ok(_) => tracing::info!("📡 Local Peer Discovery (LSD) active"),
+        Err(e) => tracing::warn!("Could not start Local Peer Discovery (LSD): {} (continuing without it)", e),
+    }
+
+    if config.privacy.disable_dht_globally {
+        tracing::info!("DHT disabled via privacy.disable_dht_globally -- not starting a DHT node");
+    } else {
+        // DHT conventionally shares the same port number as the TCP peer listener (just UDP).
+        let dht_bind = SocketAddr::from(([0, 0, 0, 0], config.network.listen_port));
+        match swarm.clone().start_dht(dht_bind).await {
+            Ok(addr) => tracing::info!("📡 DHT (Kademlia) node active on {}", addr),
+            Err(e) => tracing::warn!("Could not start DHT node: {} (continuing without it)", e),
+        }
     }
 
     match swarm.restore_session() {

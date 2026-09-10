@@ -229,11 +229,6 @@ fn decode_message(src: &mut BytesMut) -> Result<Option<Message>, WireError> {
             begin: u32::from_be_bytes([src[9], src[10], src[11], src[12]]),
             length: u32::from_be_bytes([src[13], src[14], src[15], src[16]]),
         },
-        8 if payload_len == 12 => Message::Cancel {
-            index: u32::from_be_bytes([src[5], src[6], src[7], src[8]]),
-            begin: u32::from_be_bytes([src[9], src[10], src[11], src[12]]),
-            length: u32::from_be_bytes([src[13], src[14], src[15], src[16]]),
-        },
         8 => return Err(WireError::Protocol("Cancel message has the wrong length")),
         9 if payload_len == 2 => Message::Port(u16::from_be_bytes([src[5], src[6]])),
         9 => return Err(WireError::Protocol("Port message has the wrong length")),

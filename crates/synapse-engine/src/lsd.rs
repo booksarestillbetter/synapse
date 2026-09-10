@@ -37,6 +37,12 @@ impl LsdManager {
         }
     }
 
+    /// Updates the peer listen port advertised in outgoing announcements (e.g. once the
+    /// daemon's inbound TCP listener has actually bound and the real port is known).
+    pub fn set_listen_port(&mut self, port: u16) {
+        self.listen_port = port;
+    }
+
     /// Registers a torrent in the LSD manager with its privacy flag.
     pub fn register_torrent(&mut self, info_hash: [u8; 20], is_private: bool) {
         if is_private {

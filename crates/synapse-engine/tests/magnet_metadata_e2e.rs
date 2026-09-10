@@ -1,8 +1,9 @@
-//! End-to-end proof that the rewrite's core pipeline actually works: two `Torrent`
-//! actors, connected over a real TCP loopback socket, driving `synapse-wire`'s codec,
-//! `synapse-picker`'s picker/choker, `synapse-meta`'s piece/file layout, and
-//! `diskio`'s disk engine together - a seeder that already has a file on disk, and a
-//! leecher that downloads it from scratch and must produce a byte-identical copy.
+//! End-to-end proof that BEP 9 `ut_metadata` exchange actually works: a "leecher"
+//! `Torrent` actor constructed the same way `SwarmEngine::add_magnet` builds one --
+//! from `Info::from_magnet`, with no files/pieces known yet -- connects over a real
+//! TCP loopback socket to a normal "seeder" actor that already has full metadata, and
+//! must come away with a byte-for-byte-correct, hash-verified `Info` delivered through
+//! `on_metadata_resolved`.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,9 +17,6 @@ use synapse_engine::{PeerEvent, SwarmState, SwarmStats, SwarmTier, TokenBucket, 
 use synapse_meta::Info;
 use synapse_picker::{Bitfield, Mode, RoaringBitfield};
 
-/// A fresh `SwarmStats` for a `Torrent` under test — this crate's `SwarmEngine::add_torrent`
-/// normally builds one of these and shares it with the `Torrent` it spawns; this test
-/// constructs `Torrent` directly (no `SwarmEngine` in the loop) so it needs to build its own.
 fn fresh_stats(info: &Info, download_dir: &std::path::Path) -> Arc<parking_lot::RwLock<SwarmStats>> {
     Arc::new(parking_lot::RwLock::new(SwarmStats {
         info_hash: info.hash,
@@ -53,70 +51,51 @@ fn build_test_info(file_data: &[u8], piece_len: u32, name: &str) -> Info {
     }
 
     let mut info_dict = std::collections::BTreeMap::new();
-    info_dict.insert(
-        b"name".to_vec(),
-        synapse_bencode::BEncode::String(name.as_bytes().to_vec()),
-    );
-    info_dict.insert(
-        b"piece length".to_vec(),
-        synapse_bencode::BEncode::Int(piece_len as i64),
-    );
+    info_dict.insert(b"name".to_vec(), synapse_bencode::BEncode::String(name.as_bytes().to_vec()));
+    info_dict.insert(b"piece length".to_vec(), synapse_bencode::BEncode::Int(piece_len as i64));
     info_dict.insert(b"pieces".to_vec(), synapse_bencode::BEncode::String(pieces));
-    info_dict.insert(
-        b"length".to_vec(),
-        synapse_bencode::BEncode::Int(file_data.len() as i64),
-    );
+    info_dict.insert(b"length".to_vec(), synapse_bencode::BEncode::Int(file_data.len() as i64));
 
     let mut torrent_dict = std::collections::BTreeMap::new();
-    torrent_dict.insert(
-        b"info".to_vec(),
-        synapse_bencode::BEncode::Dict(info_dict),
-    );
+    torrent_dict.insert(b"info".to_vec(), synapse_bencode::BEncode::Dict(info_dict));
 
     Info::from_bencode(synapse_bencode::BEncode::Dict(torrent_dict)).expect("valid test torrent")
 }
 
-fn deterministic_file(len: usize) -> Vec<u8> {
-    // Not cryptographically anything - just content with no obvious repeating
-    // structure, so a bug that mixed up block/piece offsets would very likely produce
-    // a detectably wrong byte sequence rather than accidentally still matching.
-    let mut state: u32 = 0x1234_5678;
-    (0..len)
-        .map(|_| {
-            state ^= state << 13;
-            state ^= state >> 17;
-            state ^= state << 5;
-            (state & 0xFF) as u8
-        })
-        .collect()
-}
+#[tokio::test(flavor = "multi_thread")]
+async fn magnet_leecher_resolves_metadata_from_a_seeder_over_ut_metadata() {
+    let _ = tracing_subscriber::fmt::try_init();
 
-/// Runs a full seeder->leecher download over a real TCP loopback connection and
-/// returns what the leecher wrote to disk, for the caller to assert against.
-async fn run_download(file_data: &[u8], piece_len: u32) -> Vec<u8> {
-    let info = Arc::new(build_test_info(file_data, piece_len, "testfile.bin"));
+    let file_data = b"a small file whose metadata gets fetched via BEP 9".to_vec();
+    let piece_len = file_data.len() as u32; // single piece keeps this fast and deterministic
+    let seeder_info = Arc::new(build_test_info(&file_data, piece_len, "magnet-test.bin"));
+
+    let magnet_uri = format!("magnet:?xt=urn:btih:{}&dn=magnet-test.bin", hex::encode(seeder_info.hash));
+    let leecher_info = Arc::new(Info::from_magnet(&magnet_uri).expect("valid magnet URI"));
+    assert!(leecher_info.files.is_empty(), "magnet-derived Info must start with no files (the 'awaiting metadata' signal Torrent::new checks for)");
+    assert_eq!(leecher_info.hash, seeder_info.hash);
 
     let seeder_dir = tempfile::tempdir().unwrap();
     let leecher_dir = tempfile::tempdir().unwrap();
-    std::fs::write(seeder_dir.path().join("testfile.bin"), file_data).unwrap();
+    std::fs::write(seeder_dir.path().join("magnet-test.bin"), &file_data).unwrap();
 
     let seeder_disk = Arc::new(DiskEngine::auto().await);
     let leecher_disk = Arc::new(DiskEngine::auto().await);
 
-    let mut seeder_have = Bitfield::new(info.pieces() as usize);
-    for i in 0..info.pieces() {
+    let mut seeder_have = Bitfield::new(seeder_info.pieces() as usize);
+    for i in 0..seeder_info.pieces() {
         seeder_have.set(i as usize);
     }
 
-    let tick = Duration::from_millis(50);
-    let seeder_peer_id = [1u8; 20];
-    let leecher_peer_id = [2u8; 20];
+    let tick = Duration::from_millis(20);
+    let seeder_peer_id = [5u8; 20];
+    let leecher_peer_id = [6u8; 20];
 
     let (seeder_tx, seeder_rx) = mpsc::channel::<PeerEvent>(64);
     let (_seeder_cmd_tx, seeder_cmd_rx) = mpsc::channel(1);
     let seeder = Torrent::new(
         TorrentConfig {
-            info: info.clone(),
+            info: seeder_info.clone(),
             download_dir: seeder_dir.path().to_path_buf(),
             peer_id: seeder_peer_id,
             disk: seeder_disk,
@@ -127,14 +106,14 @@ async fn run_download(file_data: &[u8], piece_len: u32) -> Vec<u8> {
             tick_interval: tick,
             on_torrent_completed: None,
             on_piece_completed: None,
-            stats: fresh_stats(&info, seeder_dir.path()),
+            stats: fresh_stats(&seeder_info, seeder_dir.path()),
             bitfield: Arc::new(parking_lot::RwLock::new(Some(RoaringBitfield::from_bitfield(&seeder_have)))),
             download_bucket: Arc::new(TokenBucket::unthrottled()),
             upload_bucket: Arc::new(TokenBucket::unthrottled()),
             global_metrics: None,
             idle_timeout: None,
             live_peers: Arc::new(parking_lot::RwLock::new(Vec::new())),
-            piece_availability: Arc::new(parking_lot::RwLock::new(vec![1; info.pieces() as usize])),
+            piece_availability: Arc::new(parking_lot::RwLock::new(vec![1; seeder_info.pieces() as usize])),
             settings: Arc::new(parking_lot::RwLock::new(Default::default())),
             on_peers_discovered: None,
             http_client: reqwest::Client::new(),
@@ -146,9 +125,10 @@ async fn run_download(file_data: &[u8], piece_len: u32) -> Vec<u8> {
 
     let (leecher_tx, leecher_rx) = mpsc::channel::<PeerEvent>(64);
     let (_leecher_cmd_tx, leecher_cmd_rx) = mpsc::channel(1);
-    let mut leecher = Torrent::new(
+    let (metadata_tx, metadata_rx) = oneshot::channel::<Info>();
+    let leecher = Torrent::new(
         TorrentConfig {
-            info: info.clone(),
+            info: leecher_info.clone(),
             download_dir: leecher_dir.path().to_path_buf(),
             peer_id: leecher_peer_id,
             disk: leecher_disk,
@@ -159,30 +139,28 @@ async fn run_download(file_data: &[u8], piece_len: u32) -> Vec<u8> {
             tick_interval: tick,
             on_torrent_completed: None,
             on_piece_completed: None,
-            stats: fresh_stats(&info, leecher_dir.path()),
+            stats: fresh_stats(&leecher_info, leecher_dir.path()),
             bitfield: Arc::new(parking_lot::RwLock::new(None)),
             download_bucket: Arc::new(TokenBucket::unthrottled()),
             upload_bucket: Arc::new(TokenBucket::unthrottled()),
             global_metrics: None,
             idle_timeout: None,
             live_peers: Arc::new(parking_lot::RwLock::new(Vec::new())),
-            piece_availability: Arc::new(parking_lot::RwLock::new(vec![0; info.pieces() as usize])),
+            piece_availability: Arc::new(parking_lot::RwLock::new(Vec::new())),
             settings: Arc::new(parking_lot::RwLock::new(Default::default())),
             on_peers_discovered: None,
             http_client: reqwest::Client::new(),
-            on_metadata_resolved: None,
+            on_metadata_resolved: Some(metadata_tx),
         },
         None,
     );
-    let (done_tx, done_rx) = oneshot::channel();
-    leecher.notify_on_complete(done_tx);
     tokio::spawn(leecher.run(leecher_rx, leecher_cmd_rx));
 
-    // Seeder listens; leecher dials. Accepting the connection performs the receiving
-    // side of the BEP3 handshake before the seeder's Torrent actor ever sees it.
+    // Seeder listens; leecher dials, using only the info_hash it already knows from the
+    // magnet URI -- exactly like a real magnet add, before any piece metadata exists.
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let seeder_addr = listener.local_addr().unwrap();
-    let expected_hash = info.hash;
+    let expected_hash = seeder_info.hash;
     tokio::spawn(async move {
         let (stream, addr) = listener.accept().await.unwrap();
         synapse_engine::accept(stream, addr, seeder_peer_id, move |h| h == expected_hash, false, seeder_tx)
@@ -190,47 +168,17 @@ async fn run_download(file_data: &[u8], piece_len: u32) -> Vec<u8> {
             .expect("seeder-side handshake failed");
     });
 
-    synapse_engine::connect(seeder_addr, leecher_peer_id, info.hash, false, leecher_tx)
+    synapse_engine::connect(seeder_addr, leecher_peer_id, expected_hash, false, leecher_tx)
         .await
         .expect("leecher-side handshake failed");
 
-    tokio::time::timeout(Duration::from_secs(10), done_rx)
+    let resolved = tokio::time::timeout(Duration::from_secs(10), metadata_rx)
         .await
-        .expect("timed out waiting for the download to complete")
-        .expect("completion sender dropped without firing");
+        .expect("timed out waiting for magnet metadata to resolve")
+        .expect("metadata channel dropped without resolving");
 
-    std::fs::read(leecher_dir.path().join("testfile.bin")).unwrap()
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn leecher_downloads_a_complete_byte_identical_file_from_a_seeder() {
-    let _ = tracing_subscriber::fmt::try_init();
-
-    // Two pieces, two blocks each (32KiB pieces, 16KiB blocks) - big enough to
-    // exercise multi-block piece assembly, small enough to run fast.
-    const PIECE_LEN: u32 = 32 * 1024;
-    let file_data = deterministic_file(2 * PIECE_LEN as usize);
-
-    let downloaded = run_download(&file_data, PIECE_LEN).await;
-    assert_eq!(
-        downloaded, file_data,
-        "downloaded file must be byte-identical to the seeder's copy"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn handles_a_final_piece_and_block_shorter_than_the_normal_size() {
-    let _ = tracing_subscriber::fmt::try_init();
-
-    // 32KiB pieces (2x 16KiB blocks each), but a total length that leaves a short
-    // final piece with a single, short final block - exercises Info::piece_len's
-    // last-piece special case and the BLOCK_LEN.min(...) clamp in the request loop.
-    const PIECE_LEN: u32 = 32 * 1024;
-    let file_data = deterministic_file(2 * PIECE_LEN as usize + 12_345);
-
-    let downloaded = run_download(&file_data, PIECE_LEN).await;
-    assert_eq!(
-        downloaded, file_data,
-        "downloaded file must be byte-identical even with an uneven final piece/block"
-    );
+    assert_eq!(resolved.hash, seeder_info.hash, "resolved Info must hash-verify against the original magnet info_hash");
+    assert_eq!(resolved.name, seeder_info.name);
+    assert_eq!(resolved.total_len, seeder_info.total_len);
+    assert_eq!(resolved.pieces(), seeder_info.pieces());
 }

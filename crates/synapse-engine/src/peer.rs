@@ -4,6 +4,7 @@
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
@@ -13,6 +14,13 @@ use tokio_util::codec::Framed;
 use synapse_wire::{Message, PeerCodec, WireError};
 
 pub type PeerId = u64;
+
+/// Maximum time a peer has to complete the BEP3 handshake before the connection is
+/// dropped. Applies to both inbound and outbound connections. Without this, a peer
+/// that opens a TCP connection and never sends (or slowly trickles) a handshake would
+/// otherwise tie up a tokio task indefinitely -- a trivial resource-exhaustion vector
+/// against an internet-facing listener.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 
 static NEXT_PEER_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -28,6 +36,8 @@ pub enum PeerError {
     Wire(#[from] WireError),
     #[error("connection closed during handshake")]
     HandshakeClosed,
+    #[error("handshake timed out")]
+    HandshakeTimeout,
     #[error("peer sent something other than a handshake first")]
     NotAHandshake,
     #[error("info hash mismatch")]
@@ -127,7 +137,10 @@ where
 {
     let _ = stream.set_nodelay(true);
     let mut framed = Framed::new(stream, PeerCodec::new());
-    let msg = framed.next().await.ok_or(PeerError::HandshakeClosed)??;
+    let msg = tokio::time::timeout(HANDSHAKE_TIMEOUT, framed.next())
+        .await
+        .map_err(|_| PeerError::HandshakeTimeout)?
+        .ok_or(PeerError::HandshakeClosed)??;
     let (info_hash, their_id) = match msg {
         Message::Handshake { info_hash, peer_id, .. } => (info_hash, peer_id),
         _ => return Err(PeerError::NotAHandshake),
@@ -163,7 +176,10 @@ pub async fn accept(
     events: mpsc::Sender<PeerEvent>,
 ) -> Result<(), PeerError> {
     let mut framed = Framed::new(stream, PeerCodec::new());
-    let msg = framed.next().await.ok_or(PeerError::HandshakeClosed)??;
+    let msg = tokio::time::timeout(HANDSHAKE_TIMEOUT, framed.next())
+        .await
+        .map_err(|_| PeerError::HandshakeTimeout)?
+        .ok_or(PeerError::HandshakeClosed)??;
     let (info_hash, their_id) = match msg {
         Message::Handshake { info_hash, peer_id, .. } => (info_hash, peer_id),
         _ => return Err(PeerError::NotAHandshake),
@@ -194,7 +210,10 @@ async fn read_and_verify_handshake(
     framed: &mut Framed<TcpStream, PeerCodec>,
     expected_hash: [u8; 20],
 ) -> Result<[u8; 20], PeerError> {
-    let msg = framed.next().await.ok_or(PeerError::HandshakeClosed)??;
+    let msg = tokio::time::timeout(HANDSHAKE_TIMEOUT, framed.next())
+        .await
+        .map_err(|_| PeerError::HandshakeTimeout)?
+        .ok_or(PeerError::HandshakeClosed)??;
     match msg {
         Message::Handshake { info_hash, peer_id, .. } if info_hash == expected_hash => Ok(peer_id),
         Message::Handshake { .. } => Err(PeerError::InfoHashMismatch),
