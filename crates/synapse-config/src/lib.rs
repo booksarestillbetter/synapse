@@ -387,6 +387,7 @@ pub struct HttpApiConfig {
     pub enabled: bool,
     pub listen_addr: SocketAddr,
     pub cors_enabled: bool,
+    pub auth_token: Option<String>,
 }
 
 impl Default for HttpApiConfig {
@@ -395,6 +396,7 @@ impl Default for HttpApiConfig {
             enabled: false,
             listen_addr: SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)), 8080),
             cors_enabled: true,
+            auth_token: None,
         }
     }
 }
@@ -872,8 +874,12 @@ impl Config {
         if let Ok(val) = std::env::var("SYNAPSE_RPC_LISTEN_ADDR") {
             self.rpc.listen_addr = val;
         }
-        if let Ok(val) = std::env::var("SYNAPSE_RPC_AUTH_TOKEN") {
-            self.rpc.auth_token = Some(val);
+        if let Ok(val) = std::env::var("SYNAPSE_AUTH_TOKEN")
+            .or_else(|_| std::env::var("SYNAPSE_RPC_AUTH_TOKEN"))
+            .or_else(|_| std::env::var("SYNAPSE_HTTP_AUTH_TOKEN"))
+        {
+            self.rpc.auth_token = Some(val.clone());
+            self.http_api.auth_token = Some(val);
         }
         if let Ok(val) = std::env::var("SYNAPSE_HTTP_ENABLED").or_else(|_| std::env::var("SYNAPSE_HTTP_API_ENABLED")) {
             if let Ok(b) = val.parse::<bool>() {

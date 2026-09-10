@@ -359,7 +359,11 @@ async fn main() -> std::process::ExitCode {
     let event_bus = Arc::new(EventBus::new(4096));
     let flusher_bus = event_bus.clone();
     let _flusher_handle = flusher_bus.start_flusher(Duration::from_millis(100));
-    let auth_token = config.rpc.auth_token.clone();
+    let auth_token = config
+        .http_api
+        .auth_token
+        .clone()
+        .or_else(|| config.rpc.auth_token.clone());
     let service = SynapseService::new(event_bus.clone())
         .with_swarm_engine(swarm.clone())
         .with_auth_token(auth_token.clone());

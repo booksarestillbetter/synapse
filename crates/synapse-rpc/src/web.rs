@@ -343,6 +343,7 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
         <button class="tab-btn" onclick="switchSettingsTab('queue')">Queue</button>
         <button class="tab-btn" onclick="switchSettingsTab('peers')">Peers & Swarm</button>
         <button class="tab-btn" onclick="switchSettingsTab('storage')">Storage</button>
+        <button class="tab-btn" onclick="switchSettingsTab('security')">Security</button>
       </div>
 
       <!-- Bandwidth Settings -->
@@ -443,6 +444,21 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
         </div>
         <div class="form-row">
           <label><input type="checkbox" id="cfg-start-added"> Automatically start newly added torrents</label>
+        </div>
+      </div>
+
+      <!-- Security Settings -->
+      <div class="tab-pane hidden" id="spane-security">
+        <h4>Authentication & Access Control</h4>
+        <div class="form-group">
+          <label>Bearer Authorization Token:</label>
+          <input type="password" id="cfg-auth-token" placeholder="Leave blank if daemon requires no token">
+          <small style="display:block; margin-top: 4px; color: var(--text-muted);">
+            Stored securely in your browser's local storage for API requests. Required if Synapse has an authentication token configured.
+          </small>
+        </div>
+        <div style="margin-top: 16px;">
+          <button type="button" class="btn btn-danger" id="btn-clear-token">Clear Stored Token (Log Out)</button>
         </div>
       </div>
     </div>
@@ -1449,11 +1465,23 @@ async function submitAddTorrent() {
     if (downloadDir) query.set('download_dir', downloadDir);
     if (paused) query.set('paused', 'true');
 
-    await fetch(`/api/v1/torrents/upload?${query.toString()}`, {
+    const uploadHeaders = { 'Content-Type': 'application/x-bittorrent' };
+    if (authToken) {
+      uploadHeaders['Authorization'] = `Bearer ${authToken}`;
+    }
+    const res = await fetch(`/api/v1/torrents/upload?${query.toString()}`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/x-bittorrent' },
+      headers: uploadHeaders,
       body: bytes
     });
+    if (!res.ok) {
+      if (res.status === 401) {
+        showToast('Unauthorized: Set your authorization token in Settings -> Security', 'error');
+      } else {
+        showToast('Upload failed: HTTP ' + res.status, 'error');
+      }
+      return;
+    }
     showToast('Uploaded and added .torrent file', 'success');
   } else {
     const magnet = document.getElementById('input-magnet').value.trim();
@@ -1516,6 +1544,12 @@ async function openSettings() {
     document.getElementById('cfg-incomplete-dir').value = sessionSettings.incomplete_dir || '';
     document.getElementById('cfg-start-added').checked = sessionSettings.start_added_torrents;
 
+    // Security
+    const tokenInput = document.getElementById('cfg-auth-token');
+    if (tokenInput) {
+      tokenInput.value = authToken;
+    }
+
     document.getElementById('settings-status').innerText = '';
     document.getElementById('modal-settings').showModal();
   } catch (e) {
@@ -1524,6 +1558,20 @@ async function openSettings() {
 }
 
 async function saveSettings() {
+  const tokenInput = document.getElementById('cfg-auth-token');
+  if (tokenInput) {
+    const newToken = tokenInput.value.trim();
+    if (newToken !== authToken) {
+      authToken = newToken;
+      if (authToken) {
+        localStorage.setItem('synapse_auth_token', authToken);
+      } else {
+        localStorage.removeItem('synapse_auth_token');
+      }
+      fetchUpdate();
+    }
+  }
+
   const payload = {
     download_limit_enabled: document.getElementById('cfg-down-limit-enabled').checked,
     download_limit_bytes: parseInt(document.getElementById('cfg-down-limit-val').value, 10) * 1024,
@@ -1598,10 +1646,12 @@ async function updateTurtleButtonState(explicitState) {
 }
 
 function switchSettingsTab(tab) {
-  const tabs = ['bandwidth', 'queue', 'peers', 'storage'];
+  const tabs = ['bandwidth', 'queue', 'peers', 'storage', 'security'];
   tabs.forEach((t, i) => {
-    document.querySelectorAll('#modal-settings .modal-tabs .tab-btn')[i].classList.toggle('active', t === tab);
-    document.getElementById(`spane-${t}`).classList.toggle('hidden', t !== tab);
+    const btns = document.querySelectorAll('#modal-settings .modal-tabs .tab-btn');
+    if (btns[i]) btns[i].classList.toggle('active', t === tab);
+    const pane = document.getElementById(`spane-${t}`);
+    if (pane) pane.classList.toggle('hidden', t !== tab);
   });
 }
 
@@ -1656,6 +1706,18 @@ window.addEventListener('DOMContentLoaded', () => {
   document.getElementById('btn-save-settings').addEventListener('click', saveSettings);
   document.getElementById('btn-submit-add').addEventListener('click', submitAddTorrent);
   document.getElementById('btn-recheck-torrent').addEventListener('click', forceRecheck);
+  const btnClearToken = document.getElementById('btn-clear-token');
+  if (btnClearToken) {
+    btnClearToken.addEventListener('click', () => {
+      authToken = '';
+      localStorage.removeItem('synapse_auth_token');
+      const tokenInput = document.getElementById('cfg-auth-token');
+      if (tokenInput) tokenInput.value = '';
+      showToast('Authentication token cleared', 'info');
+      document.getElementById('modal-settings').close();
+      fetchUpdate();
+    });
+  }
 
   // Inspector Tabs
   document.querySelectorAll('.inspector-tabs .tab-btn').forEach(btn => {

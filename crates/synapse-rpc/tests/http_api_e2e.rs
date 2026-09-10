@@ -234,3 +234,63 @@ async fn test_rest_api_detail_upload_and_settings_patch() {
     assert_eq!(resp.status(), StatusCode::OK);
 }
 
+#[tokio::test]
+async fn test_http_api_and_web_token_authentication() {
+    let disk = Arc::new(diskio::DiskEngine::auto().await);
+    let engine = Arc::new(SwarmEngine::new(disk, [0u8; 20]));
+    let web_cfg = synapse_config::WebConfig {
+        enabled: true,
+        ..Default::default()
+    };
+    let app = synapse_rpc::create_http_router_all(
+        engine.clone(),
+        Some("super-secret-token".to_string()),
+        true,
+        web_cfg,
+    );
+
+    // 1. Health check is public
+    let health_req = Request::builder().uri("/api/v1/health").body(Body::empty()).unwrap();
+    let resp = app.clone().oneshot(health_req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // 2. Web UI static assets are public (so client can load and prompt for token)
+    let root_req = Request::builder().uri("/").body(Body::empty()).unwrap();
+    let resp = app.clone().oneshot(root_req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), 100_000).await.unwrap();
+    let html = String::from_utf8_lossy(&body);
+    assert!(html.contains("Security"));
+    assert!(html.contains("cfg-auth-token"));
+
+    let js_req = Request::builder().uri("/app.js").body(Body::empty()).unwrap();
+    let resp = app.clone().oneshot(js_req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), 100_000).await.unwrap();
+    let js = String::from_utf8_lossy(&body);
+    assert!(js.contains("synapse_auth_token"));
+
+    // 3. Protected API route without token returns 401
+    let unauth_req = Request::builder().uri("/api/v1/session").body(Body::empty()).unwrap();
+    let resp = app.clone().oneshot(unauth_req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // 4. Protected API route with invalid token returns 401
+    let bad_auth_req = Request::builder()
+        .uri("/api/v1/torrents")
+        .header("Authorization", "Bearer wrong-token")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(bad_auth_req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // 5. Protected API route with correct Bearer token returns 200
+    let auth_req = Request::builder()
+        .uri("/api/v1/session")
+        .header("Authorization", "Bearer super-secret-token")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(auth_req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
