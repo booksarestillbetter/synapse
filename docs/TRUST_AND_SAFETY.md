@@ -58,8 +58,8 @@ Under the BitTorrent protocol, **clients never report deltas**. Clients report *
 
 ### Why Double-Sending or Retrying Cannot Cheat
 When the tracker receives an announce, the tracker server computes the difference against the previously stored value:
-$$\Delta = \text{new\_uploaded} - \text{last\_recorded\_uploaded}$$
-$$\text{User Upload Credit} \mathrel{+}= \Delta$$
+$$\Delta = \text{new uploaded} - \text{last recorded uploaded}$$
+$$\text{credit added} = \Delta$$
 
 If a network timeout causes Synapse to retry an announce, or if two announces arrive close together:
 1. First announce arrives: `uploaded = 500,000,000`. Tracker grants credit for the increase and records `500,000,000`.
