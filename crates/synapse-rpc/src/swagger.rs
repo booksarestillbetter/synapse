@@ -170,10 +170,36 @@ pub const OPENAPI_JSON: &str = r#"{
     "/api/v1/session/stats": {
       "get": {
         "summary": "Global session statistics",
-        "description": "Returns aggregate throughput rates, swarm counts, and disk I/O metrics.",
+        "description": "Returns aggregate throughput rates, swarm counts, DHT node telemetry, discovery subsystem states, and disk I/O metrics.",
         "responses": {
           "200": {
-            "description": "Session statistics retrieved successfully"
+            "description": "Session statistics retrieved successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "total_torrents": { "type": "integer" },
+                    "downloading_torrents": { "type": "integer" },
+                    "seeding_torrents": { "type": "integer" },
+                    "paused_torrents": { "type": "integer" },
+                    "queued_torrents": { "type": "integer" },
+                    "downloaded_bytes": { "type": "integer" },
+                    "uploaded_bytes": { "type": "integer" },
+                    "download_rate": { "type": "integer" },
+                    "upload_rate": { "type": "integer" },
+                    "peers_connected": { "type": "integer" },
+                    "active_actors": { "type": "integer" },
+                    "free_disk_space_bytes": { "type": "integer" },
+                    "dht_nodes": { "type": "integer" },
+                    "dht_enabled": { "type": "boolean" },
+                    "pex_enabled": { "type": "boolean" },
+                    "lsd_enabled": { "type": "boolean" },
+                    "version": { "type": "string" }
+                  }
+                }
+              }
+            }
           }
         }
       }
@@ -214,12 +240,12 @@ pub const OPENAPI_JSON: &str = r#"{
     },
     "/api/v1/torrents/{info_hash}": {
       "get": {
-        "summary": "Inspect torrent details",
+        "summary": "Inspect torrent summary",
         "parameters": [
           { "name": "info_hash", "in": "path", "required": true, "schema": { "type": "string" } }
         ],
         "responses": {
-          "200": { "description": "Torrent detailed info" },
+          "200": { "description": "Torrent summary info" },
           "404": { "description": "Torrent not found" }
         }
       },
@@ -231,6 +257,73 @@ pub const OPENAPI_JSON: &str = r#"{
         ],
         "responses": {
           "200": { "description": "Torrent removed successfully" },
+          "404": { "description": "Torrent not found" }
+        }
+      }
+    },
+    "/api/v1/torrents/{info_hash}/detail": {
+      "get": {
+        "summary": "Inspect comprehensive torrent details",
+        "description": "Returns in-depth swarm details including files, trackers, candidate peer pool size, active dials, DHT/PEX/LSD/webseed discovery metrics, and connected peer telemetry.",
+        "parameters": [
+          { "name": "info_hash", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": {
+            "description": "Torrent comprehensive detail retrieved successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "info_hash": { "type": "string" },
+                    "name": { "type": "string" },
+                    "download_dir": { "type": "string" },
+                    "total_bytes": { "type": "integer" },
+                    "progress": { "type": "number" },
+                    "download_rate": { "type": "integer" },
+                    "upload_rate": { "type": "integer" },
+                    "downloaded_bytes": { "type": "integer" },
+                    "uploaded_bytes": { "type": "integer" },
+                    "ratio": { "type": "number" },
+                    "eta_seconds": { "type": "integer" },
+                    "peers_connected": { "type": "integer" },
+                    "peers_sending": { "type": "integer" },
+                    "candidate_peers": { "type": "integer", "description": "Candidate peer pool size available for dialing" },
+                    "active_dials": { "type": "integer", "description": "Number of currently active outbound TCP/uTP connection attempts" },
+                    "discovery": {
+                      "type": "object",
+                      "properties": {
+                        "is_private": { "type": "boolean" },
+                        "allows_dht": { "type": "boolean" },
+                        "allows_pex": { "type": "boolean" },
+                        "allows_lsd": { "type": "boolean" },
+                        "candidate_peers": { "type": "integer" },
+                        "active_dials": { "type": "integer" },
+                        "pex_peers": { "type": "integer", "description": "Connected peers supporting BEP 11 / ut_pex" },
+                        "discovered_from_tracker": { "type": "integer" },
+                        "discovered_from_dht": { "type": "integer" },
+                        "discovered_from_pex": { "type": "integer" },
+                        "discovered_from_lsd": { "type": "integer" },
+                        "webseeds": {
+                          "type": "array",
+                          "items": { "type": "string" }
+                        }
+                      }
+                    },
+                    "state": { "type": "string" },
+                    "tier": { "type": "string" },
+                    "piece_count": { "type": "integer" },
+                    "piece_size": { "type": "integer" },
+                    "piece_bitfield": { "type": "string" },
+                    "files": { "type": "array", "items": { "type": "object" } },
+                    "trackers": { "type": "array", "items": { "type": "object" } },
+                    "active_peers": { "type": "array", "items": { "type": "object" } }
+                  }
+                }
+              }
+            }
+          },
           "404": { "description": "Torrent not found" }
         }
       }

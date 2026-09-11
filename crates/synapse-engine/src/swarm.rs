@@ -255,6 +255,27 @@ pub struct SwarmResumeOptions {
     pub is_paused: bool,
 }
 
+/// Comprehensive telemetry for swarm discovery mechanisms (DHT, PEX, LSD, Trackers, Webseeds).
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct SwarmDiscoveryStats {
+    pub candidate_peers: usize,
+    pub active_dials: usize,
+    pub dht_enabled: bool,
+    pub dht_allowed: bool,
+    pub pex_enabled: bool,
+    pub pex_allowed: bool,
+    pub pex_peers: usize,
+    pub lsd_enabled: bool,
+    pub lsd_allowed: bool,
+    pub is_private: bool,
+    pub webseeds_count: usize,
+    pub webseeds: Vec<String>,
+    pub discovered_from_tracker: u64,
+    pub discovered_from_dht: u64,
+    pub discovered_from_pex: u64,
+    pub discovered_from_lsd: u64,
+}
+
 #[derive(Clone)]
 pub struct ActiveActor {
     pub peer_event_tx: mpsc::Sender<PeerEvent>,
@@ -756,7 +777,7 @@ impl SwarmEngine {
         let hash_pex = info.hash;
         tokio::spawn(async move {
             while let Some(peers) = pex_rx.recv().await {
-                scheduler_pex.add_candidate_peers(&hash_pex, peers);
+                scheduler_pex.add_candidate_peers_with_source(&hash_pex, peers, crate::announcer::PeerDiscoverySource::Pex);
             }
         });
 
@@ -1666,6 +1687,69 @@ impl SwarmEngine {
         }
     }
 
+    /// Returns the number of candidate peers queued to be dialed for this swarm.
+    pub fn candidate_peers_count(&self, info_hash: &[u8; 20]) -> usize {
+        self.announce_scheduler.candidate_peers_count(info_hash)
+    }
+
+    /// Returns the number of active dials currently in flight for this swarm.
+    pub fn active_dials_count(&self, info_hash: &[u8; 20]) -> usize {
+        self.announce_scheduler.active_dials_count(info_hash)
+    }
+
+    /// Returns comprehensive discovery metrics and flags for this swarm.
+    pub fn swarm_discovery_stats(&self, info_hash: &[u8; 20]) -> SwarmDiscoveryStats {
+        let (candidate_peers, active_dials, from_tracker, from_dht, from_pex, from_lsd) =
+            self.announce_scheduler.discovery_breakdown(info_hash);
+
+        let (dht_enabled, pex_enabled, lsd_enabled) = {
+            let s = self.settings.read();
+            (s.dht_enabled, s.pex_enabled, s.lsd_enabled)
+        };
+
+        if let Some(handle) = self.get_torrent(info_hash) {
+            let pex_peers = handle
+                .live_peers
+                .read()
+                .iter()
+                .filter(|p| p.supports_pex || p.flags.contains('X'))
+                .count();
+            let webseeds: Vec<String> = handle.info.web_seeds.iter().map(|u| u.to_string()).collect();
+            let webseeds_count = webseeds.len();
+            SwarmDiscoveryStats {
+                candidate_peers,
+                active_dials,
+                dht_enabled,
+                dht_allowed: handle.allows_dht(),
+                pex_enabled,
+                pex_allowed: handle.allows_pex(),
+                pex_peers,
+                lsd_enabled,
+                lsd_allowed: handle.allows_lsd(),
+                is_private: handle.is_private(),
+                webseeds_count,
+                webseeds,
+                discovered_from_tracker: from_tracker,
+                discovered_from_dht: from_dht,
+                discovered_from_pex: from_pex,
+                discovered_from_lsd: from_lsd,
+            }
+        } else {
+            SwarmDiscoveryStats {
+                candidate_peers,
+                active_dials,
+                dht_enabled,
+                pex_enabled,
+                lsd_enabled,
+                discovered_from_tracker: from_tracker,
+                discovered_from_dht: from_dht,
+                discovered_from_pex: from_pex,
+                discovered_from_lsd: from_lsd,
+                ..Default::default()
+            }
+        }
+    }
+
     /// Starts the BEP 5 Kademlia DHT: binds a UDP node, resolves the standard public
     /// bootstrap routers, then periodically (every `DHT_CRAWL_INTERVAL`) walks the
     /// network for peers on every registered non-private swarm and feeds discovered
@@ -1736,7 +1820,7 @@ impl SwarmEngine {
                             Ok(result) => {
                                 if !result.peers.is_empty() {
                                     let addrs = result.peers.into_iter().map(SocketAddr::V4);
-                                    engine.announce_scheduler.add_candidate_peers(&info_hash, addrs);
+                                    engine.announce_scheduler.add_candidate_peers_with_source(&info_hash, addrs, crate::announcer::PeerDiscoverySource::Dht);
                                 }
                                 for (node, token) in result.closest_nodes {
                                     let _ = handle.announce_peer(node.addr, info_hash, peer_port, token).await;
@@ -1804,7 +1888,7 @@ impl SwarmEngine {
                                 if let Ok(text) = std::str::from_utf8(&buf[..n]) {
                                     let discovered = self.lsd_manager.lock().ingest_packet(from.ip(), text);
                                     for peer in discovered {
-                                        self.announce_scheduler.add_candidate_peers(&peer.info_hash, [peer.addr]);
+                                        self.announce_scheduler.add_candidate_peers_with_source(&peer.info_hash, [peer.addr], crate::announcer::PeerDiscoverySource::Lsd);
                                     }
                                 }
                             }

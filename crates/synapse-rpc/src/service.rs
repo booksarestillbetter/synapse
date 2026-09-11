@@ -31,6 +31,7 @@ impl SynapseService {
             active_seeding: 0,
             free_disk_space_bytes: 0,
             timestamp_ms: 0,
+            dht_nodes: 0,
         };
 
         Self {
@@ -143,6 +144,7 @@ impl SynapseService {
             active_seeding: seeding,
             free_disk_space_bytes: free_space,
             timestamp_ms: now_ms,
+            dht_nodes: 0,
         });
     }
 }
@@ -484,6 +486,12 @@ impl SynapseControl for SynapseService {
                     }
                 }
 
+                let discovery = if let (Some(ref swarm), Some(ref hb)) = (&swarm_opt, &hash_bytes) {
+                    swarm.swarm_discovery_stats(hb)
+                } else {
+                    synapse_engine::SwarmDiscoveryStats::default()
+                };
+
                 let detail = TorrentDetailEvent {
                     hash: hash.clone(),
                     timestamp_ms: now_ms,
@@ -494,6 +502,18 @@ impl SynapseControl for SynapseService {
                     piece_count,
                     piece_size,
                     availability,
+                    candidate_peers: discovery.candidate_peers as u32,
+                    active_dials: discovery.active_dials as u32,
+                    is_private: discovery.is_private,
+                    allows_dht: discovery.dht_allowed,
+                    allows_pex: discovery.pex_allowed,
+                    allows_lsd: discovery.lsd_allowed,
+                    pex_peers: discovery.pex_peers as u32,
+                    discovered_from_tracker: discovery.discovered_from_tracker,
+                    discovered_from_dht: discovery.discovered_from_dht,
+                    discovered_from_pex: discovery.discovered_from_pex,
+                    discovered_from_lsd: discovery.discovered_from_lsd,
+                    webseeds: discovery.webseeds,
                 };
                 yield Ok(detail);
             }
@@ -801,6 +821,7 @@ impl SynapseControl for SynapseService {
             let rate_dl: u64 = swarms.iter().map(|s| s.download_rate).sum();
             let rate_ul: u64 = swarms.iter().map(|s| s.upload_rate).sum();
             let free_space = engine.free_disk_space_bytes();
+            let dht_nodes = engine.dht_node_count().await as u32;
             let now_ms = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
@@ -815,6 +836,7 @@ impl SynapseControl for SynapseService {
                 active_seeding: seeding,
                 free_disk_space_bytes: free_space,
                 timestamp_ms: now_ms,
+                dht_nodes,
             }));
         }
         let stats = *self.session_stats.read();

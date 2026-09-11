@@ -36,6 +36,8 @@ pub struct PeerSnapshot {
     pub progress: f32,
     pub is_encrypted: bool,
     pub is_utp: bool,
+    #[serde(default)]
+    pub supports_pex: bool,
 }
 
 /// Conventional BitTorrent block size. Requests are always made in blocks of this size
@@ -1451,6 +1453,10 @@ impl Torrent {
             if peer.has.is_complete() {
                 flags.push('H');
             }
+            let supports_pex = peer.peer_extensions.contains_key("ut_pex");
+            if supports_pex {
+                flags.push('X');
+            }
             if flags.is_empty() {
                 flags.push('?');
             }
@@ -1466,6 +1472,7 @@ impl Torrent {
                 progress: peer_progress.min(1.0),
                 is_encrypted: false,
                 is_utp: false,
+                supports_pex,
             });
         }
 

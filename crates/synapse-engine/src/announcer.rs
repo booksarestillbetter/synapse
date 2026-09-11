@@ -593,6 +593,15 @@ impl PartialOrd for ScheduledJob {
     }
 }
 
+/// Peer discovery origin for candidate peer telemetry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum PeerDiscoverySource {
+    Tracker,
+    Dht,
+    Pex,
+    Lsd,
+}
+
 struct SwarmMeta {
     info: Arc<Info>,
     stats: Arc<RwLock<SwarmStats>>,
@@ -602,6 +611,10 @@ struct SwarmMeta {
     tracker_reports: Vec<TrackerReport>,
     candidate_peers: VecDeque<SocketAddr>,
     active_dials: HashSet<SocketAddr>,
+    discovered_from_tracker: u64,
+    discovered_from_dht: u64,
+    discovered_from_pex: u64,
+    discovered_from_lsd: u64,
 }
 
 /// Callback type for dynamically waking dormant swarms and obtaining their peer event channel.
@@ -726,6 +739,10 @@ impl AnnounceScheduler {
                     tracker_reports: initial_reports,
                     candidate_peers: VecDeque::new(),
                     active_dials: HashSet::new(),
+                    discovered_from_tracker: 0,
+                    discovered_from_dht: 0,
+                    discovered_from_pex: 0,
+                    discovered_from_lsd: 0,
                 },
             );
         }
@@ -745,8 +762,14 @@ impl AnnounceScheduler {
         }
     }
 
-    /// Enqueues newly discovered peers from trackers or PEX into the swarm's candidate pool.
-    pub fn add_candidate_peers(&self, info_hash: &[u8; 20], peers: impl IntoIterator<Item = SocketAddr>) {
+    /// Enqueues newly discovered peers from Trackers, DHT, PEX, or LSD into the swarm's candidate pool,
+    /// tracking discovery metrics by origin subsystem.
+    pub fn add_candidate_peers_with_source(
+        &self,
+        info_hash: &[u8; 20],
+        peers: impl IntoIterator<Item = SocketAddr>,
+        source: PeerDiscoverySource,
+    ) {
         let mut swarms = self.swarms.write();
         if let Some(meta) = swarms.get_mut(info_hash) {
             let mut existing: HashSet<SocketAddr> = meta.candidate_peers.iter().copied().collect();
@@ -759,15 +782,46 @@ impl AnnounceScheduler {
                 {
                     existing.insert(addr);
                     meta.candidate_peers.push_back(addr);
+                    match source {
+                        PeerDiscoverySource::Tracker => meta.discovered_from_tracker += 1,
+                        PeerDiscoverySource::Dht => meta.discovered_from_dht += 1,
+                        PeerDiscoverySource::Pex => meta.discovered_from_pex += 1,
+                        PeerDiscoverySource::Lsd => meta.discovered_from_lsd += 1,
+                    }
                 }
             }
         }
+    }
+
+    /// Enqueues newly discovered peers into the swarm's candidate pool, attributing them to Tracker announces.
+    pub fn add_candidate_peers(&self, info_hash: &[u8; 20], peers: impl IntoIterator<Item = SocketAddr>) {
+        self.add_candidate_peers_with_source(info_hash, peers, PeerDiscoverySource::Tracker);
     }
 
     /// Returns the number of candidate peers currently queued for dialing.
     pub fn candidate_peers_count(&self, info_hash: &[u8; 20]) -> usize {
         let swarms = self.swarms.read();
         swarms.get(info_hash).map(|m| m.candidate_peers.len()).unwrap_or(0)
+    }
+
+    /// Returns the number of active dials currently in flight for this swarm.
+    pub fn active_dials_count(&self, info_hash: &[u8; 20]) -> usize {
+        let swarms = self.swarms.read();
+        swarms.get(info_hash).map(|m| m.active_dials.len()).unwrap_or(0)
+    }
+
+    /// Returns the candidate pool size, active dials count, and discovery attribution counters
+    /// (candidate_peers, active_dials, from_tracker, from_dht, from_pex, from_lsd).
+    pub fn discovery_breakdown(&self, info_hash: &[u8; 20]) -> (usize, usize, u64, u64, u64, u64) {
+        let swarms = self.swarms.read();
+        swarms.get(info_hash).map(|m| (
+            m.candidate_peers.len(),
+            m.active_dials.len(),
+            m.discovered_from_tracker,
+            m.discovered_from_dht,
+            m.discovered_from_pex,
+            m.discovered_from_lsd,
+        )).unwrap_or((0, 0, 0, 0, 0, 0))
     }
 
     /// Unregisters a removed torrent from future announces.

@@ -356,6 +356,11 @@ async fn update_session_settings_handler(
 
 async fn session_stats_handler(State(state): State<ApiState>) -> Json<serde_json::Value> {
     let m = state.engine.global_metrics();
+    let dht_nodes = state.engine.dht_node_count().await;
+    let (dht_enabled, pex_enabled, lsd_enabled) = {
+        let s = state.engine.settings().read().clone();
+        (s.dht_enabled, s.pex_enabled, s.lsd_enabled)
+    };
 
     Json(serde_json::json!({
         "total_torrents": m.total_torrents,
@@ -370,6 +375,10 @@ async fn session_stats_handler(State(state): State<ApiState>) -> Json<serde_json
         "peers_connected": m.peers_connected,
         "active_actors": m.active_actors,
         "free_disk_space_bytes": state.engine.free_disk_space_bytes(),
+        "dht_nodes": dht_nodes,
+        "dht_enabled": dht_enabled,
+        "pex_enabled": pex_enabled,
+        "lsd_enabled": lsd_enabled,
         "version": env!("CARGO_PKG_VERSION")
     }))
 }
@@ -683,6 +692,8 @@ async fn get_torrent_detail_handler(
         }));
     }
 
+    let discovery = state.engine.swarm_discovery_stats(&hash);
+
     Ok(Json(serde_json::json!({
         "info_hash": hex::encode(stats.info_hash),
         "name": stats.name,
@@ -697,6 +708,9 @@ async fn get_torrent_detail_handler(
         "eta_seconds": stats.eta_seconds,
         "peers_connected": stats.peers_connected,
         "peers_sending": stats.peers_sending,
+        "candidate_peers": discovery.candidate_peers,
+        "active_dials": discovery.active_dials,
+        "discovery": discovery,
         "state": format!("{:?}", stats.state),
         "tier": format!("{:?}", stats.tier),
         "piece_count": piece_count,

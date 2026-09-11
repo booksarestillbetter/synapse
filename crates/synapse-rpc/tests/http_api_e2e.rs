@@ -194,6 +194,28 @@ async fn test_rest_api_detail_upload_and_settings_patch() {
     assert!(val.get("files").is_some());
     assert!(val.get("trackers").is_some());
     assert!(val.get("active_peers").is_some());
+    assert!(val.get("candidate_peers").is_some());
+    assert!(val.get("active_dials").is_some());
+    assert!(val.get("discovery").is_some());
+    let disc = &val["discovery"];
+    assert_eq!(disc["dht_allowed"], true);
+    assert_eq!(disc["pex_allowed"], true);
+    assert_eq!(disc["lsd_allowed"], true);
+    assert_eq!(disc["is_private"], false);
+
+    // Verify Session Stats exposes DHT nodes and discovery subsystem states
+    let session_stats_req = Request::builder()
+        .uri("/api/v1/session/stats")
+        .body(Body::empty())
+        .unwrap();
+    let resp_stats = app.clone().oneshot(session_stats_req).await.unwrap();
+    assert_eq!(resp_stats.status(), StatusCode::OK);
+    let stats_body = axum::body::to_bytes(resp_stats.into_body(), 10_000).await.unwrap();
+    let stats_json: serde_json::Value = serde_json::from_slice(&stats_body).unwrap();
+    assert!(stats_json.get("dht_nodes").is_some());
+    assert_eq!(stats_json["dht_enabled"], true);
+    assert_eq!(stats_json["pex_enabled"], true);
+    assert_eq!(stats_json["lsd_enabled"], true);
 
     // 3. Test In-flight Session Settings PATCH
     let patch_req = Request::builder()

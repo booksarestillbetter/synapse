@@ -21,7 +21,7 @@ mod torrent;
 pub mod utp;
 pub mod webseed;
 
-pub use announcer::{AnnounceScheduler, AnnounceStats, Announcer, PeerEventRouter, TrackerReport};
+pub use announcer::{AnnounceScheduler, AnnounceStats, Announcer, PeerDiscoverySource, PeerEventRouter, TrackerReport};
 pub use circuit_breaker::{CircuitState, EndpointCircuitInfo, PeerCircuitBreaker};
 pub use fast_ext::compute_allowed_fast_set;
 pub use fs::get_available_disk_space;
@@ -43,7 +43,7 @@ pub use ratelimit::TokenBucket;
 pub use session::{SessionStore, TorrentSessionState};
 pub use settings::{current_time_mins_and_day, is_in_alt_speed_schedule, DynamicSessionSettings, SessionSettingsUpdate};
 pub use swarm::{
-    EngineMetricsSnapshot, GlobalEngineMetrics, SwarmEngine, SwarmResumeOptions, SwarmState,
+    EngineMetricsSnapshot, GlobalEngineMetrics, SwarmDiscoveryStats, SwarmEngine, SwarmResumeOptions, SwarmState,
     SwarmStateFilter, SwarmStats, SwarmTier, TorrentHandle,
 };
 pub use torrent::{PeerSnapshot, Torrent, TorrentConfig};

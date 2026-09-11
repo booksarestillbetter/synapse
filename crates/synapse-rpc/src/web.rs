@@ -149,8 +149,9 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
         <div class="sidebar-title">Daemon Info</div>
         <div class="daemon-info-card">
           <div><small>Engine:</small> <strong>Synapse 2.0</strong></div>
-          <div><small>Peer ID:</small> <code>-SY2000-</code></div>
-          <div id="daemon-version"><small>Version:</small> 2.2.1</div>
+          <div><small>Peer ID:</small> <code>-SY2200-</code></div>
+          <div id="daemon-version"><small>Version:</small> 2.2.3</div>
+          <div id="daemon-dht"><small>DHT Nodes:</small> <span id="stat-dht-nodes">0</span></div>
         </div>
       </div>
     </aside>
@@ -208,6 +209,9 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
               <div class="detail-item"><span class="lbl">Total Size:</span> <span class="val" id="det-size">-</span></div>
               <div class="detail-item"><span class="lbl">Pieces:</span> <span class="val" id="det-pieces">-</span></div>
               <div class="detail-item"><span class="lbl">State / Tier:</span> <span class="val" id="det-state">-</span></div>
+              <div class="detail-item"><span class="lbl">Swarm Privacy:</span> <span class="val" id="det-privacy">-</span></div>
+              <div class="detail-item"><span class="lbl">Discovery:</span> <span class="val" id="det-discovery">-</span></div>
+              <div class="detail-item"><span class="lbl">Webseeds:</span> <span class="val" id="det-webseeds">-</span></div>
             </div>
           </div>
 
@@ -221,6 +225,7 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
               <div class="detail-item"><span class="lbl">Share Ratio:</span> <span class="val" id="det-ratio">-</span></div>
               <div class="detail-item"><span class="lbl">ETA:</span> <span class="val" id="det-eta">-</span></div>
               <div class="detail-item"><span class="lbl">Connected Peers:</span> <span class="val" id="det-peer-count">-</span></div>
+              <div class="detail-item"><span class="lbl">Discovered:</span> <span class="val" id="det-discovered-counts">-</span></div>
             </div>
           </div>
 
@@ -1101,10 +1106,19 @@ async function fetchUpdate() {
     document.getElementById('conn-status').classList.remove('offline');
     torrents = torrentData.torrents || [];
 
-    // Update global toolbar metrics
+    // Update global toolbar metrics and DHT nodes
     document.getElementById('stat-dl-rate').innerText = formatSpeed(stats.download_rate);
     document.getElementById('stat-ul-rate').innerText = formatSpeed(stats.upload_rate);
     document.getElementById('stat-free-disk').innerText = formatBytes(stats.free_disk_space_bytes);
+
+    const dhtEl = document.getElementById('stat-dht-nodes');
+    if (dhtEl) {
+      if (stats.dht_enabled === false) {
+        dhtEl.innerText = 'Disabled';
+      } else {
+        dhtEl.innerText = `${stats.dht_nodes || 0}`;
+      }
+    }
 
     updateCategoryCounts();
     renderTorrentTable();
@@ -1281,6 +1295,28 @@ async function updateInspector(hash) {
     document.getElementById('det-pieces').innerText = `${d.piece_count || 0} pieces @ ${formatBytes(d.piece_size || 0)}`;
     document.getElementById('det-state').innerText = `${cleanState(d.state)} (${d.tier || 'Hot'})`;
 
+    const disc = d.discovery || {};
+    const privacyEl = document.getElementById('det-privacy');
+    if (privacyEl) {
+      privacyEl.innerText = disc.is_private ? '🔒 Private (BEP 27)' : '🌐 Public Swarm';
+    }
+    const discEl = document.getElementById('det-discovery');
+    if (discEl) {
+      if (disc.is_private) {
+        discEl.innerText = 'DHT / PEX / LSD Prohibited';
+      } else {
+        const parts = [];
+        parts.push(disc.dht_enabled ? 'DHT' : 'DHT off');
+        parts.push(disc.pex_enabled ? `PEX (${disc.pex_peers || 0} active)` : 'PEX off');
+        parts.push(disc.lsd_enabled ? 'LSD' : 'LSD off');
+        discEl.innerText = parts.join(' | ');
+      }
+    }
+    const webseedsEl = document.getElementById('det-webseeds');
+    if (webseedsEl) {
+      webseedsEl.innerText = (disc.webseeds_count || 0) > 0 ? `${disc.webseeds_count} HTTP mirror(s)` : 'None';
+    }
+
     // Transfer
     document.getElementById('det-downloaded').innerText = formatBytes(d.downloaded_bytes);
     document.getElementById('det-uploaded').innerText = formatBytes(d.uploaded_bytes);
@@ -1288,7 +1324,14 @@ async function updateInspector(hash) {
     document.getElementById('det-ul-rate').innerText = formatSpeed(d.upload_rate);
     document.getElementById('det-ratio').innerText = d.ratio !== undefined ? d.ratio.toFixed(2) : '0.00';
     document.getElementById('det-eta').innerText = formatEta(d.eta_seconds);
-    document.getElementById('det-peer-count').innerText = `${d.peers_connected || 0} connected (${d.peers_sending || 0} active)`;
+
+    const inPool = d.candidate_peers !== undefined ? ` (${d.candidate_peers} in pool, ${d.active_dials || 0} dialing)` : '';
+    document.getElementById('det-peer-count').innerText = `${d.peers_connected || 0} connected${inPool}`;
+
+    const discCountsEl = document.getElementById('det-discovered-counts');
+    if (discCountsEl) {
+      discCountsEl.innerText = `Trackers: ${disc.discovered_from_tracker || 0} | DHT: ${disc.discovered_from_dht || 0} | PEX: ${disc.discovered_from_pex || 0} | LSD: ${disc.discovered_from_lsd || 0}`;
+    }
 
     // Trackers
     const tBody = document.getElementById('trackers-tbody');
