@@ -574,10 +574,58 @@ impl SynapseControl for SynapseService {
                     }
                 }
             }
+            Some(add_torrent_request::Source::FilePath(path)) => {
+                match tokio::fs::read(&path).await {
+                    Ok(bytes) => {
+                        if let Ok(bencode) = synapse_bencode::decode_buf(&bytes) {
+                            if let Ok(info) = synapse_meta::Info::from_bencode(bencode) {
+                                (hex::encode(info.hash), info.name.clone(), info.total_len, Some(info))
+                            } else {
+                                return Ok(Response::new(AddTorrentResponse {
+                                    success: false,
+                                    hash: String::new(),
+                                    name: String::new(),
+                                    error: Some("Invalid torrent metadata in file".into()),
+                                }));
+                            }
+                        } else {
+                            return Ok(Response::new(AddTorrentResponse {
+                                success: false,
+                                hash: String::new(),
+                                name: String::new(),
+                                error: Some("Failed to decode bencode from file".into()),
+                            }));
+                        }
+                    }
+                    Err(e) => {
+                        return Ok(Response::new(AddTorrentResponse {
+                            success: false,
+                            hash: String::new(),
+                            name: String::new(),
+                            error: Some(format!("Failed to read torrent file: {e}")),
+                        }));
+                    }
+                }
+            }
             _ => ("unknown_hash".to_string(), "Unknown".to_string(), 0, None),
         };
 
-        let dl_dir = req.download_dir.unwrap_or_else(|| "/downloads".into());
+        let dl_dir = req
+            .download_dir
+            .filter(|d| !d.trim().is_empty())
+            .unwrap_or_else(|| {
+                self.swarm_engine
+                    .as_ref()
+                    .map(|s| s.settings().read().download_dir.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "/downloads".into())
+            });
+
+        let start_paused = req.start_paused.unwrap_or_else(|| {
+            self.swarm_engine
+                .as_ref()
+                .map(|s| !s.settings().read().start_added_torrents)
+                .unwrap_or(false)
+        });
 
         let (piece_count, piece_size) = if let Some(ref info) = info_opt {
             (info.pieces(), info.piece_len)
@@ -587,7 +635,11 @@ impl SynapseControl for SynapseService {
 
         if let Some(info) = info_opt {
             if let Some(ref swarm) = self.swarm_engine {
+                let info_hash = info.hash;
                 swarm.add_torrent(Arc::new(info), std::path::PathBuf::from(&dl_dir), None);
+                if start_paused {
+                    swarm.transition_to_cold(&info_hash);
+                }
             }
         }
 
@@ -596,7 +648,11 @@ impl SynapseControl for SynapseService {
             name: name.clone(),
             total_size,
             progress: 0.0,
-            state: TorrentState::StateDownloading as i32,
+            state: if start_paused {
+                TorrentState::StateStopped as i32
+            } else {
+                TorrentState::StateDownloading as i32
+            },
             rate_download: 0,
             rate_upload: 0,
             peers_connected: 0,

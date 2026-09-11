@@ -1,6 +1,5 @@
-//! Piece picker, bitfield, and choking algorithm for the synapse rewrite. Pure logic,
-//! no I/O and no async - the `Engine` (Stage 3, not yet built) drives these from
-//! whatever async event loop actually talks to peers. See `doc/REWRITE_ROADMAP.md`.
+//! Piece picker, bitfield, priority mapping, and choking algorithms for Synapse 2.0.
+//! Pure logic, zero I/O — driven asynchronously by `synapse-engine` swarm actors.
 
 mod bitfield;
 mod choker;

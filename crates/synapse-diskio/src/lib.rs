@@ -65,13 +65,23 @@ pub enum DiskEngine {
 impl DiskEngine {
     /// Picks the best backend available: `io_uring` on Linux if the running kernel
     /// supports the operations this engine needs, the portable blocking-thread-pool
-    /// backend otherwise (including on every non-Linux platform).
+    /// backend otherwise (including on every non-Linux platform), bounded by default max open files.
     pub async fn auto() -> DiskEngine {
+        Self::auto_with_max_open_files(500).await
+    }
+
+    /// Picks the best backend available with a configured maximum open files limit for
+    /// LRU file descriptor caching.
+    pub async fn auto_with_max_open_files(max_open_files: usize) -> DiskEngine {
         #[cfg(target_os = "linux")]
         {
-            match IoUringDiskEngine::new(IoUringDiskEngineConfig::default()).await {
+            let cfg = IoUringDiskEngineConfig {
+                max_open_files,
+                ..Default::default()
+            };
+            match IoUringDiskEngine::new(cfg).await {
                 Ok(engine) => {
-                    tracing::info!("disk engine: io_uring");
+                    tracing::info!("disk engine: io_uring (max_open_files={})", max_open_files);
                     return DiskEngine::IoUring(engine);
                 }
                 Err(e) => {
@@ -79,8 +89,8 @@ impl DiskEngine {
                 }
             }
         }
-        tracing::info!("disk engine: blocking thread pool");
-        DiskEngine::Blocking(BlockingDiskEngine::new(BlockingDiskEngineConfig::default()))
+        tracing::info!("disk engine: blocking thread pool (max_open_files={})", max_open_files);
+        DiskEngine::Blocking(BlockingDiskEngine::new(BlockingDiskEngineConfig { max_open_files }))
     }
 
     /// Submits a batch of writes (e.g. every file location one piece touches, when a

@@ -364,6 +364,34 @@ pub const OPENAPI_JSON: &str = r#"{
         }
       }
     },
+    "/api/v1/torrents/{info_hash}/files/{index}/priority": {
+      "post": {
+        "summary": "Set file download priority",
+        "description": "Sets the download priority for a specific file index in a multi-file torrent (0=skip/do not download, 1=low, 4=normal, 7=high).",
+        "parameters": [
+          { "name": "info_hash", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "index", "in": "path", "required": true, "schema": { "type": "integer" } }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "priority": { "type": "integer", "enum": [0, 1, 4, 7], "example": 4 }
+                },
+                "required": ["priority"]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "File priority updated successfully" },
+          "404": { "description": "Torrent not found" }
+        }
+      }
+    },
     "/api/v1/torrents/{info_hash}/peers": {
       "get": {
         "summary": "List connected peers",

@@ -866,6 +866,19 @@ body {
   padding: 4px 8px;
   border-bottom: 1px solid var(--border-subtle);
 }
+.prio-select {
+  background: var(--bg-tertiary);
+  color: var(--text-main);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 2px 4px;
+  font-size: 11px;
+  outline: none;
+  cursor: pointer;
+}
+.prio-select:hover {
+  border-color: var(--primary);
+}
 
 /* Piece Map */
 .pieces-wrapper { display: flex; flex-direction: column; gap: 8px; }
@@ -1381,7 +1394,14 @@ async function updateInspector(hash) {
               <span class="prog-text">${(f.progress * 100).toFixed(0)}%</span>
             </div>
           </td>
-          <td>${formatPriority(f.priority)}</td>
+          <td>
+            <select class="prio-select" onchange="setFilePriority('${hash}', ${f.index}, this.value)">
+              <option value="0" ${f.priority === 0 ? 'selected' : ''}>Skip</option>
+              <option value="1" ${f.priority === 1 ? 'selected' : ''}>Low</option>
+              <option value="4" ${f.priority === 4 ? 'selected' : ''}>Normal</option>
+              <option value="7" ${f.priority === 7 ? 'selected' : ''}>High</option>
+            </select>
+          </td>
         </tr>
       `).join('');
     } else {
@@ -1392,6 +1412,18 @@ async function updateInspector(hash) {
     renderPieceMap(d.piece_count, d.piece_bitfield);
   } catch (e) {
     console.error('Inspector fetch failed:', e);
+  }
+}
+
+async function setFilePriority(hash, fileIndex, priority) {
+  try {
+    await api(`/api/v1/torrents/${hash}/files/${fileIndex}/priority`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ priority: parseInt(priority, 10) })
+    });
+  } catch (e) {
+    alert('Failed to set file priority: ' + e.message);
   }
 }
 

@@ -290,6 +290,7 @@ pub struct TorrentHandle {
     pub active_actor: Arc<RwLock<Option<ActiveActor>>>,
     pub live_peers: Arc<RwLock<Vec<PeerSnapshot>>>,
     pub piece_availability: Arc<RwLock<Vec<u32>>>,
+    pub file_priorities: Arc<RwLock<Vec<u8>>>,
 }
 
 impl TorrentHandle {
@@ -1180,6 +1181,7 @@ impl SwarmEngine {
             vec![0u32; info.pieces() as usize]
         };
         let piece_availability = Arc::new(RwLock::new(initial_availability));
+        let file_priorities = Arc::new(RwLock::new(vec![4u8; info.files.len()]));
 
         let handle = Arc::new(TorrentHandle {
             info: info.clone(),
@@ -1188,6 +1190,7 @@ impl SwarmEngine {
             active_actor: Arc::new(RwLock::new(None)),
             live_peers: Arc::new(RwLock::new(Vec::new())),
             piece_availability,
+            file_priorities,
         });
 
         if initial_state == SwarmState::Seeding {
@@ -1299,12 +1302,25 @@ impl SwarmEngine {
     /// masks the file's pieces in the picker. Previously this only checked the torrent existed
     /// and never touched what got downloaded.
     pub fn set_file_priority(&self, info_hash: &[u8; 20], file_index: u32, priority: u8) -> bool {
-        if let Some(tx) = self.get_or_wake_command_tx(info_hash) {
-            let _ = tx.try_send(TorrentCommand::SetFilePriority(file_index, priority));
+        if let Some(handle) = self.torrents.get(info_hash) {
+            {
+                let mut prios = handle.file_priorities.write();
+                if let Some(p) = prios.get_mut(file_index as usize) {
+                    *p = priority;
+                }
+            }
+            if let Some(tx) = self.get_or_wake_command_tx(info_hash) {
+                let _ = tx.try_send(TorrentCommand::SetFilePriority(file_index, priority));
+            }
             true
         } else {
             false
         }
+    }
+
+    /// Returns the active priority for each file in the torrent (0=skip, 1=low, 4=normal, 7=high).
+    pub fn get_file_priorities(&self, info_hash: &[u8; 20]) -> Option<Vec<u8>> {
+        self.torrents.get(info_hash).map(|h| h.file_priorities.read().clone())
     }
 
     /// Moves an active swarm's downloaded files to a new directory — dispatched to

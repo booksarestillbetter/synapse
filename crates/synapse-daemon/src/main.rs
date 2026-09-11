@@ -248,7 +248,7 @@ async fn main() -> std::process::ExitCode {
     tracing::info!("🐕 Synapse 2.0 Daemon starting...");
 
     // Initialize Zero-Copy Disk Engine
-    let disk = Arc::new(DiskEngine::auto().await);
+    let disk = Arc::new(DiskEngine::auto_with_max_open_files(config.disk.max_open_files).await);
     if let Err(e) = startup_self_check(&disk, &config.disk.session_dir).await {
         tracing::error!("disk engine startup self-check failed: {e}");
         return std::process::ExitCode::FAILURE;

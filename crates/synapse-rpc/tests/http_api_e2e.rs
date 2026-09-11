@@ -316,3 +316,61 @@ async fn test_http_api_and_web_token_authentication() {
     assert_eq!(resp.status(), StatusCode::OK);
 }
 
+fn build_test_torrent(name: &str) -> synapse_meta::Info {
+    let piece_len = 16384u32;
+    let file_len = 32768usize;
+    let pieces = vec![0x33u8; 40]; // 2 pieces * 20 bytes
+    let mut info_dict = std::collections::BTreeMap::new();
+    info_dict.insert(b"name".to_vec(), synapse_bencode::BEncode::String(name.as_bytes().to_vec()));
+    info_dict.insert(b"piece length".to_vec(), synapse_bencode::BEncode::Int(piece_len as i64));
+    info_dict.insert(b"pieces".to_vec(), synapse_bencode::BEncode::String(pieces));
+    info_dict.insert(b"length".to_vec(), synapse_bencode::BEncode::Int(file_len as i64));
+    let mut torrent_dict = std::collections::BTreeMap::new();
+    torrent_dict.insert(b"info".to_vec(), synapse_bencode::BEncode::Dict(info_dict));
+    synapse_meta::Info::from_bencode(synapse_bencode::BEncode::Dict(torrent_dict)).unwrap()
+}
+
+#[tokio::test]
+async fn test_file_priority_and_default_download_dir() {
+    let disk = Arc::new(diskio::DiskEngine::auto().await);
+    let engine = Arc::new(SwarmEngine::new(disk, [0u8; 20]));
+    engine.settings().write().download_dir = std::path::PathBuf::from("/custom/download/path");
+    let app = synapse_rpc::create_http_router(engine.clone());
+
+    let test_info = Arc::new(build_test_torrent("MultiFileTest"));
+    let hash_hex = hex::encode(test_info.hash);
+    engine.add_torrent(test_info, std::path::PathBuf::from("/custom/download/path"), None);
+
+    // 1. Verify initial file priority is 4 (Normal)
+    let detail_req = Request::builder()
+        .uri(format!("/api/v1/torrents/{hash_hex}/detail"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(detail_req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), 50_000).await.unwrap();
+    let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(val["files"][0]["priority"], 4);
+
+    // 2. Update file priority to 7 (High)
+    let prio_req = Request::builder()
+        .method("POST")
+        .uri(format!("/api/v1/torrents/{hash_hex}/files/0/priority"))
+        .header("Content-Type", "application/json")
+        .body(Body::from(r#"{"priority": 7}"#))
+        .unwrap();
+    let prio_resp = app.clone().oneshot(prio_req).await.unwrap();
+    assert_eq!(prio_resp.status(), StatusCode::OK);
+
+    // 3. Verify file priority updated in detail response
+    let detail_req2 = Request::builder()
+        .uri(format!("/api/v1/torrents/{hash_hex}/detail"))
+        .body(Body::empty())
+        .unwrap();
+    let resp2 = app.clone().oneshot(detail_req2).await.unwrap();
+    let body2 = axum::body::to_bytes(resp2.into_body(), 50_000).await.unwrap();
+    let val2: serde_json::Value = serde_json::from_slice(&body2).unwrap();
+    assert_eq!(val2["files"][0]["priority"], 7);
+}
+
+

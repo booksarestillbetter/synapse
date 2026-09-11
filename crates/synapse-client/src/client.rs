@@ -141,6 +141,22 @@ impl SynapseClient {
         Ok(resp.into_inner())
     }
 
+    /// Adds a torrent by referencing a local `.torrent` file path on the daemon filesystem.
+    pub async fn add_torrent_file(
+        &self,
+        file_path: &str,
+        download_dir: Option<String>,
+        start_paused: bool,
+    ) -> Result<AddTorrentResponse> {
+        let req = self.request(AddTorrentRequest {
+            source: Some(Source::FilePath(file_path.to_string())),
+            download_dir,
+            start_paused: Some(start_paused),
+        });
+        let resp = self.inner.clone().add_torrent(req).await?;
+        Ok(resp.into_inner())
+    }
+
     /// Removes a torrent from the daemon, optionally deleting its files from disk.
     pub async fn remove_torrent(&self, hash: &str, delete_data: bool) -> Result<CommandResponse> {
         let req = self.request(RemoveTorrentRequest {

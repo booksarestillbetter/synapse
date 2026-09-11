@@ -39,6 +39,11 @@ pub struct SetLocationRequest {
     pub new_download_dir: String,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SetFilePriorityRequest {
+    pub priority: u8,
+}
+
 #[derive(Debug, Serialize, Deserialize, Default)]
 pub struct PaginationQuery {
     pub page: Option<usize>,
@@ -192,6 +197,7 @@ pub fn create_http_router_all(
         .route("/api/v1/torrents/:info_hash/resume", post(resume_torrent_handler))
         .route("/api/v1/torrents/:info_hash/recheck", post(recheck_torrent_handler))
         .route("/api/v1/torrents/:info_hash/location", post(set_location_handler))
+        .route("/api/v1/torrents/:info_hash/files/:index/priority", post(set_file_priority_handler))
         .route("/api/v1/circuit-breakers", get(list_circuit_breakers_handler))
         .route("/api/v1/circuit-breakers/:host/trip", post(trip_circuit_breaker_handler))
         .route("/api/v1/circuit-breakers/:host/reset", post(reset_circuit_breaker_handler))
@@ -440,8 +446,9 @@ async fn add_torrent_handler(
 ) -> Result<Json<ActionResponse>, (StatusCode, Json<ActionResponse>)> {
     let dir = payload
         .download_dir
+        .filter(|d| !d.trim().is_empty())
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
+        .unwrap_or_else(|| state.engine.settings().read().download_dir.clone());
 
     let info = if let Some(ref url) = payload.url {
         match crate::url_fetcher::fetch_or_parse_torrent(url).await {
@@ -510,7 +517,8 @@ async fn add_torrent_handler(
 
     let handle = state.engine.add_torrent(std::sync::Arc::new(info), dir, None);
     let hash = handle.stats.read().info_hash;
-    if payload.paused.unwrap_or(false) {
+    let start_added = state.engine.settings().read().start_added_torrents;
+    if payload.paused.unwrap_or(!start_added) {
         state.engine.transition_to_cold(&hash);
     }
 
@@ -654,13 +662,14 @@ async fn get_torrent_detail_handler(
             (0, 0.0)
         };
 
+        let priority = handle.file_priorities.read().get(idx).copied().unwrap_or(4);
         files_json.push(serde_json::json!({
             "index": idx,
             "path": f.path.to_string_lossy(),
             "size_bytes": f.length,
             "bytes_completed": bytes_completed,
             "progress": progress,
-            "priority": 4,
+            "priority": priority,
         }));
     }
 
@@ -759,12 +768,14 @@ async fn upload_torrent_handler(
 
     let dir = query
         .download_dir
+        .filter(|d| !d.trim().is_empty())
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
+        .unwrap_or_else(|| state.engine.settings().read().download_dir.clone());
 
     let handle = state.engine.add_torrent(std::sync::Arc::new(info), dir, None);
     let hash = handle.stats.read().info_hash;
-    if query.paused.unwrap_or(false) {
+    let start_added = state.engine.settings().read().start_added_torrents;
+    if query.paused.unwrap_or(!start_added) {
         state.engine.transition_to_cold(&hash);
     }
 
@@ -811,6 +822,28 @@ async fn set_location_handler(
         Ok(Json(ActionResponse {
             success: true,
             message: "Location updated".to_string(),
+        }))
+    } else {
+        Err(StatusCode::NOT_FOUND)
+    }
+}
+
+async fn set_file_priority_handler(
+    State(state): State<ApiState>,
+    Path((info_hash_str, file_index)): Path<(String, u32)>,
+    Json(payload): Json<SetFilePriorityRequest>,
+) -> Result<Json<ActionResponse>, StatusCode> {
+    let hash_bytes = hex::decode(&info_hash_str).map_err(|_| StatusCode::BAD_REQUEST)?;
+    if hash_bytes.len() != 20 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let mut hash = [0u8; 20];
+    hash.copy_from_slice(&hash_bytes);
+
+    if state.engine.set_file_priority(&hash, file_index, payload.priority) {
+        Ok(Json(ActionResponse {
+            success: true,
+            message: format!("Priority for file {} updated to {}", file_index, payload.priority),
         }))
     } else {
         Err(StatusCode::NOT_FOUND)
