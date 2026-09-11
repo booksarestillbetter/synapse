@@ -3,6 +3,19 @@
 All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [2.2.4] - 2026-09-10
+
+### Added
+
+- **Discovery telemetry for DHT/PEX/LSD/Trackers/Webseeds (`synapse-engine::announcer`, `::swarm`, `::torrent`, `synapse-rpc`)**: each swarm's candidate peer pool and in-flight dial count are now attributed by discovery origin (`PeerDiscoverySource::{Tracker,Dht,Pex,Lsd}`), and surfaced end-to-end — new `discovered_from_{tracker,dht,pex,lsd}` counters, `candidate_peers`/`active_dials` on the per-torrent detail response (REST, gRPC `TorrentDetailEvent`, and the built-in web UI), plus `dht_nodes`/`dht_enabled`/`pex_enabled`/`lsd_enabled` on session stats. The web UI's torrent inspector shows swarm privacy (BEP 27), which discovery subsystems are active, active webseed mirrors, and a live per-source discovery breakdown. `PeerSnapshot` also gained `supports_pex`, derived from each connected peer's own extension handshake.
+- **`AddTorrent` can now reference a local `.torrent` file path on the daemon filesystem** (`synapse-client`, `synapse-rpc::service`) via the existing `Source::FilePath` oneof, not just a magnet URI or uploaded bytes.
+
+### Fixed
+
+- **File priority was accepted by the API and silently discarded** (`synapse-engine::swarm`, `synapse-rpc::http_api`): `set_file_priority` sent a `TorrentCommand` to the torrent actor but never persisted the value anywhere durable for the detail endpoint to read back, so `GET .../detail` always reported every file as priority `4` (Normal) regardless of what was actually set. Priorities are now tracked per-torrent (`TorrentHandle::file_priorities`) and a new `POST /api/v1/torrents/{hash}/files/{index}/priority` REST endpoint (plus matching web UI dropdown) lets a file's priority actually be changed and correctly read back.
+- **Default download directory ignored the configured setting**: `add_torrent`/`upload_torrent` (REST) and `AddTorrent` (gRPC) all fell back to a hardcoded `"."` or `"/downloads"` when no `download_dir` was supplied, instead of the daemon's actual configured `settings.download_dir`. Same fix applied to whether a torrent starts paused: previously only an explicit `paused: true` in the request would pause it; now the daemon's `start_added_torrents` setting is honored as the default when the request doesn't specify.
+- **`disk.max_open_files` was configured but never passed to the disk engine** (`synapse-diskio`, `synapse-daemon`): `DiskEngine::auto()` always used a hardcoded default LRU file-descriptor cache size on both the `io_uring` and blocking backends. New `DiskEngine::auto_with_max_open_files` is now what the daemon actually calls, using the configured value.
+
 ## [2.2.3] - 2026-09-09
 
 ### Added
