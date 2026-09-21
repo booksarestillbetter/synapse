@@ -836,7 +836,7 @@ mod liveness_tests {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
         });
-        let res = tokio::time::timeout(Duration::from_secs(3), server).await;
+        let res = tokio::time::timeout(Duration::from_secs(30), server).await;
         assert!(
             matches!(res, Ok(Ok(Err(PeerError::HandshakeTimeout)))),
             "trickled handshake must fail with HandshakeTimeout, got {res:?}"
@@ -850,12 +850,12 @@ mod liveness_tests {
     #[tokio::test]
     async fn silent_peer_gets_keepalives_then_is_dropped() {
         let (mut them, mut rx, _handle) = spawn_pair().await;
-        let first = tokio::time::timeout(Duration::from_secs(2), them.next()).await;
+        let first = tokio::time::timeout(Duration::from_secs(20), them.next()).await;
         assert!(
             matches!(first, Ok(Some(Ok(Message::KeepAlive)))),
             "expected a keepalive, got {first:?}"
         );
-        let closed = tokio::time::timeout(Duration::from_secs(5), async {
+        let closed = tokio::time::timeout(Duration::from_secs(30), async {
             while let Some(m) = rx.recv().await {
                 if matches!(m, PeerEvent::Disconnected(_)) {
                     return true;

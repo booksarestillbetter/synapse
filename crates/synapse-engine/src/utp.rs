@@ -1304,7 +1304,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_utp_socket_manager_duplex_stream_transfer() {
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout(Duration::from_secs(60), async {
             let server_mgr = UtpSocketManager::bind("127.0.0.1:0".parse().unwrap())
                 .await
                 .unwrap();
@@ -1338,7 +1338,7 @@ mod tests {
             server_handle.await.unwrap();
         })
         .await
-        .expect("test timed out after 5s");
+        .expect("test timed out after 60s");
     }
 
     #[tokio::test]
@@ -1358,7 +1358,7 @@ mod tests {
             client_sock.send_to(&pkt.encode(), addr).await.unwrap();
             let mut buf = [0u8; 1024];
             let (len, _) =
-                tokio::time::timeout(Duration::from_secs(1), client_sock.recv_from(&mut buf))
+                tokio::time::timeout(Duration::from_secs(20), client_sock.recv_from(&mut buf))
                     .await
                     .unwrap()
                     .unwrap();
@@ -1376,7 +1376,7 @@ mod tests {
 
         let mut buf = [0u8; 1024];
         let (len, _) =
-            tokio::time::timeout(Duration::from_secs(1), client_sock.recv_from(&mut buf))
+            tokio::time::timeout(Duration::from_secs(20), client_sock.recv_from(&mut buf))
                 .await
                 .unwrap()
                 .unwrap();

@@ -79,7 +79,11 @@ async fn ipv4_and_ipv6_wildcard_listeners_coexist_on_one_port() {
             assert!(tokio::net::TcpStream::connect(("127.0.0.1", port))
                 .await
                 .is_ok());
-            assert!(tokio::net::TcpStream::connect(("::1", port)).await.is_ok());
+            // A container can have an IPv6 stack (so the `[::]` bind above works) yet no `::1`
+            // address; the coexistence that matters is already shown by both binds succeeding.
+            if std::net::UdpSocket::bind("[::1]:0").is_ok() {
+                assert!(tokio::net::TcpStream::connect(("::1", port)).await.is_ok());
+            }
         }
         // Hosts without an IPv6 stack cannot run the v6 half.
         Err(e)
