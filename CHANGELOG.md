@@ -3,6 +3,21 @@
 All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [2.2.16] - 2026-09-21
+
+Queue, picking, tracker and blocklist controls over gRPC, and three fixes found while adding them.
+
+### Added
+
+**Control API (gRPC)**
+- `MoveInQueue` (top, up, down, bottom), with a `queue_position` on every torrent in the list and its updates: position decides which queued torrent starts next when a download slot frees up. `SetSequentialDownload` per torrent (saved with the session), `ReannounceTorrents`, `ReplaceTrackers` (an empty list restores the torrent's own; saved with the session) and `ReloadIpFilter` (re-reads the configured CIDR list and blocklist file, returns the rule count). Each is listed by `GetCapabilities` (`queue_move_v1`, `sequential_download_v1`, `reannounce_v1`, `replace_trackers_v1`, `ip_filter_reload_v1`) so a manager can tell whether the daemon has it.
+
+### Fixed
+
+- **eMule-format blocklists** with zero-padded addresses (`001.002.003.000 - 001.002.003.255 , 000 , name`, how real `ipfilter.dat` files are written) failed to parse and every line was skipped.
+- **Duplicate announce chains.** A completed, resumed or peer-starved announce queued an extra job without retiring the regular one, so a torrent could end up announcing on two or more parallel schedules; a job that has been superseded by a later schedule is now dropped.
+- Queued torrents are started in queue order; before, the order followed the internal map.
+
 ## [2.2.5] - 2026-09-18
 
 Adds the remaining BitTorrent Enhancement Proposals and the missing pieces of a complete client (proxy support, torrent creation, signed torrents, RSS, search), and hardens the daemon against hostile peers, `.torrent` files and feeds. `docs/BEP_SUPPORT_MATRIX.md` records what each BEP does today and how it was verified.

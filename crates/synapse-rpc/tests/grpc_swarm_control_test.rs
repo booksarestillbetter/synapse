@@ -74,7 +74,15 @@ async fn test_grpc_add_and_remove_torrent_with_swarm_engine() {
             detail.trackers[0].url,
             "http://tracker.example.com/announce"
         );
-        assert!(detail.trackers[0].status == "Ready" || detail.trackers[0].status == "Updating");
+        // The first announce starts at once, and on a machine that cannot resolve the
+        // (fictional) tracker it fails within milliseconds, so any state is possible by the
+        // time the detail is read; what matters is that the tracker is listed with one.
+        let known = ["Ready", "Updating", "Announced", "Error", "Timeout"];
+        assert!(
+            known.contains(&detail.trackers[0].status.as_str()),
+            "unexpected tracker status {:?}",
+            detail.trackers[0].status
+        );
         assert_eq!(detail.active_peers.len(), 0);
     }
 

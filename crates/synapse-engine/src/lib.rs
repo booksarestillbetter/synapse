@@ -72,7 +72,7 @@ pub use settings::{
     SessionSettingsUpdate,
 };
 pub use swarm::{
-    EngineMetricsSnapshot, GlobalEngineMetrics, SwarmDiscoveryStats, SwarmEngine,
+    EngineMetricsSnapshot, GlobalEngineMetrics, QueueMove, SwarmDiscoveryStats, SwarmEngine,
     SwarmResumeOptions, SwarmState, SwarmStateFilter, SwarmStats, SwarmTier, TorrentHandle,
 };
 pub use synapse_wire::EncryptionMode;

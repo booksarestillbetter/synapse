@@ -35,6 +35,7 @@ async fn test_grpc_subscribe_torrents_and_delta_streaming() {
             added_at: 1700000000,
             piece_count: 100,
             piece_size: 10000,
+            queue_position: 0,
         };
         service.upsert_torrent(summary);
     }

@@ -97,12 +97,14 @@ impl SynapseService {
             return;
         };
         let live = engine.list_torrents();
+        let positions = engine.queue_positions();
         let mut seen = std::collections::HashSet::with_capacity(live.len());
 
         for stats in &live {
             let hash = hex::encode(stats.info_hash);
             seen.insert(hash.clone());
-            let new_summary = swarm_stats_to_summary(stats);
+            let mut new_summary = swarm_stats_to_summary(stats);
+            new_summary.queue_position = positions.get(&stats.info_hash).copied().unwrap_or(0);
 
             let existing = self.active_summaries.get(&hash).map(|r| r.value().clone());
             match existing {
@@ -192,7 +194,21 @@ fn swarm_stats_to_summary(s: &synapse_engine::SwarmStats) -> TorrentSummary {
         added_at: s.added_at,
         piece_count: s.piece_count,
         piece_size: s.piece_size,
+        queue_position: 0,
     }
+}
+
+/// Decodes a 40-character hex info hash.
+fn parse_hash(hex_hash: &str) -> Option<[u8; 20]> {
+    let bytes = hex::decode(hex_hash).ok()?;
+    <[u8; 20]>::try_from(bytes.as_slice()).ok()
+}
+
+fn command_result(ok: bool, error: impl Into<String>) -> Response<CommandResponse> {
+    Response::new(CommandResponse {
+        success: ok,
+        error: (!ok).then(|| error.into()),
+    })
 }
 
 fn circuit_state_to_proto(state: synapse_tracker::CircuitState) -> CircuitBreakerState {
@@ -262,6 +278,10 @@ fn diff_summary(old: &TorrentSummary, new: &TorrentSummary) -> Option<TorrentDel
     }
     if old.error_message != new.error_message {
         delta.error_message = new.error_message.clone();
+        changed = true;
+    }
+    if old.queue_position != new.queue_position {
+        delta.queue_position = Some(new.queue_position);
         changed = true;
     }
     if old.download_dir != new.download_dir {
@@ -801,6 +821,7 @@ impl SynapseControl for SynapseService {
                 .as_secs() as i64,
             piece_count,
             piece_size,
+            queue_position: 0,
         };
 
         self.upsert_torrent(summary);
@@ -1167,7 +1188,16 @@ impl SynapseControl for SynapseService {
     ) -> Result<Response<CapabilitiesResponse>, Status> {
         Ok(Response::new(CapabilitiesResponse {
             version: env!("CARGO_PKG_VERSION").to_string(),
-            features: vec!["tracker_circuit_breaker_v1".to_string()],
+            features: [
+                "tracker_circuit_breaker_v1",
+                "queue_move_v1",
+                "sequential_download_v1",
+                "reannounce_v1",
+                "replace_trackers_v1",
+                "ip_filter_reload_v1",
+            ]
+            .map(String::from)
+            .to_vec(),
         }))
     }
 
@@ -1207,6 +1237,128 @@ impl SynapseControl for SynapseService {
         Ok(Response::new(CommandResponse {
             success: true,
             error: None,
+        }))
+    }
+
+    async fn move_in_queue(
+        &self,
+        request: Request<MoveInQueueRequest>,
+    ) -> Result<Response<CommandResponse>, Status> {
+        self.verify_auth(&request)?;
+        let Some(ref engine) = self.swarm_engine else {
+            return Err(Status::unavailable("SwarmEngine not configured"));
+        };
+        let req = request.into_inner();
+        let direction = match move_in_queue_request::Direction::try_from(req.direction) {
+            Ok(move_in_queue_request::Direction::Top) => synapse_engine::QueueMove::Top,
+            Ok(move_in_queue_request::Direction::Up) => synapse_engine::QueueMove::Up,
+            Ok(move_in_queue_request::Direction::Down) => synapse_engine::QueueMove::Down,
+            Ok(move_in_queue_request::Direction::Bottom) => synapse_engine::QueueMove::Bottom,
+            Err(_) => return Err(Status::invalid_argument("unknown queue direction")),
+        };
+        let hashes: Vec<[u8; 20]> = req.hashes.iter().filter_map(|h| parse_hash(h)).collect();
+        if hashes.len() != req.hashes.len() {
+            return Err(Status::invalid_argument("malformed info hash"));
+        }
+        let found = engine.move_in_queue(&hashes, direction);
+        if found == 0 {
+            return Ok(command_result(false, "no such torrent"));
+        }
+        self.sync_from_engine();
+        Ok(command_result(true, ""))
+    }
+
+    async fn set_sequential_download(
+        &self,
+        request: Request<SequentialDownloadRequest>,
+    ) -> Result<Response<CommandResponse>, Status> {
+        self.verify_auth(&request)?;
+        let Some(ref engine) = self.swarm_engine else {
+            return Err(Status::unavailable("SwarmEngine not configured"));
+        };
+        let req = request.into_inner();
+        let mut missing = 0usize;
+        for h in &req.hashes {
+            let Some(hash) = parse_hash(h) else {
+                return Err(Status::invalid_argument("malformed info hash"));
+            };
+            if !engine.set_sequential_download(&hash, req.enabled) {
+                missing += 1;
+            }
+        }
+        if missing > 0 {
+            return Ok(command_result(
+                false,
+                format!("{missing} torrent(s) not found"),
+            ));
+        }
+        Ok(command_result(true, ""))
+    }
+
+    async fn reannounce_torrents(
+        &self,
+        request: Request<TorrentHashesRequest>,
+    ) -> Result<Response<CommandResponse>, Status> {
+        self.verify_auth(&request)?;
+        let Some(ref engine) = self.swarm_engine else {
+            return Err(Status::unavailable("SwarmEngine not configured"));
+        };
+        let req = request.into_inner();
+        let mut skipped = 0usize;
+        for h in &req.hashes {
+            let Some(hash) = parse_hash(h) else {
+                return Err(Status::invalid_argument("malformed info hash"));
+            };
+            if !engine.reannounce_torrent(&hash) {
+                skipped += 1;
+            }
+        }
+        if skipped > 0 {
+            return Ok(command_result(
+                false,
+                format!("{skipped} torrent(s) not found or not announcing (stopped or queued)"),
+            ));
+        }
+        Ok(command_result(true, ""))
+    }
+
+    async fn replace_trackers(
+        &self,
+        request: Request<ReplaceTrackersRequest>,
+    ) -> Result<Response<CommandResponse>, Status> {
+        self.verify_auth(&request)?;
+        let Some(ref engine) = self.swarm_engine else {
+            return Err(Status::unavailable("SwarmEngine not configured"));
+        };
+        let req = request.into_inner();
+        let Some(hash) = parse_hash(&req.hash) else {
+            return Err(Status::invalid_argument("malformed info hash"));
+        };
+        match engine.replace_trackers(&hash, &req.trackers) {
+            None => Ok(command_result(false, "no such torrent")),
+            Some(0) if !req.trackers.is_empty() => Ok(command_result(
+                false,
+                "none of the given tracker URLs were valid",
+            )),
+            Some(_) => Ok(command_result(true, "")),
+        }
+    }
+
+    async fn reload_ip_filter(
+        &self,
+        request: Request<Empty>,
+    ) -> Result<Response<ReloadIpFilterResponse>, Status> {
+        self.verify_auth(&request)?;
+        let Some(ref engine) = self.swarm_engine else {
+            return Err(Status::unavailable("SwarmEngine not configured"));
+        };
+        // Reading and parsing a large blocklist is blocking file I/O.
+        let engine = engine.clone();
+        let rules = tokio::task::spawn_blocking(move || engine.reload_ip_filter())
+            .await
+            .map_err(|e| Status::internal(format!("reload failed: {e}")))?;
+        Ok(Response::new(ReloadIpFilterResponse {
+            rules: rules as u32,
         }))
     }
 }

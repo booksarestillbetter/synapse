@@ -429,6 +429,19 @@ pub struct SwarmStats {
     pub piece_size: u32,
 }
 
+/// Parses user-supplied tracker URLs, dropping blanks and anything that isn't a valid URL.
+fn parse_tracker_urls(list: &[String]) -> Vec<url::Url> {
+    let mut out: Vec<url::Url> = Vec::new();
+    for raw in list {
+        if let Ok(u) = url::Url::parse(raw.trim()) {
+            if !out.contains(&u) {
+                out.push(u);
+            }
+        }
+    }
+    out
+}
+
 /// Options for restoring historical swarm metrics and lifecycle state upon restart.
 #[derive(Debug, Clone, Default)]
 pub struct SwarmResumeOptions {
@@ -439,6 +452,58 @@ pub struct SwarmResumeOptions {
     pub is_paused: bool,
     /// Per-file priorities saved with the session; empty (or the wrong length) means defaults.
     pub file_priorities: Vec<u8>,
+    /// Sequential piece picking, saved with the session.
+    pub sequential: bool,
+    /// API-set tracker replacement, saved with the session.
+    pub tracker_override: Option<Vec<String>>,
+}
+
+/// Which way to move torrents in the download queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueMove {
+    Top,
+    Up,
+    Down,
+    Bottom,
+}
+
+/// Reorders `order` so the `selected` entries move as a group, keeping their relative order
+/// (Transmission's `queue-move-*` semantics). Returns whether anything changed.
+pub fn apply_queue_move(
+    order: &mut Vec<[u8; 20]>,
+    selected: &std::collections::HashSet<[u8; 20]>,
+    direction: QueueMove,
+) -> bool {
+    let before = order.clone();
+    match direction {
+        QueueMove::Top | QueueMove::Bottom => {
+            let (mut picked, rest): (Vec<_>, Vec<_>) =
+                order.iter().copied().partition(|h| selected.contains(h));
+            let mut rest = rest;
+            *order = if direction == QueueMove::Top {
+                picked.append(&mut rest);
+                picked
+            } else {
+                rest.append(&mut picked);
+                rest
+            };
+        }
+        QueueMove::Up => {
+            for i in 1..order.len() {
+                if selected.contains(&order[i]) && !selected.contains(&order[i - 1]) {
+                    order.swap(i, i - 1);
+                }
+            }
+        }
+        QueueMove::Down => {
+            for i in (0..order.len().saturating_sub(1)).rev() {
+                if selected.contains(&order[i]) && !selected.contains(&order[i + 1]) {
+                    order.swap(i, i + 1);
+                }
+            }
+        }
+    }
+    *order != before
 }
 
 /// Comprehensive telemetry for swarm discovery mechanisms (DHT, PEX, LSD, Trackers, Webseeds).
@@ -477,6 +542,11 @@ pub struct TorrentHandle {
     pub live_peers: Arc<RwLock<Vec<PeerSnapshot>>>,
     pub piece_availability: Arc<RwLock<Vec<u32>>>,
     pub file_priorities: Arc<RwLock<Vec<u8>>>,
+    /// Pick pieces in order rather than rarest-first. Lives here (not on the actor) so it
+    /// survives the actor being evicted and woken again.
+    pub sequential: Arc<std::sync::atomic::AtomicBool>,
+    /// API-set replacement tracker list, kept as strings so it can be saved with the session.
+    pub tracker_override: Arc<RwLock<Option<Vec<String>>>>,
 }
 
 impl TorrentHandle {
@@ -542,6 +612,11 @@ pub struct SwarmEngine {
     upload_bucket: Arc<TokenBucket>,
     circuit_breaker: Arc<PeerCircuitBreaker>,
     queue_manager: Arc<RwLock<QueueManager>>,
+    /// Download-queue order, front first. Reconciled lazily against `torrents` (see
+    /// `sync_queue_order`) so add/remove paths don't have to maintain it.
+    queue_order: Arc<Mutex<Vec<[u8; 20]>>>,
+    /// Where the IP filter was loaded from, so it can be re-read on demand.
+    ip_filter_source: Arc<Mutex<(Vec<String>, Option<PathBuf>)>>,
     settings: Arc<RwLock<DynamicSessionSettings>>,
     metrics: Arc<GlobalEngineMetrics>,
     announce_scheduler: Arc<AnnounceScheduler>,
@@ -637,6 +712,8 @@ impl SwarmEngine {
             upload_bucket: Arc::new(TokenBucket::unthrottled()),
             circuit_breaker,
             queue_manager: Arc::new(RwLock::new(QueueManager::new(QueueConfig::default()))),
+            queue_order: Arc::new(Mutex::new(Vec::new())),
+            ip_filter_source: Arc::new(Mutex::new((Vec::new(), None))),
             settings,
             metrics: Arc::new(GlobalEngineMetrics::default()),
             announce_scheduler: announce_scheduler.clone(),
@@ -775,6 +852,7 @@ impl SwarmEngine {
         cidr_ranges: &[String],
         file_path: Option<&std::path::Path>,
     ) {
+        *self.ip_filter_source.lock() = (cidr_ranges.to_vec(), file_path.map(PathBuf::from));
         let mut filter = IpFilter::new();
         for cidr in cidr_ranges {
             if let Err(e) = filter.add_cidr_str(cidr) {
@@ -793,6 +871,15 @@ impl SwarmEngine {
             filter.total_rules()
         );
         *self.ip_filter.write() = filter;
+    }
+
+    /// Re-reads the IP filter from the sources it was last loaded from (the configured CIDR
+    /// list and blocklist file), picking up edits made to the file since. Returns the number
+    /// of rules now active.
+    pub fn reload_ip_filter(&self) -> usize {
+        let (cidrs, path) = self.ip_filter_source.lock().clone();
+        self.load_ip_filter_config(&cidrs, path.as_deref());
+        self.ip_filter.read().total_rules()
     }
 
     /// Attempts to recover the full `Info` struct for a swarm:
@@ -1141,7 +1228,10 @@ impl SwarmEngine {
             return reports;
         }
         if let Some(handle) = self.torrents.get(info_hash) {
-            let candidate_urls = Announcer::candidate_trackers(&handle.info);
+            let candidate_urls = self
+                .announce_scheduler
+                .announcer()
+                .trackers_for(&handle.info);
             candidate_urls
                 .into_iter()
                 .map(|u| TrackerReport {
@@ -1311,7 +1401,11 @@ impl SwarmEngine {
             download_dir: download_dir.clone(),
             peer_id: self.peer_id,
             disk: self.disk.clone(),
-            mode: synapse_picker::Mode::RarestFirst,
+            mode: if handle.sequential.load(Ordering::Relaxed) {
+                synapse_picker::Mode::Sequential
+            } else {
+                synapse_picker::Mode::RarestFirst
+            },
             max_pipeline: 64,
             regular_unchokes: 8,
             optimistic_unchoke_interval: Duration::from_secs(30),
@@ -1397,6 +1491,8 @@ impl SwarmEngine {
         let added_at = handle.stats.read().added_at;
 
         let priorities_worker = handle.file_priorities.clone();
+        let sequential_worker = handle.sequential.clone();
+        let tracker_override_worker = handle.tracker_override.clone();
         let last_saved_secs = Arc::new(AtomicU64::new(0));
         const SAVE_THROTTLE: Duration = Duration::from_secs(5);
 
@@ -1455,6 +1551,8 @@ impl SwarmEngine {
                         let dl_dir_c = dl_dir_str.clone();
                         let raw_hex_c = raw_bencode_hex_worker.clone();
                         let prios_c = priorities_worker.read().clone();
+                        let sequential_c = sequential_worker.load(Ordering::Relaxed);
+                        let tracker_override_c = tracker_override_worker.read().clone();
                         let (uploaded_bytes, current_ratio) = {
                             let s = stats_worker.read();
                             (s.uploaded_bytes, s.ratio)
@@ -1478,6 +1576,8 @@ impl SwarmEngine {
                                 magnet_uri: None,
                                 raw_bencode_hex: raw_hex_c,
                                 file_priorities: prios_c,
+                                sequential: sequential_c,
+                                tracker_override: tracker_override_c,
                             };
                             let _ = store.save_torrent(&state);
                         });
@@ -1567,6 +1667,9 @@ impl SwarmEngine {
             }
         }
 
+        // Start queued torrents in queue order, not in whatever order the map yields them.
+        let positions = self.queue_positions();
+        queued_hashes.sort_by_key(|h| positions.get(h).copied().unwrap_or(u32::MAX));
         for hash in queued_hashes {
             if qm.evaluate_downloader(active_non_stalled, self.torrents.len()) == QueueAction::Allow
             {
@@ -1832,6 +1935,8 @@ impl SwarmEngine {
                     magnet_uri: None,
                     raw_bencode_hex: Some(hex::encode(info.to_torrent_bytes())),
                     file_priorities: Vec::new(),
+                    sequential: false,
+                    tracker_override: None,
                 };
                 let _ = store.save_torrent(&state);
             }
@@ -1868,13 +1973,30 @@ impl SwarmEngine {
             live_peers: Arc::new(RwLock::new(Vec::new())),
             piece_availability,
             file_priorities,
+            sequential: Arc::new(std::sync::atomic::AtomicBool::new(
+                resume.as_ref().is_some_and(|r| r.sequential),
+            )),
+            tracker_override: Arc::new(RwLock::new(
+                resume.as_ref().and_then(|r| r.tracker_override.clone()),
+            )),
         });
+        // Always set (or clear): a re-added torrent must not inherit an override left over
+        // from an earlier life under the same info hash.
+        self.announce_scheduler.announcer().set_tracker_override(
+            info.hash,
+            handle
+                .tracker_override
+                .read()
+                .as_ref()
+                .map(|list| parse_tracker_urls(list)),
+        );
 
         if initial_state == SwarmState::Seeding {
             info.evict_piece_hashes();
         }
 
         self.torrents.insert(info_hash, handle.clone());
+        self.queue_order.lock().push(info_hash);
         self.mse_req2_index
             .insert(synapse_wire::mse_req2(&info_hash), info_hash);
         if let Some(v2) = info.info_hash_v2 {
@@ -1943,6 +2065,8 @@ impl SwarmEngine {
                             None
                         },
                         file_priorities: h.file_priorities.read().clone(),
+                        sequential: h.sequential.load(Ordering::Relaxed),
+                        tracker_override: h.tracker_override.read().clone(),
                     }
                 })
                 .collect();
@@ -1986,6 +2110,120 @@ impl SwarmEngine {
     /// `Torrent::apply_file_priority` via `TorrentCommand::SetFilePriority`, which actually
     /// masks the file's pieces in the picker. Previously this only checked the torrent existed
     /// and never touched what got downloaded.
+    /// Switches a torrent between rarest-first and sequential (in-order) piece picking.
+    /// Returns false if the torrent doesn't exist.
+    pub fn set_sequential_download(&self, info_hash: &[u8; 20], enabled: bool) -> bool {
+        let Some(handle) = self.torrents.get(info_hash) else {
+            return false;
+        };
+        handle.sequential.store(enabled, Ordering::Relaxed);
+        self.persist_torrent_option(info_hash, move |state| state.sequential = enabled);
+        // A running actor changes mode now; a dormant one picks it up when it next starts.
+        if let Some(tx) = handle.command_tx() {
+            let _ = tx.try_send(TorrentCommand::SetSequential(enabled));
+        }
+        true
+    }
+
+    pub fn is_sequential(&self, info_hash: &[u8; 20]) -> bool {
+        self.torrents
+            .get(info_hash)
+            .is_some_and(|h| h.sequential.load(Ordering::Relaxed))
+    }
+
+    /// Replaces the trackers a torrent announces to with `trackers` and announces to them
+    /// straight away. An empty list restores the torrent's own trackers. Invalid URLs are
+    /// dropped; returns how many usable trackers were set, or `None` if the torrent
+    /// doesn't exist.
+    pub fn replace_trackers(&self, info_hash: &[u8; 20], trackers: &[String]) -> Option<usize> {
+        let handle = self.torrents.get(info_hash)?;
+        let urls = parse_tracker_urls(trackers);
+        let announcer = self.announce_scheduler.announcer();
+        let (stored, count) = if trackers.is_empty() {
+            announcer.set_tracker_override(handle.info.hash, None);
+            (None, 0)
+        } else {
+            let strings: Vec<String> = urls.iter().map(|u| u.to_string()).collect();
+            let count = urls.len();
+            announcer.set_tracker_override(handle.info.hash, Some(urls));
+            (Some(strings), count)
+        };
+        *handle.tracker_override.write() = stored.clone();
+        self.persist_torrent_option(info_hash, move |state| state.tracker_override = stored);
+        self.announce_scheduler
+            .drop_stale_tracker_reports(info_hash, &announcer.trackers_for(&handle.info));
+        self.announce_scheduler.reannounce(info_hash);
+        Some(count)
+    }
+
+    /// Announces to a torrent's trackers now rather than at the next scheduled time. Returns
+    /// false if the torrent doesn't exist or isn't announcing (stopped or still queued).
+    pub fn reannounce_torrent(&self, info_hash: &[u8; 20]) -> bool {
+        self.torrents.contains_key(info_hash) && self.announce_scheduler.reannounce(info_hash)
+    }
+
+    /// Reconciles the queue order with the torrents that exist: drops the gone, and appends
+    /// newcomers oldest-first so an unordered set of adds still yields a stable queue.
+    fn sync_queue_order(&self, order: &mut Vec<[u8; 20]>) {
+        let mut known: std::collections::HashSet<[u8; 20]> = std::collections::HashSet::new();
+        order.retain(|h| self.torrents.contains_key(h) && known.insert(*h));
+        let mut fresh: Vec<([u8; 20], i64)> = self
+            .torrents
+            .iter()
+            .filter(|e| !known.contains(e.key()))
+            .map(|e| (*e.key(), e.value().stats.read().added_at))
+            .collect();
+        fresh.sort_by_key(|(h, added)| (*added, *h));
+        order.extend(fresh.into_iter().map(|(h, _)| h));
+    }
+
+    /// Every torrent's position in the download queue (0 is next in line).
+    pub fn queue_positions(&self) -> std::collections::HashMap<[u8; 20], u32> {
+        let mut order = self.queue_order.lock();
+        self.sync_queue_order(&mut order);
+        order
+            .iter()
+            .enumerate()
+            .map(|(i, h)| (*h, i as u32))
+            .collect()
+    }
+
+    /// Moves torrents within the download queue. Position decides which queued torrent starts
+    /// next when a download slot frees up; it doesn't stop one that is already running.
+    /// Returns how many of `hashes` exist.
+    pub fn move_in_queue(&self, hashes: &[[u8; 20]], direction: QueueMove) -> usize {
+        let selected: std::collections::HashSet<[u8; 20]> = hashes
+            .iter()
+            .copied()
+            .filter(|h| self.torrents.contains_key(h))
+            .collect();
+        let mut order = self.queue_order.lock();
+        self.sync_queue_order(&mut order);
+        if apply_queue_move(&mut order, &selected, direction) {
+            drop(order);
+            self.reconcile_queue();
+        }
+        selected.len()
+    }
+
+    /// Saves one field of a torrent's session record without waiting for the next full flush.
+    fn persist_torrent_option(
+        &self,
+        info_hash: &[u8; 20],
+        apply: impl FnOnce(&mut TorrentSessionState) + Send + 'static,
+    ) {
+        let Some(store) = self.session_store.clone() else {
+            return;
+        };
+        let hex = hex::encode(info_hash);
+        tokio::task::spawn_blocking(move || {
+            if let Ok(Some(mut state)) = store.load_torrent(&hex) {
+                apply(&mut state);
+                let _ = store.save_torrent(&state);
+            }
+        });
+    }
+
     pub fn set_file_priority(&self, info_hash: &[u8; 20], file_index: u32, priority: u8) -> bool {
         if let Some(handle) = self.torrents.get(info_hash) {
             {
@@ -2604,6 +2842,8 @@ impl SwarmEngine {
                         added_at: Some(state.added_at),
                         is_paused: state.is_paused,
                         file_priorities: state.file_priorities.clone(),
+                        sequential: state.sequential,
+                        tracker_override: state.tracker_override.clone(),
                     };
                     self.add_torrent_with_resume(
                         Arc::new(info),
@@ -2614,6 +2854,12 @@ impl SwarmEngine {
                     restored += 1;
                 }
             }
+        }
+        // The store yields torrents in arbitrary order; start the queue oldest-first.
+        if restored > 0 {
+            let mut order = self.queue_order.lock();
+            order.clear();
+            self.sync_queue_order(&mut order);
         }
         Ok(restored)
     }
@@ -3471,5 +3717,75 @@ mod resume_verification_tests {
         bf.set(1);
         assert_eq!(verify_resume_bitfield(&info, dir.path(), &mut bf), 1);
         assert_eq!(bf.count_ones(), 0);
+    }
+}
+
+#[cfg(test)]
+mod queue_order_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    fn h(n: u8) -> [u8; 20] {
+        [n; 20]
+    }
+
+    fn order(list: &[u8]) -> Vec<[u8; 20]> {
+        list.iter().map(|n| h(*n)).collect()
+    }
+
+    fn sel(list: &[u8]) -> HashSet<[u8; 20]> {
+        list.iter().map(|n| h(*n)).collect()
+    }
+
+    #[test]
+    fn top_and_bottom_move_the_selection_as_a_group_in_its_own_order() {
+        let mut o = order(&[1, 2, 3, 4, 5]);
+        assert!(apply_queue_move(&mut o, &sel(&[4, 2]), QueueMove::Top));
+        assert_eq!(o, order(&[2, 4, 1, 3, 5]));
+        assert!(apply_queue_move(&mut o, &sel(&[2, 4]), QueueMove::Bottom));
+        assert_eq!(o, order(&[1, 3, 5, 2, 4]));
+    }
+
+    #[test]
+    fn up_and_down_step_one_place_and_stop_at_the_ends() {
+        let mut o = order(&[1, 2, 3, 4]);
+        assert!(apply_queue_move(&mut o, &sel(&[3]), QueueMove::Up));
+        assert_eq!(o, order(&[1, 3, 2, 4]));
+        assert!(apply_queue_move(&mut o, &sel(&[3]), QueueMove::Up));
+        assert_eq!(o, order(&[3, 1, 2, 4]));
+        assert!(
+            !apply_queue_move(&mut o, &sel(&[3]), QueueMove::Up),
+            "already first"
+        );
+
+        assert!(
+            !apply_queue_move(&mut o, &sel(&[4]), QueueMove::Down),
+            "already last"
+        );
+        assert!(apply_queue_move(&mut o, &sel(&[1]), QueueMove::Down));
+        assert_eq!(o, order(&[3, 2, 1, 4]));
+    }
+
+    #[test]
+    fn a_selected_block_moves_together_and_does_not_leapfrog_itself() {
+        let mut o = order(&[1, 2, 3, 4, 5]);
+        assert!(apply_queue_move(&mut o, &sel(&[3, 4]), QueueMove::Up));
+        assert_eq!(o, order(&[1, 3, 4, 2, 5]));
+        assert!(apply_queue_move(&mut o, &sel(&[3, 4]), QueueMove::Down));
+        assert_eq!(o, order(&[1, 2, 3, 4, 5]));
+    }
+
+    #[test]
+    fn selecting_nothing_changes_nothing() {
+        let mut o = order(&[1, 2, 3]);
+        for d in [
+            QueueMove::Top,
+            QueueMove::Up,
+            QueueMove::Down,
+            QueueMove::Bottom,
+        ] {
+            assert!(!apply_queue_move(&mut o, &sel(&[]), d));
+        }
+        assert_eq!(o, order(&[1, 2, 3]));
     }
 }

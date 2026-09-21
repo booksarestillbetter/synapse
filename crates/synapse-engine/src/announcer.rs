@@ -77,9 +77,34 @@ pub struct Announcer {
     tracker_ids: Arc<parking_lot::Mutex<TrackerIds>>,
     /// The external address each tracker reported (BEP 24), by tracker URL.
     external_ip_votes: Arc<parking_lot::Mutex<HashMap<String, std::net::IpAddr>>>,
+    /// Per-torrent tracker lists set through the API. A torrent's own `announce`/`announce-list`
+    /// lives in an immutable `Info`, so a replacement is held here and consulted instead.
+    tracker_overrides: Arc<RwLock<HashMap<[u8; 20], Vec<url::Url>>>>,
 }
 
 impl Announcer {
+    /// Replaces the tracker list used for a torrent (`None` restores the torrent's own).
+    pub fn set_tracker_override(&self, info_hash: [u8; 20], trackers: Option<Vec<url::Url>>) {
+        let mut map = self.tracker_overrides.write();
+        match trackers {
+            Some(list) => {
+                map.insert(info_hash, list);
+            }
+            None => {
+                map.remove(&info_hash);
+            }
+        }
+    }
+
+    /// The trackers a torrent announces to: its API-set replacement if there is one,
+    /// otherwise the ones in its metainfo (plus the public fallbacks, for public torrents).
+    pub fn trackers_for(&self, info: &Info) -> Vec<url::Url> {
+        match self.tracker_overrides.read().get(&info.hash) {
+            Some(list) => Self::with_fallbacks(list.clone(), info.private),
+            None => Self::candidate_trackers(info),
+        }
+    }
+
     /// Our external address if at least two different trackers agree on it (BEP 24).
     pub fn external_ip(&self) -> Option<std::net::IpAddr> {
         let votes = self.external_ip_votes.lock();
@@ -125,6 +150,7 @@ impl Announcer {
             alert_sender: Arc::new(RwLock::new(None)),
             tracker_ids: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             external_ip_votes: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            tracker_overrides: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -207,9 +233,14 @@ impl Announcer {
 
         // A torrent controls its own tracker list, so bound how many announces it can
         // fan out per cycle.
+        Self::with_fallbacks(candidate_urls, info.private)
+    }
+
+    /// Bounds the list and, for public torrents, appends the fallback trackers.
+    fn with_fallbacks(mut candidate_urls: Vec<url::Url>, private: bool) -> Vec<url::Url> {
         candidate_urls.truncate(MAX_TRACKERS_PER_TORRENT);
 
-        if !info.private && FALLBACK_TRACKERS_ENABLED.load(Ordering::Relaxed) {
+        if !private && FALLBACK_TRACKERS_ENABLED.load(Ordering::Relaxed) {
             let fallback_trackers = [
                 "udp://tracker.opentrackr.org:1337/announce",
                 "udp://open.stealth.si:80/announce",
@@ -237,7 +268,7 @@ impl Announcer {
         uploaded: u64,
         event: Event,
     ) -> (Vec<SocketAddr>, u32, Vec<TrackerReport>) {
-        let candidate_urls = Self::candidate_trackers(info);
+        let candidate_urls = self.trackers_for(info);
         let announce_ip = self.settings.as_ref().and_then(|s| s.read().announce_ip);
         let bound_port = *self.listen_port.read();
         let port = self
@@ -940,7 +971,7 @@ impl AnnounceScheduler {
             Instant::now() + Duration::from_secs(jitter_secs)
         };
 
-        let candidate_urls = Announcer::candidate_trackers(&info);
+        let candidate_urls = self.announcer.trackers_for(&info);
         let now = Instant::now();
         let initial_remaining = if next_announce_at > now {
             (next_announce_at - now).as_secs() as i64
@@ -1094,26 +1125,54 @@ impl AnnounceScheduler {
 
     /// Wakes the scheduler to send an immediate `Event::Completed` announce for a finished download.
     pub fn notify_completed(&self, info_hash: &[u8; 20]) {
-        let mut q = self.queue.lock();
-        q.push(ScheduledJob {
+        self.schedule_now(info_hash, false, Event::Completed);
+    }
+
+    /// Announces to the torrent's trackers right away, outside the normal schedule.
+    /// Returns false if the torrent isn't registered with the scheduler (stopped, or not
+    /// started yet), in which case there is nothing to announce.
+    pub fn reannounce(&self, info_hash: &[u8; 20]) -> bool {
+        let is_downloading = match self.swarms.read().get(info_hash) {
+            Some(m) => m.stats.read().state == crate::swarm::SwarmState::Downloading,
+            None => return false,
+        };
+        self.schedule_now(info_hash, is_downloading, Event::None)
+    }
+
+    /// Queues an immediate announce and marks it as the swarm's current schedule, so the
+    /// regular job that was already queued for later is recognised as superseded (see
+    /// `dispatch_batch`) instead of running a second announce chain.
+    fn schedule_now(&self, info_hash: &[u8; 20], is_downloading: bool, event: Event) -> bool {
+        let now = Instant::now();
+        {
+            let mut swarms = self.swarms.write();
+            match swarms.get_mut(info_hash) {
+                Some(m) => m.next_announce_at = now,
+                None => return false,
+            }
+        }
+        self.queue.lock().push(ScheduledJob {
             info_hash: *info_hash,
-            next_announce_at: Instant::now(),
-            is_downloading: false,
-            event: Event::Completed,
+            next_announce_at: now,
+            is_downloading,
+            event,
         });
         self.wake_notify.notify_one();
+        true
     }
 
     /// Wakes the scheduler to immediately announce a resumed torrent.
     pub fn notify_resumed(&self, info_hash: &[u8; 20]) {
-        let mut q = self.queue.lock();
-        q.push(ScheduledJob {
-            info_hash: *info_hash,
-            next_announce_at: Instant::now(),
-            is_downloading: true,
-            event: Event::Started,
-        });
-        self.wake_notify.notify_one();
+        self.schedule_now(info_hash, true, Event::Started);
+    }
+
+    /// Forgets the status reports of trackers a torrent no longer uses, so a replaced tracker
+    /// doesn't linger in the tracker list.
+    pub fn drop_stale_tracker_reports(&self, info_hash: &[u8; 20], keep: &[url::Url]) {
+        if let Some(m) = self.swarms.write().get_mut(info_hash) {
+            m.tracker_reports
+                .retain(|r| keep.iter().any(|u| u.as_str() == r.url));
+        }
     }
 
     pub fn active_swarms_count(&self) -> usize {
@@ -1401,14 +1460,26 @@ impl AnnounceScheduler {
         for job in due_jobs {
             let meta_opt = {
                 let swarms = self.swarms.read();
-                swarms
-                    .get(&job.info_hash)
-                    .map(|m| (m.info.clone(), m.stats.clone(), m.consecutive_failures))
+                swarms.get(&job.info_hash).map(|m| {
+                    (
+                        m.info.clone(),
+                        m.stats.clone(),
+                        m.consecutive_failures,
+                        m.next_announce_at,
+                    )
+                })
             };
 
-            let Some((info, stats, failures)) = meta_opt else {
+            let Some((info, stats, failures, scheduled_for)) = meta_opt else {
                 continue; // Unregistered torrent
             };
+
+            // A job whose time is well before the swarm's current schedule was superseded
+            // (an announce already ran after it was queued); running it would start a second,
+            // parallel announce chain for the same torrent.
+            if scheduled_for > job.next_announce_at + Duration::from_secs(1) {
+                continue;
+            }
 
             let (state, dl, left, ul) = {
                 let s = stats.read();

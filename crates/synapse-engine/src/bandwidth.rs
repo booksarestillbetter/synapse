@@ -181,7 +181,9 @@ mod tests {
 
     #[test]
     fn a_full_narrow_bucket_is_not_drained_when_a_wider_one_refuses() {
-        let global = Arc::new(TokenBucket::new(1_000, 1_000));
+        // Refills at 1 B/s, so a slow machine cannot stall long enough for the emptied global
+        // bucket to recover 500 bytes mid-test.
+        let global = Arc::new(TokenBucket::new(1, 1_000));
         let torrent = Arc::new(TokenBucket::new(1_000_000, 1_000_000));
         let peer = Arc::new(TokenBucket::new(1_000_000, 1_000_000));
         // Empty the global bucket.

@@ -327,6 +327,8 @@ pub fn migrate_transmission(
                 magnet_uri: None,
                 raw_bencode_hex: Some(hex::encode(&entry.raw_bencode)),
                 file_priorities: Vec::new(),
+                sequential: false,
+                tracker_override: None,
             };
 
             if let Some(ref s) = store {

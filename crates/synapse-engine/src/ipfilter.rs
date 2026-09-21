@@ -7,6 +7,17 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::Path;
 use std::str::FromStr;
 
+/// Parses a dotted-quad address, accepting zero-padded octets (`001.002.003.004`), which
+/// `Ipv4Addr::from_str` rejects but eMule-format blocklists use throughout.
+fn parse_v4(s: &str) -> Option<Ipv4Addr> {
+    let mut octets = [0u8; 4];
+    let mut parts = s.split('.');
+    for slot in &mut octets {
+        *slot = parts.next()?.trim().parse().ok()?;
+    }
+    parts.next().is_none().then(|| Ipv4Addr::from(octets))
+}
+
 #[derive(Debug, Clone)]
 pub struct Ipv4Range {
     pub start: u32,
@@ -126,7 +137,8 @@ impl IpFilter {
 
     /// Loads additional blocklist rules from an `ipfilter.dat`-style file. Two line
     /// formats are auto-detected per line:
-    ///   - eMule/PeerGuardian range format: `1.2.3.4 - 1.2.3.10 , description`
+    ///   - eMule/PeerGuardian range format: `1.2.3.4 - 1.2.3.10 , description` (octets may be
+    ///     zero-padded, as real eMule files write them: `001.002.003.004`)
     ///   - Plain CIDR notation: `1.2.3.0/24` or `fc00::/7`
     ///
     /// Blank lines and lines starting with `#` or `;` are ignored. A malformed line is
@@ -145,9 +157,7 @@ impl IpFilter {
             if let Some((range_part, desc)) = line.split_once(',') {
                 if let Some((start_str, end_str)) = range_part.split_once('-') {
                     let (start_str, end_str) = (start_str.trim(), end_str.trim());
-                    if let (Ok(start), Ok(end)) =
-                        (Ipv4Addr::from_str(start_str), Ipv4Addr::from_str(end_str))
-                    {
+                    if let (Some(start), Some(end)) = (parse_v4(start_str), parse_v4(end_str)) {
                         self.add_v4_range(start, end, desc.trim());
                         loaded += 1;
                         continue;
@@ -274,6 +284,26 @@ mod tests {
         assert!(filter.is_blocked(IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3))));
         assert!(filter.is_blocked("fc00::1".parse().unwrap()));
         assert!(!filter.is_blocked(IpAddr::V4(Ipv4Addr::new(11, 0, 0, 1))));
+    }
+
+    #[test]
+    fn emule_files_with_zero_padded_octets_load() {
+        let dir = std::env::temp_dir().join(format!("ipf-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ipfilter.dat");
+        std::fs::write(
+            &path,
+            "001.002.003.000 - 001.002.003.255 , 000 , Example Range\n\
+             010.000.000.001-010.000.000.009 , 100 , Compact\n\
+             1.2.3.256 - 1.2.3.300 , 000 , not an address\n",
+        )
+        .unwrap();
+        let mut filter = IpFilter::new();
+        assert_eq!(filter.load_file(&path).unwrap(), 2);
+        assert!(filter.is_blocked("1.2.3.77".parse().unwrap()));
+        assert!(filter.is_blocked("10.0.0.5".parse().unwrap()));
+        assert!(!filter.is_blocked("10.0.0.10".parse().unwrap()));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -231,6 +231,8 @@ pub enum TorrentCommand {
     Recheck,
     /// Moves every downloaded file from the current download directory to a new one.
     SetLocation(PathBuf),
+    /// Switches the piece picker between rarest-first and sequential.
+    SetSequential(bool),
     /// Stops the torrent actor: closes all peer handles to terminate connection tasks and exits the actor loop.
     Stop,
     /// Dynamically update regular unchoke slots allocated by the session choker.
@@ -723,6 +725,13 @@ impl Torrent {
                             if priority > 0 {
                                 self.migrate_part_file_slices(file_idx as usize).await;
                             }
+                        }
+                        Some(TorrentCommand::SetSequential(on)) => {
+                            self.picker.set_mode(if on {
+                                synapse_picker::Mode::Sequential
+                            } else {
+                                synapse_picker::Mode::RarestFirst
+                            });
                         }
                         Some(TorrentCommand::Recheck) => self.handle_recheck().await,
                         Some(TorrentCommand::SetLocation(new_dir)) => self.handle_set_location(new_dir).await,

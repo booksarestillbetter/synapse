@@ -34,6 +34,12 @@ pub struct TorrentSessionState {
     /// written before priorities were persisted deserialize to.
     #[serde(default)]
     pub file_priorities: Vec<u8>,
+    /// Sequential (in-order) piece picking, set per torrent.
+    #[serde(default)]
+    pub sequential: bool,
+    /// Replacement tracker list set through the API. `None` means "use the torrent's own".
+    #[serde(default)]
+    pub tracker_override: Option<Vec<String>>,
 }
 
 impl TorrentSessionState {

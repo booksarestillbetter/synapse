@@ -27,6 +27,13 @@ service SynapseControl {
   rpc GetCapabilities(Empty) returns (CapabilitiesResponse);
   rpc ListCircuitBreakers(Empty) returns (CircuitBreakerListResponse);
   rpc ForceCircuitBreakerAction(CircuitBreakerActionRequest) returns (CommandResponse);
+
+  // Queue, picking, trackers, blocklist
+  rpc MoveInQueue(MoveInQueueRequest) returns (CommandResponse);
+  rpc SetSequentialDownload(SequentialDownloadRequest) returns (CommandResponse);
+  rpc ReannounceTorrents(TorrentHashesRequest) returns (CommandResponse);
+  rpc ReplaceTrackers(ReplaceTrackersRequest) returns (CommandResponse);
+  rpc ReloadIpFilter(Empty) returns (ReloadIpFilterResponse);
 }
 
 message Empty {}
@@ -63,6 +70,37 @@ message CircuitBreakerActionRequest {
     RESET = 1;
   }
   Action action = 2;
+}
+
+message TorrentHashesRequest {
+  repeated string hashes = 1;
+}
+
+message MoveInQueueRequest {
+  enum Direction {
+    TOP = 0;
+    UP = 1;
+    DOWN = 2;
+    BOTTOM = 3;
+  }
+  repeated string hashes = 1;
+  Direction direction = 2;
+}
+
+message SequentialDownloadRequest {
+  repeated string hashes = 1;
+  bool enabled = 2;
+}
+
+// Replaces the trackers a torrent announces to. An empty list restores the trackers from the
+// torrent's own metainfo.
+message ReplaceTrackersRequest {
+  string hash = 1;
+  repeated string trackers = 2;
+}
+
+message ReloadIpFilterResponse {
+  uint32 rules = 1; // rules active after the reload
 }
 
 enum TorrentState {
@@ -111,6 +149,7 @@ message TorrentSummary {
   int64 added_at = 14;
   uint32 piece_count = 15;
   uint32 piece_size = 16;
+  uint32 queue_position = 17; // 0 is next in line to start
 }
 
 message TorrentDelta {
@@ -124,6 +163,7 @@ message TorrentDelta {
   optional uint64 eta_seconds = 8;
   optional float ratio = 9;
   optional string error_message = 10;
+  optional uint32 queue_position = 11;
 }
 
 message TorrentSnapshotChunk {
