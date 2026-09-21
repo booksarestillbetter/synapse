@@ -600,7 +600,16 @@ impl UtpSocketManager {
                             continue;
                         };
 
-                        let conn_id = packet.header.connection_id;
+                        // A SYN names the id the *initiator* receives on (R); the connection we
+                        // registered for it is keyed by the id we receive on (R + 1). So a repeated
+                        // SYN (the initiator retransmitting because our STATE was lost, or a
+                        // duplicated datagram) must be looked up under R + 1, or it would be taken
+                        // for a new connection that replaces, and so kills, the established one.
+                        let conn_id = if packet.header.ptype == UtpType::Syn {
+                            packet.header.connection_id.wrapping_add(1)
+                        } else {
+                            packet.header.connection_id
+                        };
                         let sender_opt = {
                             let table = mgr.connections.read();
                             table.get(&(remote_addr, conn_id)).cloned()
@@ -1098,7 +1107,10 @@ async fn drive_utp_connection(
                         }
                     }
                     UtpType::Syn => {
+                        // A repeated SYN: the initiator has not seen our STATE yet. Say it again.
                         conn.state = UtpConnectionState::Connected;
+                        let state_pkt = conn.build_state_packet();
+                        let _ = socket.send_to(&state_pkt.encode(), remote_addr).await;
                     }
                 }
             }

@@ -57,7 +57,7 @@ jobs:
         token: ${{ secrets.GITHUB_TOKEN }}
 
   package:
-    name: Debian Package Build
+    name: Release Build
     runs-on: ubuntu-latest
     needs: [lint-and-fmt, test, deny]
     steps:
@@ -65,21 +65,10 @@ jobs:
     - uses: dtolnay/rust-toolchain@stable
     - name: Rust Cache
       uses: Swatinem/rust-cache@v2
-    - name: Install cargo-deb
-      run: cargo install cargo-deb --locked
     - name: Build
-      run: cargo build --locked --release --all --verbose
-    - name: Package as deb file
-      run: cargo deb --no-build --verbose
+      run: cargo build --locked --release -p synapsed --verbose
     - name: Upload Artifact Linux
       uses: actions/upload-artifact@v4
       with:
-        name: synapse_sycli
-        path: |
-          target/release/synapse
-          target/release/sycli
-    - name: Upload Artifact Linux as .deb package
-      uses: actions/upload-artifact@v4
-      with:
-        name: synapse_deb
-        path: target/debian/*.deb
+        name: synapsed-linux-x86_64
+        path: target/release/synapsed

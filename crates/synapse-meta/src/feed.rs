@@ -8,7 +8,7 @@
 //! Besides `title`, `link`, `enclosure` and the publication date, BEP 36's torrent-namespace
 //! elements are read: `infoHash`, `magnetURI`, `contentLength`, `seeds` and `peers`.
 
-use quick_xml::events::{BytesStart, Event};
+use quick_xml::events::{BytesRef, BytesStart, Event};
 use quick_xml::Reader;
 
 /// Items read from one feed, and the longest text kept for any field.
@@ -70,19 +70,23 @@ pub fn parse_torrent_feed(xml: &str) -> Vec<FeedItem> {
             }
             Event::Text(t) => {
                 if field.is_some() && text.len() < MAX_FIELD_BYTES {
-                    if let Ok(s) = t.unescape() {
-                        text.push_str(&s);
-                    }
+                    text.push_str(&t.xml10_content());
+                }
+            }
+            // `&amp;`, `&#x26;` and friends arrive as their own events.
+            Event::GeneralRef(r) => {
+                if field.is_some() && text.len() < MAX_FIELD_BYTES {
+                    append_entity(&mut text, &r);
                 }
             }
             Event::CData(c) => {
                 if field.is_some() && text.len() < MAX_FIELD_BYTES {
-                    text.push_str(&String::from_utf8_lossy(&c.into_inner()));
+                    text.push_str(&c.xml10_content());
                 }
             }
             Event::End(e) => {
                 depth = depth.saturating_sub(1);
-                let name = String::from_utf8_lossy(e.local_name().as_ref()).into_owned();
+                let name = e.local_name().as_ref().to_string();
                 if let Some(item) = current.as_mut() {
                     if field.as_deref() == Some(name.as_str()) {
                         let value = text
@@ -128,13 +132,28 @@ pub fn parse_torrent_feed(xml: &str) -> Vec<FeedItem> {
 
 /// The element name without its namespace prefix (`torrent:infoHash` -> `infoHash`).
 fn local_name(e: &BytesStart<'_>) -> String {
-    String::from_utf8_lossy(e.local_name().as_ref()).into_owned()
+    e.local_name().as_ref().to_string()
+}
+
+/// Appends what an entity reference stands for: the five predefined entities and numeric
+/// character references. Anything else (a custom entity from a DTD, which is never defined here)
+/// is dropped, so a document cannot expand into more than it says.
+pub(crate) fn append_entity(text: &mut String, entity: &BytesRef<'_>) {
+    if let Ok(Some(ch)) = entity.resolve_char_ref() {
+        text.push(ch);
+    } else if let Some(s) = quick_xml::escape::resolve_predefined_entity(&entity.xml10_content()) {
+        text.push_str(s);
+    }
 }
 
 fn attribute(e: &BytesStart<'_>, name: &str) -> Option<String> {
     e.attributes().flatten().find_map(|a| {
-        (a.key.local_name().as_ref() == name.as_bytes())
-            .then(|| a.unescape_value().ok().map(|v| v.into_owned()))
+        (a.key.local_name().as_ref() == name)
+            .then(|| {
+                a.normalized_value(quick_xml::XmlVersion::Implicit1_0)
+                    .ok()
+                    .map(|v| v.into_owned())
+            })
             .flatten()
     })
 }
@@ -340,5 +359,12 @@ mod tests {
         assert!(parse_info_hash(&"g".repeat(40)).is_none());
         // base32 of 20 zero bytes is 32 'A's.
         assert_eq!(parse_info_hash(&"A".repeat(32)), Some([0u8; 20]));
+    }
+
+    #[test]
+    fn numeric_references_resolve_and_undefined_entities_are_dropped() {
+        let xml = "<rss><item><title>A&#x26;B &#65; &lt;x&gt; &undefined; end</title></item></rss>";
+        let items = parse_torrent_feed(xml);
+        assert_eq!(items[0].title, "A&B A <x>  end");
     }
 }

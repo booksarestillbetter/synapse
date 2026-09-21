@@ -6,7 +6,12 @@
 # vulnerabilities and no longer accepts the old `vulnerability`, `unlicensed` and `notice`
 # keys, so only the remaining options are set here.
 yanked = "deny"
-ignore = []
+ignore = [
+    # `rsa` (Marvin attack, a timing side channel in private-key operations). Synapse only
+    # verifies torrent signatures with public keys (BEP 35) and never decrypts or signs, so the
+    # affected operations are not reachable. No fixed release exists; revisit when one does.
+    { id = "RUSTSEC-2023-0071", reason = "only RSA public-key verification is used; private-key operations are unreachable" },
+]
 
 [bans]
 multiple-versions = "warn"
@@ -22,6 +27,7 @@ allow = [
     "Apache-2.0 WITH LLVM-exception",
     "BSD-2-Clause",
     "BSD-3-Clause",
+    "CDLA-Permissive-2.0", # webpki-roots (the bundled root certificate list)
     "CC0-1.0",
     "ISC",
     "MIT",

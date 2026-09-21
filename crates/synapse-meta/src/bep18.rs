@@ -63,7 +63,7 @@ impl SearchEngine {
         loop {
             match reader.read_event() {
                 Ok(Event::Start(e)) => {
-                    let name = String::from_utf8_lossy(e.local_name().as_ref()).into_owned();
+                    let name = e.local_name().as_ref().to_string();
                     if !in_root {
                         if name != "OpenSearchDescription" {
                             return Err(SearchEngineError::NotOpenSearch);
@@ -83,15 +83,18 @@ impl SearchEngine {
                     }
                 }
                 Ok(Event::Empty(e)) => {
-                    if in_root && e.local_name().as_ref() == b"Url" {
+                    if in_root && e.local_name().as_ref() == "Url" {
                         take_template(&e, &mut template);
                     }
                 }
                 Ok(Event::Text(t)) => {
                     if field.is_some() {
-                        if let Ok(s) = t.unescape() {
-                            text.push_str(&s);
-                        }
+                        text.push_str(&t.xml10_content());
+                    }
+                }
+                Ok(Event::GeneralRef(r)) => {
+                    if field.is_some() {
+                        crate::feed::append_entity(&mut text, &r);
                     }
                 }
                 Ok(Event::End(_)) => {
@@ -152,8 +155,12 @@ impl SearchEngine {
 fn take_template(e: &BytesStart<'_>, slot: &mut Option<String>) {
     let attr = |name: &str| {
         e.attributes().flatten().find_map(|a| {
-            (a.key.as_ref() == name.as_bytes())
-                .then(|| a.unescape_value().ok().map(|v| v.into_owned()))
+            (a.key.as_ref() == name)
+                .then(|| {
+                    a.normalized_value(quick_xml::XmlVersion::Implicit1_0)
+                        .ok()
+                        .map(|v| v.into_owned())
+                })
                 .flatten()
         })
     };

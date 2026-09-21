@@ -582,3 +582,78 @@ async fn a_transfer_over_a_lossy_reordering_path_still_arrives_intact() {
     assert!(got == data, "data corrupted or reordered on a lossy path");
     let _ = writer.await;
 }
+
+/// A relay that duplicates the client's first datagram (the SYN) and drops the server's first
+/// reply (the handshake STATE), so the client has to retransmit its SYN into a connection the
+/// server already has. That repeated SYN must not be mistaken for a new connection.
+async fn handshake_mangling_relay(server: std::net::SocketAddr) -> std::net::SocketAddr {
+    let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let addr = sock.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 4096];
+        let mut client: Option<std::net::SocketAddr> = None;
+        let (mut from_client, mut from_server) = (0u32, 0u32);
+        loop {
+            let Ok((n, from)) = sock.recv_from(&mut buf).await else {
+                return;
+            };
+            if from == server {
+                from_server += 1;
+                if from_server == 1 {
+                    continue; // the handshake STATE is lost
+                }
+                if let Some(c) = client {
+                    let _ = sock.send_to(&buf[..n], c).await;
+                }
+            } else {
+                client = Some(from);
+                from_client += 1;
+                let _ = sock.send_to(&buf[..n], server).await;
+                if from_client == 1 {
+                    let _ = sock.send_to(&buf[..n], server).await; // duplicated SYN
+                }
+            }
+        }
+    });
+    addr
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_repeated_syn_does_not_replace_the_established_connection() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let server = UtpSocketManager::bind("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let relay = handshake_mangling_relay(server.local_addr()).await;
+    let client = UtpSocketManager::bind("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let accepted = tokio::spawn({
+        let server = server.clone();
+        async move { server.accept().await.unwrap().0 }
+    });
+    let mut c = timeout(Duration::from_secs(10), client.connect(relay))
+        .await
+        .expect("connect hung")
+        .expect("the retransmitted SYN was not answered");
+    let mut s = timeout(Duration::from_secs(5), accepted)
+        .await
+        .unwrap()
+        .unwrap();
+
+    // Data flows both ways over the connection that existed before the repeated SYN arrived.
+    c.write_all(b"hello over a repeated syn").await.unwrap();
+    let mut got = vec![0u8; 25];
+    timeout(Duration::from_secs(10), s.read_exact(&mut got))
+        .await
+        .expect("client to server stalled")
+        .unwrap();
+    assert_eq!(&got, b"hello over a repeated syn");
+    s.write_all(b"and back").await.unwrap();
+    let mut back = vec![0u8; 8];
+    timeout(Duration::from_secs(10), c.read_exact(&mut back))
+        .await
+        .expect("server to client stalled")
+        .unwrap();
+    assert_eq!(&back, b"and back");
+}

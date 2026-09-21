@@ -1,0 +1,6 @@
+[advisories]
+ignore = [
+    # `rsa` Marvin attack: a timing side channel in private-key operations. Synapse only verifies
+    # torrent signatures with public keys (BEP 35); see deny.toml. No fixed release exists.
+    "RUSTSEC-2023-0071",
+]
