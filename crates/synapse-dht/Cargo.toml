@@ -7,12 +7,15 @@ publish.workspace = true
 description = "BEP5 Kademlia DHT for the synapse rewrite. See doc/REWRITE_ROADMAP.md."
 
 [dependencies]
+socket2 = "0.6"
+ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
 tokio = { workspace = true, features = ["net", "time", "sync"] }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 rand = "0.8"
 sha1 = "0.10"
 synapse-bencode = { path = "../synapse-bencode" }
+synapse-wire = { path = "../synapse-wire" }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }

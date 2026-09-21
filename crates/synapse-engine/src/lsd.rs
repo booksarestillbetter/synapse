@@ -8,8 +8,18 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
+use std::time::{Duration, Instant};
 use synapse_wire::{format_lsd_announce, parse_lsd_announce};
 use tracing::debug;
+
+/// Announcements accepted from one source address per `SOURCE_WINDOW`. Honest clients
+/// announce every few minutes, so this only ever affects a flooder.
+const MAX_PACKETS_PER_SOURCE: u32 = 20;
+const SOURCE_WINDOW: Duration = Duration::from_secs(60);
+/// Sources tracked for rate limiting at once.
+const MAX_TRACKED_SOURCES: usize = 1024;
+/// Distinct local peers remembered per torrent (also what bounds spoofed-port floods).
+const MAX_PEERS_PER_TORRENT: usize = 256;
 
 #[derive(Debug, Clone)]
 pub struct DiscoveredLocalPeer {
@@ -24,6 +34,8 @@ pub struct LsdManager {
     public_torrents: HashSet<[u8; 20]>,
     private_torrents: HashSet<[u8; 20]>,
     known_peers: HashMap<[u8; 20], HashSet<SocketAddr>>,
+    /// Per-source (window start, packets in window) for rate limiting.
+    sources: HashMap<IpAddr, (Instant, u32)>,
 }
 
 impl LsdManager {
@@ -34,7 +46,25 @@ impl LsdManager {
             public_torrents: HashSet::new(),
             private_torrents: HashSet::new(),
             known_peers: HashMap::new(),
+            sources: HashMap::new(),
         }
+    }
+
+    /// Whether another packet from `ip` is within its budget; counts it.
+    fn source_allowed(&mut self, ip: IpAddr, now: Instant) -> bool {
+        if self.sources.len() >= MAX_TRACKED_SOURCES && !self.sources.contains_key(&ip) {
+            self.sources
+                .retain(|_, (start, _)| now.duration_since(*start) < SOURCE_WINDOW);
+            if self.sources.len() >= MAX_TRACKED_SOURCES {
+                return false;
+            }
+        }
+        let entry = self.sources.entry(ip).or_insert((now, 0));
+        if now.duration_since(entry.0) >= SOURCE_WINDOW {
+            *entry = (now, 0);
+        }
+        entry.1 += 1;
+        entry.1 <= MAX_PACKETS_PER_SOURCE
     }
 
     /// Updates the peer listen port advertised in outgoing announcements (e.g. once the
@@ -82,6 +112,18 @@ impl LsdManager {
         sender_ip: IpAddr,
         packet_raw: &str,
     ) -> Vec<DiscoveredLocalPeer> {
+        // LSD is link-local multicast: a genuine announcement comes from a host on our own
+        // network. A packet claiming a public source address is spoofed (or misrouted) and
+        // must not be able to inject peers.
+        // (IPv6 hosts on a LAN commonly hold global addresses, so the public-source test only
+        // applies to IPv4, where multicast senders are on private space. The per-source rate
+        // limit and per-torrent peer cap below bound what a spoofed IPv6 source could inject.)
+        if sender_ip.is_ipv4() && synapse_tracker::safe_http::is_public_ip(sender_ip) {
+            return Vec::new();
+        }
+        if !self.source_allowed(sender_ip, Instant::now()) {
+            return Vec::new();
+        }
         let announce = match parse_lsd_announce(packet_raw) {
             Ok(a) => a,
             Err(_) => return Vec::new(),
@@ -94,18 +136,27 @@ impl LsdManager {
             }
         }
 
+        if announce.port == 0 {
+            return Vec::new();
+        }
         let peer_addr = SocketAddr::new(sender_ip, announce.port);
         let mut discovered = Vec::new();
 
         for hash in announce.info_hashes {
             // Strict BEP 27 invariant: Private torrents NEVER accept LSD peers
             if self.private_torrents.contains(&hash) {
-                debug!("LSD peer ignored for private torrent info_hash={}", hex::encode(hash));
+                debug!(
+                    "LSD peer ignored for private torrent info_hash={}",
+                    hex::encode(hash)
+                );
                 continue;
             }
 
             if self.public_torrents.contains(&hash) {
                 let peer_set = self.known_peers.entry(hash).or_default();
+                if peer_set.len() >= MAX_PEERS_PER_TORRENT {
+                    continue;
+                }
                 if peer_set.insert(peer_addr) {
                     discovered.push(DiscoveredLocalPeer {
                         addr: peer_addr,
@@ -163,5 +214,55 @@ mod tests {
         let sender = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 200));
         let discovered = mgr.ingest_packet(sender, &fake_pkt);
         assert!(discovered.is_empty());
+    }
+
+    fn announce_for(port: u16, hash: [u8; 20]) -> String {
+        let mut m = LsdManager::new(port, format!("cookie{port}"));
+        m.register_torrent(hash, false);
+        m.build_announce_packet().unwrap()
+    }
+
+    #[test]
+    fn packets_from_public_source_addresses_are_ignored() {
+        let hash = [0x22; 20];
+        let mut rx = LsdManager::new(6881, "rx".into());
+        rx.register_torrent(hash, false);
+        let pkt = announce_for(6882, hash);
+        assert!(
+            rx.ingest_packet(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), &pkt)
+                .is_empty(),
+            "spoofed public source"
+        );
+        assert_eq!(
+            rx.ingest_packet(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 7)), &pkt)
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_flooding_source_is_rate_limited_but_others_are_unaffected() {
+        let hash = [0x33; 20];
+        let mut rx = LsdManager::new(6881, "rx".into());
+        rx.register_torrent(hash, false);
+        let flooder = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5));
+        let mut accepted = 0;
+        for port in 1..=200u16 {
+            accepted += rx
+                .ingest_packet(flooder, &announce_for(port + 1000, hash))
+                .len();
+        }
+        assert_eq!(
+            accepted, MAX_PACKETS_PER_SOURCE as usize,
+            "only the per-window budget is honoured"
+        );
+        assert_eq!(
+            rx.ingest_packet(
+                IpAddr::V4(Ipv4Addr::new(10, 0, 0, 6)),
+                &announce_for(7000, hash)
+            )
+            .len(),
+            1
+        );
     }
 }

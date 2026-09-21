@@ -1,7 +1,7 @@
 use std::fs;
-use tempfile::tempdir;
 use synapse_engine::{ConduitLifecycleDispatcher, LifecycleConfig};
 use synapse_meta::File;
+use tempfile::tempdir;
 
 #[tokio::test]
 async fn test_conduit_lifecycle_hardlink_and_offline_wal() {
@@ -58,9 +58,9 @@ async fn test_conduit_lifecycle_hardlink_and_offline_wal() {
 
 #[tokio::test]
 async fn test_conduit_lifecycle_with_custom_plugin_and_post_script() {
+    use async_trait::async_trait;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
-    use async_trait::async_trait;
     use synapse_engine::{LifecycleError, LifecyclePlugin, TorrentCompletedEvent};
 
     let tmp = tempdir().unwrap();
@@ -94,7 +94,10 @@ async fn test_conduit_lifecycle_with_custom_plugin_and_post_script() {
         fn name(&self) -> &str {
             "test_plugin"
         }
-        async fn on_torrent_completed(&self, _event: &TorrentCompletedEvent) -> Result<(), LifecycleError> {
+        async fn on_torrent_completed(
+            &self,
+            _event: &TorrentCompletedEvent,
+        ) -> Result<(), LifecycleError> {
             self.called.store(true, Ordering::SeqCst);
             Ok(())
         }

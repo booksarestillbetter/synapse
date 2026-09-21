@@ -1,10 +1,10 @@
-use std::sync::Arc;
-use tempfile::tempdir;
-use sha1::{Digest, Sha1};
 use diskio::DiskEngine;
+use sha1::{Digest, Sha1};
+use std::sync::Arc;
 use synapse_engine::{SessionStore, SwarmEngine, SwarmState, SwarmTier};
 use synapse_meta::Info;
 use synapse_picker::Bitfield;
+use tempfile::tempdir;
 
 fn build_dummy_torrent(name: &str, file_data: &[u8], piece_len: u32) -> Info {
     let mut pieces = Vec::new();
@@ -29,10 +29,7 @@ fn build_dummy_torrent(name: &str, file_data: &[u8], piece_len: u32) -> Info {
     );
 
     let mut torrent_dict = std::collections::BTreeMap::new();
-    torrent_dict.insert(
-        b"info".to_vec(),
-        synapse_bencode::BEncode::Dict(info_dict),
-    );
+    torrent_dict.insert(b"info".to_vec(), synapse_bencode::BEncode::Dict(info_dict));
 
     Info::from_bencode(synapse_bencode::BEncode::Dict(torrent_dict))
         .expect("valid synthetic torrent")
@@ -68,7 +65,10 @@ async fn test_seeding_swarm_evicts_piece_hashes_on_add() {
     assert_eq!(handle.stats.read().progress, 1.0);
 
     // Piece hashes must be evicted immediately to save RAM
-    assert!(!handle.info.has_piece_hashes(), "piece hashes must be evicted for complete seed");
+    assert!(
+        !handle.info.has_piece_hashes(),
+        "piece hashes must be evicted for complete seed"
+    );
     assert_eq!(handle.info.piece_hash(0), None);
     assert_eq!(handle.info.piece_hash(1), None);
     assert_eq!(handle.info.piece_hash(2), None);
@@ -126,7 +126,10 @@ async fn test_recheck_transparently_reloads_evicted_hashes() {
     assert_eq!(stats.state, SwarmState::Seeding);
 
     // Hashes must be evicted again once re-verification completes
-    assert!(!handle.info.has_piece_hashes(), "hashes must be evicted again after recheck passes");
+    assert!(
+        !handle.info.has_piece_hashes(),
+        "hashes must be evicted again after recheck passes"
+    );
 }
 
 #[tokio::test]
@@ -142,14 +145,13 @@ async fn test_incomplete_download_does_not_evict_piece_hashes() {
     assert_eq!(info.pieces(), 4);
     assert!(info.has_piece_hashes());
 
-    let handle = engine.add_torrent(
-        Arc::new(info),
-        tmp.path().to_path_buf(),
-        None,
-    );
+    let handle = engine.add_torrent(Arc::new(info), tmp.path().to_path_buf(), None);
 
     // Piece hashes must NOT be evicted
-    assert!(handle.info.has_piece_hashes(), "piece hashes must NOT be evicted for incomplete download");
+    assert!(
+        handle.info.has_piece_hashes(),
+        "piece hashes must NOT be evicted for incomplete download"
+    );
     assert!(handle.info.piece_hash(0).is_some());
     assert!(handle.info.piece_hash(1).is_some());
     assert!(handle.info.piece_hash(2).is_some());

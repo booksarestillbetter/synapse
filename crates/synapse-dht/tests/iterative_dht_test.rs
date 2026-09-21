@@ -30,17 +30,29 @@ async fn test_iterative_dht_find_node_and_get_peers() {
     // On Node C, announce a peer for info_hash
     let info_hash = [0x42; 20];
     let (token, _) = node_b.get_peers(to_v4(addr_c), info_hash).await.unwrap();
-    node_b.announce_peer(to_v4(addr_c), info_hash, 6881, token).await.unwrap();
+    node_b
+        .announce_peer(to_v4(addr_c), info_hash, 6881, token)
+        .await
+        .unwrap();
 
     // Node A does not know Node C directly. It only has Node B as a bootstrap node.
     let bootstrap = vec![to_v4(addr_b)];
 
     // 1. Test iterative find_node
     let found_nodes = node_a.iterative_find_node(id_c, &bootstrap).await.unwrap();
-    assert!(found_nodes.iter().any(|n| n.id == id_c && n.addr == to_v4(addr_c)));
+    assert!(found_nodes
+        .iter()
+        .any(|n| n.id == id_c && n.addr == to_v4(addr_c)));
 
     // 2. Test iterative get_peers
-    let IterativePeersResult { peers, closest_nodes } = node_a.iterative_get_peers(info_hash, &bootstrap).await.unwrap();
+    let IterativePeersResult {
+        peers,
+        closest_nodes,
+        ..
+    } = node_a
+        .iterative_get_peers(info_hash, &bootstrap)
+        .await
+        .unwrap();
     assert!(peers.iter().any(|p| p.port() == 6881));
     assert!(!closest_nodes.is_empty());
 }

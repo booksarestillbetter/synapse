@@ -3,9 +3,7 @@ use std::time::Instant;
 use tempfile::tempdir;
 
 use diskio::DiskEngine;
-use synapse_engine::{
-    EngineMetricsSnapshot, SwarmEngine, SwarmState, SwarmStateFilter,
-};
+use synapse_engine::{EngineMetricsSnapshot, SwarmEngine, SwarmState, SwarmStateFilter};
 use synapse_meta::Info;
 use synapse_picker::Bitfield;
 
@@ -35,10 +33,7 @@ fn build_dummy_torrent(name: &str, file_len: usize, piece_len: u32) -> Info {
     );
 
     let mut torrent_dict = std::collections::BTreeMap::new();
-    torrent_dict.insert(
-        b"info".to_vec(),
-        synapse_bencode::BEncode::Dict(info_dict),
-    );
+    torrent_dict.insert(b"info".to_vec(), synapse_bencode::BEncode::Dict(info_dict));
 
     Info::from_bencode(synapse_bencode::BEncode::Dict(torrent_dict))
         .expect("valid synthetic torrent")
@@ -63,6 +58,7 @@ async fn test_scale_1000_swarms_atomic_metrics_and_zero_copy_pagination() {
         share_ratio_limit: None,
         idle_seeding_limit_enabled: false,
         seed_time_limit_secs: None,
+        ..Default::default()
     });
 
     const SWARM_COUNT: usize = 1_000;
@@ -90,7 +86,10 @@ async fn test_scale_1000_swarms_atomic_metrics_and_zero_copy_pagination() {
         engine.add_torrent(info, tmp.path().to_path_buf(), have.as_ref());
     }
 
-    println!("Ingested {SWARM_COUNT} swarms in {:.2}ms", start_ingest.elapsed().as_secs_f64() * 1000.0);
+    println!(
+        "Ingested {SWARM_COUNT} swarms in {:.2}ms",
+        start_ingest.elapsed().as_secs_f64() * 1000.0
+    );
 
     // 1. Verify O(1) Atomic Global Metrics Speed
     let start_metrics = Instant::now();
@@ -129,14 +128,16 @@ async fn test_scale_1000_swarms_atomic_metrics_and_zero_copy_pagination() {
     assert_ne!(page1[0].info_hash, page2[0].info_hash);
 
     // 3. Verify State Filtering in Pagination
-    let (seeds_page, seeds_total) = engine.list_torrents_paged(0, 25, Some(SwarmStateFilter::Seeding));
+    let (seeds_page, seeds_total) =
+        engine.list_torrents_paged(0, 25, Some(SwarmStateFilter::Seeding));
     assert_eq!(seeds_total, SWARM_COUNT / 2);
     assert_eq!(seeds_page.len(), 25);
     for s in seeds_page {
         assert_eq!(s.state, SwarmState::Seeding);
     }
 
-    let (dl_page, dl_total) = engine.list_torrents_paged(0, 25, Some(SwarmStateFilter::Downloading));
+    let (dl_page, dl_total) =
+        engine.list_torrents_paged(0, 25, Some(SwarmStateFilter::Downloading));
     assert_eq!(dl_total, 100);
     assert_eq!(dl_page.len(), 25);
     for s in dl_page {

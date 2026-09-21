@@ -3,9 +3,9 @@
 //! Provides rendezvous coordination allowing two NATed/firewalled peers to establish
 //! a direct UDP/uTP connection via a mutually connected relay peer.
 
+use crate::WireError;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use crate::WireError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HolepunchType {
@@ -106,7 +106,9 @@ impl HolepunchMessage {
                 let port = src.get_u16();
                 Ok(SocketAddr::new(IpAddr::V6(Ipv6Addr::from(octets)), port))
             }
-            _ => Err(WireError::Protocol("unsupported holepunch IP address length")),
+            _ => Err(WireError::Protocol(
+                "unsupported holepunch IP address length",
+            )),
         }
     }
 }

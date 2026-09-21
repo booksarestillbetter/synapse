@@ -1,0 +1,76 @@
+[package]
+name = "synapse-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+bytes = "1"
+tokio-util = { version = "0.7", features = ["codec"] }
+synapse-bencode = { path = "../crates/synapse-bencode" }
+synapse-meta = { path = "../crates/synapse-meta" }
+synapse-wire = { path = "../crates/synapse-wire" }
+synapse-dht = { path = "../crates/synapse-dht" }
+synapse-tracker = { path = "../crates/synapse-tracker" }
+
+# Prevent this from interfering with workspace members
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "fuzz_peer_codec"
+path = "fuzz_targets/fuzz_peer_codec.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_bencode"
+path = "fuzz_targets/fuzz_bencode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_info_meta"
+path = "fuzz_targets/fuzz_info_meta.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_ut_metadata"
+path = "fuzz_targets/fuzz_ut_metadata.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_ut_pex"
+path = "fuzz_targets/fuzz_ut_pex.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_dht_krpc"
+path = "fuzz_targets/fuzz_dht_krpc.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_utp_packet"
+path = "fuzz_targets/fuzz_utp_packet.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_tracker_response"
+path = "fuzz_targets/fuzz_tracker_response.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_lsd_parser"
+path = "fuzz_targets/fuzz_lsd_parser.rs"
+test = false
+doc = false

@@ -35,9 +35,16 @@ pub struct DynamicSessionSettings {
 
     // Protocol flags
     pub dht_enabled: bool,
+    pub dht_read_only: bool,
     pub pex_enabled: bool,
     pub lsd_enabled: bool,
+    pub zeroconf_enabled: bool,
+    /// Address announced to trackers (`network.announce_ip`).
+    pub announce_ip: Option<std::net::IpAddr>,
+    pub enable_utp: bool,
     pub encryption: String,
+    /// Permit web seed URLs on loopback/private addresses (see `NetworkConfig`).
+    pub allow_local_web_seeds: bool,
 
     // Paths & Behavior
     pub download_dir: PathBuf,
@@ -45,6 +52,18 @@ pub struct DynamicSessionSettings {
     pub incomplete_dir_enabled: bool,
     pub start_added_torrents: bool,
     pub trash_original_torrent_files: bool,
+
+    // Session Choker & Bandwidth
+    pub unchoke_slots_global: usize,
+    pub seed_choking_algorithm: String,
+    pub unchoke_slot_bandwidth: u64,
+    pub limit_lan_peers: bool,
+    pub rate_limit_ip_overhead: bool,
+
+    // Separate Announce Limits (Libtorrent parity)
+    pub max_concurrent_tracker_announces: usize,
+    pub max_concurrent_dht_announces: usize,
+    pub max_concurrent_lsd_announces: usize,
 }
 
 impl Default for DynamicSessionSettings {
@@ -59,9 +78,9 @@ impl Default for DynamicSessionSettings {
             alt_speed_down_bytes: 500_000, // 500 KB/s
             alt_speed_up_bytes: 100_000,   // 100 KB/s
             alt_speed_time_enabled: false,
-            alt_speed_time_begin: 540,       // 09:00 AM
-            alt_speed_time_end: 1020,        // 05:00 PM
-            alt_speed_time_days: 127,        // All days
+            alt_speed_time_begin: 540, // 09:00 AM
+            alt_speed_time_end: 1020,  // 05:00 PM
+            alt_speed_time_days: 127,  // All days
 
             queue: QueueConfig::default(),
 
@@ -69,16 +88,37 @@ impl Default for DynamicSessionSettings {
             max_global_peers: 2000,
 
             dht_enabled: true,
+            dht_read_only: false,
             pex_enabled: true,
             lsd_enabled: true,
+            zeroconf_enabled: false,
+            announce_ip: None,
+            enable_utp: true,
             encryption: "prefer_encrypted".to_string(),
+            allow_local_web_seeds: false,
 
             download_dir: PathBuf::from("."),
             incomplete_dir: None,
             incomplete_dir_enabled: false,
             start_added_torrents: true,
             trash_original_torrent_files: false,
+
+            unchoke_slots_global: 8,
+            seed_choking_algorithm: "round_robin".to_string(),
+            unchoke_slot_bandwidth: 16384,
+            limit_lan_peers: false,
+            rate_limit_ip_overhead: true,
+
+            max_concurrent_tracker_announces: 50,
+            max_concurrent_dht_announces: 8,
+            max_concurrent_lsd_announces: 1,
         }
+    }
+}
+
+impl DynamicSessionSettings {
+    pub fn encryption_mode(&self) -> synapse_wire::EncryptionMode {
+        synapse_wire::EncryptionMode::from_str_opt(&self.encryption)
     }
 }
 
@@ -140,8 +180,13 @@ pub struct SessionSettingsUpdate {
     pub max_peers_per_torrent: Option<usize>,
     pub max_global_peers: Option<usize>,
     pub dht_enabled: Option<bool>,
+    pub dht_read_only: Option<bool>,
     pub pex_enabled: Option<bool>,
     pub lsd_enabled: Option<bool>,
+    pub zeroconf_enabled: Option<bool>,
+    /// An address to announce to trackers; an empty string clears it.
+    pub announce_ip: Option<String>,
+    pub enable_utp: Option<bool>,
     pub encryption: Option<String>,
 
     pub download_dir: Option<String>,
@@ -149,6 +194,16 @@ pub struct SessionSettingsUpdate {
     pub incomplete_dir_enabled: Option<bool>,
     pub start_added_torrents: Option<bool>,
     pub trash_original_torrent_files: Option<bool>,
+
+    pub unchoke_slots_global: Option<usize>,
+    pub seed_choking_algorithm: Option<String>,
+    pub unchoke_slot_bandwidth: Option<u64>,
+    pub limit_lan_peers: Option<bool>,
+    pub rate_limit_ip_overhead: Option<bool>,
+
+    pub max_concurrent_tracker_announces: Option<usize>,
+    pub max_concurrent_dht_announces: Option<usize>,
+    pub max_concurrent_lsd_announces: Option<usize>,
 
     // Static parameters requiring daemon restart (warn if supplied)
     pub peer_port: Option<u16>,
@@ -216,11 +271,11 @@ mod tests {
 
         // Wraparound midnight: 22:00 (1320) to 06:00 (360)
         assert!(is_in_alt_speed_schedule(1350, 4, 1320, 360, 127)); // 22:30 -> in
-        assert!(is_in_alt_speed_schedule(100, 4, 1320, 360, 127));  // 01:40 -> in
+        assert!(is_in_alt_speed_schedule(100, 4, 1320, 360, 127)); // 01:40 -> in
         assert!(!is_in_alt_speed_schedule(700, 4, 1320, 360, 127)); // 11:40 -> out
 
         // Day of week mask: weekdays only (62 = Mon..Fri)
-        assert!(is_in_alt_speed_schedule(600, 2, 540, 1020, 62));  // Monday (2) -> in
+        assert!(is_in_alt_speed_schedule(600, 2, 540, 1020, 62)); // Monday (2) -> in
         assert!(!is_in_alt_speed_schedule(600, 1, 540, 1020, 62)); // Sunday (1) -> out
     }
 

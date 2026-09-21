@@ -180,7 +180,9 @@ async fn test_daemon_full_simulation_with_logging_and_syslog() {
     // Pause, Resume, and Delete
     let first_hash = torrents[0]["info_hash"].as_str().unwrap();
     let pause_resp: serde_json::Value = client
-        .post(format!("http://{http_addr}/api/v1/torrents/{first_hash}/pause"))
+        .post(format!(
+            "http://{http_addr}/api/v1/torrents/{first_hash}/pause"
+        ))
         .send()
         .await
         .unwrap()
@@ -190,7 +192,9 @@ async fn test_daemon_full_simulation_with_logging_and_syslog() {
     assert_eq!(pause_resp["success"], true);
 
     let resume_resp: serde_json::Value = client
-        .post(format!("http://{http_addr}/api/v1/torrents/{first_hash}/resume"))
+        .post(format!(
+            "http://{http_addr}/api/v1/torrents/{first_hash}/resume"
+        ))
         .send()
         .await
         .unwrap()
@@ -229,10 +233,7 @@ async fn test_daemon_graceful_shutdown_and_dynamic_reload() {
 
     let disk = Arc::new(DiskEngine::auto().await);
     let session_store = Arc::new(synapse_engine::SessionStore::new(&session_dir).unwrap());
-    let swarm = Arc::new(
-        SwarmEngine::new(disk, [0x77; 20])
-            .with_session_store(session_store),
-    );
+    let swarm = Arc::new(SwarmEngine::new(disk, [0x77; 20]).with_session_store(session_store));
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 

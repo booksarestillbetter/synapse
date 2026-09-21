@@ -1,8 +1,9 @@
 use std::time::Duration;
 use synapse_meta::Info;
+use synapse_tracker::safe_http::{FetchError, FetchOptions, LocalPolicy};
 use url::Url;
 
-const MAX_TORRENT_FILE_BYTES: usize = 10 * 1024 * 1024; // 10 MB limit
+use synapse_meta::MAX_TORRENT_FILE_BYTES;
 const FETCH_TIMEOUT: Duration = Duration::from_secs(8);
 
 #[derive(Debug, thiserror::Error)]
@@ -19,6 +20,27 @@ pub enum FetchTorrentError {
     Metadata(String),
 }
 
+/// Reads a local `.torrent` file, never buffering more than `MAX_TORRENT_FILE_BYTES`
+/// (a regular file's reported size can lie, and a path may name `/dev/zero` or a FIFO, so
+/// the cap is applied to the bytes actually read rather than to `metadata().len()`).
+pub async fn read_torrent_file(path: &std::path::Path) -> Result<Vec<u8>, FetchTorrentError> {
+    use tokio::io::AsyncReadExt;
+    let file = tokio::fs::File::open(path).await.map_err(|e| {
+        FetchTorrentError::Metadata(format!("Failed to read local torrent file: {e}"))
+    })?;
+    let mut buf = Vec::new();
+    file.take(MAX_TORRENT_FILE_BYTES as u64 + 1)
+        .read_to_end(&mut buf)
+        .await
+        .map_err(|e| {
+            FetchTorrentError::Metadata(format!("Failed to read local torrent file: {e}"))
+        })?;
+    if buf.len() > MAX_TORRENT_FILE_BYTES {
+        return Err(FetchTorrentError::PayloadTooLarge);
+    }
+    Ok(buf)
+}
+
 /// Securely fetches and parses a `.torrent` file or `magnet:` link from a remote URL or URI.
 ///
 /// Implements comprehensive security hardening:
@@ -32,7 +54,9 @@ pub async fn fetch_or_parse_torrent(url_or_magnet: &str) -> Result<Info, FetchTo
 
     // Check for control characters or null-byte injection
     if trimmed.chars().any(|c| c.is_control() || c == '\0') {
-        return Err(FetchTorrentError::InvalidUrl("URL contains illegal control or null characters".into()));
+        return Err(FetchTorrentError::InvalidUrl(
+            "URL contains illegal control or null characters".into(),
+        ));
     }
 
     // 1. Direct Magnet Link Fast-Path
@@ -55,13 +79,12 @@ pub async fn fetch_or_parse_torrent(url_or_magnet: &str) -> Result<Info, FetchTo
     };
 
     if resolved_path.is_file() {
-        let bytes = tokio::fs::read(&resolved_path)
-            .await
-            .map_err(|e| FetchTorrentError::Metadata(format!("Failed to read local torrent file: {e}")))?;
+        let bytes = read_torrent_file(&resolved_path).await?;
         let bencode = synapse_bencode::decode(&mut bytes.as_slice())
             .map_err(|e| FetchTorrentError::BencodeDecode(format!("Invalid local bencode: {e}")))?;
-        return Info::from_bencode(bencode)
-            .map_err(|e| FetchTorrentError::Metadata(format!("Failed to parse local torrent metadata: {e}")));
+        return Info::from_bencode(bencode).map_err(|e| {
+            FetchTorrentError::Metadata(format!("Failed to parse local torrent metadata: {e}"))
+        });
     }
 
     // 2. HTTP/HTTPS URL Validation
@@ -79,36 +102,35 @@ pub async fn fetch_or_parse_torrent(url_or_magnet: &str) -> Result<Info, FetchTo
     }
 
     if parsed_url.host_str().is_none() {
-        return Err(FetchTorrentError::InvalidUrl("URL is missing a valid hostname".into()));
+        return Err(FetchTorrentError::InvalidUrl(
+            "URL is missing a valid hostname".into(),
+        ));
     }
 
-    // 3. Secure HTTP Client Fetch
-    let client = reqwest::Client::builder()
-        .timeout(FETCH_TIMEOUT)
-        .connect_timeout(Duration::from_secs(4))
-        .redirect(reqwest::redirect::Policy::limited(3))
-        .user_agent("synapse/2.0 (High-Scale Retriever)")
-        .build()?;
-
-    let response = client.get(parsed_url.clone()).send().await?;
-
-    if !response.status().is_success() {
+    // 3. SSRF-checked, size-capped fetch: at most 5 redirects, none from a public host to
+    // a local address, and the body is abandoned at the cap. The URL comes from the API
+    // caller, so a LAN indexer is allowed as the starting point.
+    let opts = FetchOptions {
+        timeout: FETCH_TIMEOUT,
+        max_body: MAX_TORRENT_FILE_BYTES,
+        user_agent: concat!("Synapse/", env!("CARGO_PKG_VERSION")),
+        local: LocalPolicy::AllowAny,
+        range: None,
+    };
+    let fetched = synapse_tracker::safe_http::fetch(&parsed_url, &opts)
+        .await
+        .map_err(|e| match e {
+            FetchError::TooLarge(_) => FetchTorrentError::PayloadTooLarge,
+            FetchError::Http(err) => FetchTorrentError::Network(err),
+            other => FetchTorrentError::InvalidUrl(other.to_string()),
+        })?;
+    if !(200..300).contains(&fetched.status) {
         return Err(FetchTorrentError::InvalidUrl(format!(
             "Remote server returned HTTP {}",
-            response.status()
+            fetched.status
         )));
     }
-
-    if let Some(content_length) = response.content_length() {
-        if content_length > MAX_TORRENT_FILE_BYTES as u64 {
-            return Err(FetchTorrentError::PayloadTooLarge);
-        }
-    }
-
-    let bytes = response.bytes().await?;
-    if bytes.len() > MAX_TORRENT_FILE_BYTES {
-        return Err(FetchTorrentError::PayloadTooLarge);
-    }
+    let bytes = fetched.body;
 
     // 4. Bencode & Torrent Metadata Verification
     let bencode = synapse_bencode::decode_buf(&bytes)
@@ -124,22 +146,56 @@ mod tests {
 
     #[tokio::test]
     async fn test_reject_insecure_schemes() {
-        let err = fetch_or_parse_torrent("file:///etc/passwd").await.unwrap_err();
+        let err = fetch_or_parse_torrent("file:///etc/passwd")
+            .await
+            .unwrap_err();
         assert!(matches!(err, FetchTorrentError::InvalidUrl(_)));
 
-        let err = fetch_or_parse_torrent("ftp://example.com/test.torrent").await.unwrap_err();
+        let err = fetch_or_parse_torrent("ftp://example.com/test.torrent")
+            .await
+            .unwrap_err();
         assert!(matches!(err, FetchTorrentError::InvalidUrl(_)));
 
-        let err = fetch_or_parse_torrent("javascript:alert(1)").await.unwrap_err();
+        let err = fetch_or_parse_torrent("javascript:alert(1)")
+            .await
+            .unwrap_err();
         assert!(matches!(err, FetchTorrentError::InvalidUrl(_)));
     }
 
     #[tokio::test]
+    async fn read_torrent_file_enforces_the_size_cap_and_never_reads_endless_files() {
+        let dir = std::env::temp_dir().join(format!("synapse-torrent-cap-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let big = dir.join("big.torrent");
+        std::fs::write(&big, vec![0u8; MAX_TORRENT_FILE_BYTES + 1]).unwrap();
+        assert!(matches!(
+            read_torrent_file(&big).await,
+            Err(FetchTorrentError::PayloadTooLarge)
+        ));
+
+        let ok = dir.join("ok.torrent");
+        std::fs::write(&ok, b"d1:ai1ee").unwrap();
+        assert_eq!(read_torrent_file(&ok).await.unwrap(), b"d1:ai1ee");
+
+        // An endless device must be cut off at the cap rather than exhausting memory.
+        #[cfg(unix)]
+        assert!(matches!(
+            read_torrent_file(std::path::Path::new("/dev/zero")).await,
+            Err(FetchTorrentError::PayloadTooLarge)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn test_reject_control_characters() {
-        let err = fetch_or_parse_torrent("http://example.com/test\0.torrent").await.unwrap_err();
+        let err = fetch_or_parse_torrent("http://example.com/test\0.torrent")
+            .await
+            .unwrap_err();
         assert!(matches!(err, FetchTorrentError::InvalidUrl(_)));
 
-        let err = fetch_or_parse_torrent("http://example.com/test\r\nHost: evil.com").await.unwrap_err();
+        let err = fetch_or_parse_torrent("http://example.com/test\r\nHost: evil.com")
+            .await
+            .unwrap_err();
         assert!(matches!(err, FetchTorrentError::InvalidUrl(_)));
     }
 

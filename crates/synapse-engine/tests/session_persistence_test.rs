@@ -1,8 +1,8 @@
-use std::sync::Arc;
-use tempfile::tempdir;
 use diskio::DiskEngine;
+use std::sync::Arc;
 use synapse_engine::{SessionStore, SwarmEngine, TorrentSessionState};
 use synapse_picker::Bitfield;
+use tempfile::tempdir;
 
 #[tokio::test]
 async fn test_session_persistence_save_load_remove() {
@@ -26,6 +26,7 @@ async fn test_session_persistence_save_load_remove() {
         ratio: None,
         magnet_uri: None,
         raw_bencode_hex: None,
+        file_priorities: Vec::new(),
     };
 
     // 1. Save
@@ -73,6 +74,7 @@ async fn test_session_store_encryption_isolation() {
         ratio: None,
         magnet_uri: None,
         raw_bencode_hex: None,
+        file_priorities: Vec::new(),
     };
     store1.save_torrent(&state).unwrap();
     drop(store1);
@@ -80,8 +82,15 @@ async fn test_session_store_encryption_isolation() {
     // Opening with the wrong key must fail authentication
     let store2 = SessionStore::with_key(tmp.path(), key2).unwrap();
     let loaded = store2.load_all().unwrap();
-    assert_eq!(loaded.len(), 0, "Wrong decryption key must not yield any valid records");
-    assert!(store2.load_torrent(&hex::encode(info_hash)).is_err(), "Single load with wrong key must error");
+    assert_eq!(
+        loaded.len(),
+        0,
+        "Wrong decryption key must not yield any valid records"
+    );
+    assert!(
+        store2.load_torrent(&hex::encode(info_hash)).is_err(),
+        "Single load with wrong key must error"
+    );
     drop(store2);
 
     // Reopening with correct key succeeds
@@ -112,6 +121,7 @@ async fn test_legacy_json_auto_migration() {
         ratio: None,
         magnet_uri: None,
         raw_bencode_hex: None,
+        file_priorities: Vec::new(),
     };
 
     let legacy_file = torrents_dir.join(format!("{}.json", hex::encode(info_hash)));
@@ -133,7 +143,8 @@ async fn test_raw_bencode_hex_preservation_and_evicted_restore() {
     let store = Arc::new(SessionStore::new(tmp.path()).unwrap());
 
     let info_hash = [0xCC; 20];
-    let original_bencode_hex = hex::encode(b"d4:infod6:lengthi131072e4:name4:test12:piece lengthi16384e6:pieces0:ee");
+    let original_bencode_hex =
+        hex::encode(b"d4:infod6:lengthi131072e4:name4:test12:piece lengthi16384e6:pieces0:ee");
 
     let state1 = TorrentSessionState {
         info_hash_hex: hex::encode(info_hash),
@@ -149,6 +160,7 @@ async fn test_raw_bencode_hex_preservation_and_evicted_restore() {
         ratio: None,
         magnet_uri: None,
         raw_bencode_hex: Some(original_bencode_hex.clone()),
+        file_priorities: Vec::new(),
     };
 
     // 1. Initial save with raw_bencode_hex
@@ -161,7 +173,10 @@ async fn test_raw_bencode_hex_preservation_and_evicted_restore() {
     store.save_torrent(&state2).unwrap();
 
     // Verify raw_bencode_hex was preserved
-    let reloaded = store.load_torrent(&hex::encode(info_hash)).unwrap().unwrap();
+    let reloaded = store
+        .load_torrent(&hex::encode(info_hash))
+        .unwrap()
+        .unwrap();
     assert_eq!(reloaded.uploaded_bytes, 50000);
     assert_eq!(reloaded.raw_bencode_hex, Some(original_bencode_hex));
 
@@ -184,14 +199,21 @@ async fn test_swarm_stats_and_paused_preserved_across_restarts() {
     let store = Arc::new(SessionStore::new(tmp.path()).unwrap());
 
     let info_hash = [0xDD; 20];
-    let bencode_hex = hex::encode(b"d4:infod6:lengthi200000e4:name6:statsT12:piece lengthi16384e6:pieces0:ee");
+    let bencode_hex =
+        hex::encode(b"d4:infod6:lengthi200000e4:name6:statsT12:piece lengthi16384e6:pieces0:ee");
+
+    // Resume data is checked against the files on disk, so the completed torrent's data
+    // must really be there: 200 000 bytes = 13 pieces of 16 384 (the last one short).
+    let download_dir = tmp.path().join("dl");
+    std::fs::create_dir_all(&download_dir).unwrap();
+    std::fs::write(download_dir.join("statsT"), vec![0u8; 200_000]).unwrap();
 
     let state = TorrentSessionState {
         info_hash_hex: hex::encode(info_hash),
         name: "statsT".into(),
-        download_dir: "/downloads/statsT".into(),
-        bitfield_hex: hex::encode([0xFFu8; 2]),
-        total_pieces: 16,
+        download_dir: download_dir.to_string_lossy().into_owned(),
+        bitfield_hex: hex::encode([0xFFu8, 0xF8]),
+        total_pieces: 13,
         total_size: 200000,
         uploaded_bytes: 400000,
         downloaded_bytes: 200000,
@@ -200,6 +222,7 @@ async fn test_swarm_stats_and_paused_preserved_across_restarts() {
         ratio: Some(2.0),
         magnet_uri: None,
         raw_bencode_hex: Some(bencode_hex),
+        file_priorities: Vec::new(),
     };
 
     store.save_torrent(&state).unwrap();
@@ -214,11 +237,22 @@ async fn test_swarm_stats_and_paused_preserved_across_restarts() {
     {
         let s = handle1.stats.read();
         assert_eq!(s.uploaded_bytes, 400000, "Uploaded bytes must be preserved");
-        assert_eq!(s.downloaded_bytes, 200000, "Downloaded bytes must be preserved");
+        assert_eq!(
+            s.downloaded_bytes, 200000,
+            "Downloaded bytes must be preserved"
+        );
         assert!((s.ratio - 2.0).abs() < 1e-4, "Ratio must be preserved");
         assert_eq!(s.added_at, 1650000000, "added_at must be preserved");
-        assert_eq!(s.state, synapse_engine::SwarmState::Stopped, "Paused state must restore to Stopped");
-        assert_eq!(s.tier, synapse_engine::SwarmTier::Cold, "Paused state must restore to Cold tier");
+        assert_eq!(
+            s.state,
+            synapse_engine::SwarmState::Stopped,
+            "Paused state must restore to Stopped"
+        );
+        assert_eq!(
+            s.tier,
+            synapse_engine::SwarmTier::Cold,
+            "Paused state must restore to Cold tier"
+        );
     }
 
     // 2. Resume (unpause) the torrent and accumulate more uploaded bytes
@@ -240,12 +274,75 @@ async fn test_swarm_stats_and_paused_preserved_across_restarts() {
     let handle2 = engine2.get_torrent(&info_hash).unwrap();
     {
         let s = handle2.stats.read();
-        assert_eq!(s.uploaded_bytes, 600000, "New uploaded bytes must be preserved across 2nd restart");
+        assert_eq!(
+            s.uploaded_bytes, 600000,
+            "New uploaded bytes must be preserved across 2nd restart"
+        );
         assert_eq!(s.downloaded_bytes, 200000);
-        assert!((s.ratio - 3.0).abs() < 1e-4, "New ratio must be preserved across 2nd restart");
+        assert!(
+            (s.ratio - 3.0).abs() < 1e-4,
+            "New ratio must be preserved across 2nd restart"
+        );
         assert_eq!(s.added_at, 1650000000, "added_at must remain original");
         // Torrent was resumed (unpaused) before flush, so it should not be Stopped
         assert_ne!(s.state, synapse_engine::SwarmState::Stopped);
     }
 }
 
+#[tokio::test]
+async fn file_priorities_survive_a_restart_and_part_file_data_counts_as_present() {
+    let tmp = tempdir().unwrap();
+    let store = Arc::new(SessionStore::new(tmp.path()).unwrap());
+    let info_hash = [0xEE; 20];
+    // Two files, 20 000 B and 12 000 B, 16 384-byte pieces -> 2 pieces; piece 1 spans both.
+    let raw = b"d4:infod5:filesld6:lengthi20000e4:pathl1:aeed6:lengthi12000e4:pathl1:beee4:name1:t12:piece lengthi16384e6:pieces0:ee";
+    let download_dir = tmp.path().join("dl");
+    std::fs::create_dir_all(download_dir.join("t")).unwrap();
+    // Piece 0 lives wholly in `a`; piece 1 is a[16384..20000] + all of `b`. `b` was skipped, so
+    // its bytes are in the part file (recorded in the slice map) and `b` was never created.
+    std::fs::write(download_dir.join("t/a"), vec![0u8; 20_000]).unwrap();
+    let mut pfm = synapse_engine::part_file::PartFileManager::new(download_dir.clone(), info_hash);
+    pfm.set_file_priority(1, 0);
+    pfm.resolve_write_location(1, 0, 12_000, download_dir.join("t/b"));
+
+    store
+        .save_torrent(&TorrentSessionState {
+            info_hash_hex: hex::encode(info_hash),
+            name: "t".into(),
+            download_dir: download_dir.to_string_lossy().into_owned(),
+            bitfield_hex: hex::encode([0xC0u8]),
+            total_pieces: 2,
+            total_size: 32_000,
+            uploaded_bytes: 0,
+            downloaded_bytes: 32_000,
+            added_at: 1,
+            is_paused: true,
+            ratio: None,
+            magnet_uri: None,
+            raw_bencode_hex: Some(hex::encode(raw)),
+            file_priorities: vec![4, 0],
+        })
+        .unwrap();
+
+    let disk = Arc::new(DiskEngine::auto().await);
+    let engine = SwarmEngine::new(disk.clone(), [0x04; 20]).with_session_store(store.clone());
+    assert_eq!(engine.restore_session().unwrap(), 1);
+    assert_eq!(engine.get_file_priorities(&info_hash), Some(vec![4, 0]));
+    assert_eq!(
+        engine
+            .get_torrent(&info_hash)
+            .unwrap()
+            .stats
+            .read()
+            .progress,
+        1.0,
+        "the skipped file's boundary data is in the part file, so no piece is dropped"
+    );
+
+    // A priority change is persisted immediately and reloaded by the next engine.
+    assert!(engine.set_file_priority(&info_hash, 0, 0));
+    engine.flush_session().await;
+    let engine2 = SwarmEngine::new(disk, [0x05; 20]).with_session_store(store);
+    assert_eq!(engine2.restore_session().unwrap(), 1);
+    assert_eq!(engine2.get_file_priorities(&info_hash), Some(vec![0, 0]));
+}

@@ -72,20 +72,31 @@ max_open_files = 1024
 # TCP/UDP port for inbound peer connections (dual-stack: binds [::] first, falls back to
 # 0.0.0.0 on IPv6-unavailable hosts). 0 lets the OS pick an ephemeral port. Default: 54345
 listen_port = 54345
-# Specific interfaces to bind to, by name or address. Default: [] (all interfaces)
+# Specific local IP addresses to listen on (interface names are not supported). Default: [] (all interfaces)
 bind_interfaces = []
 # Default: true
 enable_ipv6 = true
-# Default: true — NOTE: as of this writing DHT bootstrap isn't actually wired into the
-# running daemon yet regardless of this flag (see CHANGELOG's "Known gaps" entry); newly
-# added torrents currently need inbound connections or a manually-connected peer to get
-# any data at all. Leave this set for forward-compatibility once that's built.
+# Enable the DHT (BEP 5) for public torrents. Private torrents never use it (BEP 27).
+# Default: true
 enable_dht = true
 # Enable Peer Exchange (PEX, BEP 11). Default: true
 enable_pex = true
 # Enable Local Peer Discovery (LSD / LPD, BEP 14). Default: true
 enable_lsd = true
-# One of: "prefer_encrypted", "require_encrypted", "disabled". Default: "prefer_encrypted"
+# Advertise and discover peers on the LAN with multicast DNS (Zeroconf, BEP 26). Default: false
+enable_zeroconf = false
+# Run the DHT in read-only mode (BEP 43): our queries carry ro=1 and we do not answer queries.
+# Can also be switched while the daemon runs. Default: false
+dht_read_only = false
+# The address to tell trackers we are reachable at, for VPN/NAT setups where the tracker would
+# otherwise see the wrong one. Default: unset (the tracker decides)
+# announce_ip = "203.0.113.5"
+# Peer-wire encryption (MSE / Protocol Encryption, BEP 8), applied to inbound and outbound
+# connections over both TCP and uTP.
+#   "prefer_encrypted"  - try MSE first, fall back to plaintext (default)
+#   "require_encrypted" - refuse plaintext peers in both directions
+#   "disabled"          - plaintext only; encrypted peers are refused
+# Default: "prefer_encrypted"
 encryption = "prefer_encrypted"
 # Default: 80
 max_peers_per_torrent = 80
@@ -254,3 +265,48 @@ initial_backoff_seconds = 30
 # Maximum exponential backoff ceiling in seconds for persistently failing peers.
 # Default: 600 (10 minutes)
 max_backoff_seconds = 600
+
+# --- Optional features ---------------------------------------------------------------------
+
+# Outbound proxy for peer connections and for HTTP requests (trackers, web seeds, RSS, search,
+# update feeds). UDP trackers, uTP and the DHT cannot use it: they are not used for traffic that a
+# proxy is configured to carry, and `force_proxy` turns them (and the listener) off entirely.
+[proxy]
+# "none", "socks5" or "http" (HTTP CONNECT). Default: "none"
+type = "none"
+# host = "127.0.0.1"
+# port = 1080
+# username = "user"
+# password = "secret"
+proxy_peer_connections = true
+proxy_tracker_connections = true
+# Let the proxy resolve host names, so no DNS query leaves this host.
+proxy_hostnames = true
+# Anonymous mode: no listening socket, DHT, LSD, zeroconf, uTP or port mapping.
+force_proxy = false
+
+# Signed torrents (BEP 35). Certificates (*.pem, *.crt, *.der, *.cer) and RSA public keys (*.pub)
+# in this directory are trusted signers; the file name is the signer's name.
+[signing]
+# trusted_signers_dir = "/etc/synapse/trusted-signers"
+# Refuse to add any torrent that is not validly signed by a trusted signer.
+require_trusted_signature = false
+
+# Torrent RSS / Atom feeds (BEP 36).
+[rss]
+enabled = false
+poll_interval_secs = 900
+# [[rss.feeds]]
+# url = "https://example.org/releases.rss"
+# name = "Example releases"
+# auto_download = true
+# filter = "1080p"      # case-insensitive substring the title must contain
+
+# Search engines (BEP 18): .btsearch descriptions, as file paths or http(s) URLs.
+[search]
+engines = []
+
+# Updates through a torrent's update-url (BEP 39).
+[updates]
+enabled = false
+check_interval_secs = 86400

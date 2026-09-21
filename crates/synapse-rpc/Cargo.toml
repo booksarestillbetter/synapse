@@ -37,4 +37,5 @@ synapse-tracker = { path = "../synapse-tracker" }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 tower = { version = "0.5", features = ["util"] }
+tempfile = "3"
 diskio = { package = "synapse-diskio", path = "../synapse-diskio" }

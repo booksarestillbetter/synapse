@@ -7,13 +7,16 @@ publish.workspace = true
 description = "Torrent state machine: wires peer connections, the piece picker/choker, and the disk engine together. See doc/REWRITE_ROADMAP.md."
 
 [dependencies]
+socket2 = "0.6"
 tokio = { workspace = true, features = ["net", "io-util", "process"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 futures = "0.3"
+base64 = "0.22"
 bytes = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 sha1 = "0.10"
+sha2 = "0.10"
 synapse-wire = { path = "../synapse-wire" }
 synapse-meta = { path = "../synapse-meta" }
 synapse-tracker = { path = "../synapse-tracker" }

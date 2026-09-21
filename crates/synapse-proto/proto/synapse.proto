@@ -8,6 +8,7 @@ service SynapseControl {
 
   // --- Tier 2: Deep Per-Torrent Inspection (Opt-In) ---
   rpc SubscribeTorrentDetail(TorrentDetailRequest) returns (stream TorrentDetailEvent);
+  rpc SubscribeAlerts(SubscribeAlertsRequest) returns (stream AlertEvent);
 
   // --- Unary Swarm Commands ---
   rpc AddTorrent(AddTorrentRequest) returns (AddTorrentResponse);
@@ -299,6 +300,11 @@ message SessionSettingsResponse {
   bool start_added_torrents = 32;
   bool trash_original_torrent_files = 33;
   bool is_alt_speed_active = 34;
+  bool enable_utp = 35;
+  bool dht_read_only = 36;
+  bool zeroconf_enabled = 37;
+  // Address announced to trackers; empty when unset.
+  string announce_ip = 38;
 }
 
 message UpdateSessionSettingsRequest {
@@ -343,6 +349,11 @@ message UpdateSessionSettingsRequest {
   optional uint32 peer_port = 34;
   optional string rpc_listen_addr = 35;
   optional string http_listen_addr = 36;
+  optional bool enable_utp = 37;
+  optional bool dht_read_only = 38;
+  optional bool zeroconf_enabled = 39;
+  // An address to announce to trackers; an empty string clears it.
+  optional string announce_ip = 40;
 }
 
 message UpdateSessionSettingsResponse {
@@ -351,3 +362,13 @@ message UpdateSessionSettingsResponse {
   optional string error = 3;
 }
 
+message SubscribeAlertsRequest {
+  optional string info_hash = 1;
+}
+
+message AlertEvent {
+  string event_type = 1;
+  string payload_json = 2;
+  int64 timestamp_ms = 3;
+  optional string info_hash = 4;
+}

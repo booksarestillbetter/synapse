@@ -36,6 +36,11 @@ pub struct Config {
     pub bandwidth: BandwidthConfig,
     pub web: WebConfig,
     pub circuit_breaker: CircuitBreakerConfig,
+    pub rss: RssConfig,
+    pub signing: SigningConfig,
+    pub search: SearchConfig,
+    pub updates: UpdatesConfig,
+    pub proxy: ProxyConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -124,7 +129,6 @@ pub struct AltSpeedConfig {
     pub time_days: u32,
 }
 
-
 impl Default for AltSpeedConfig {
     fn default() -> Self {
         Self {
@@ -132,9 +136,9 @@ impl Default for AltSpeedConfig {
             download_limit_bytes: 500_000, // 500 KB/s
             upload_limit_bytes: 100_000,   // 100 KB/s
             time_enabled: false,
-            time_begin_minutes: 540,       // 09:00 AM (minutes from midnight)
-            time_end_minutes: 1020,        // 05:00 PM (minutes from midnight)
-            time_days: 127,                // All days (bitmask)
+            time_begin_minutes: 540, // 09:00 AM (minutes from midnight)
+            time_end_minutes: 1020,  // 05:00 PM (minutes from midnight)
+            time_days: 127,          // All days (bitmask)
         }
     }
 }
@@ -317,7 +321,8 @@ where
         type Value = Option<u64>;
 
         fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-            formatter.write_str("optional bandwidth bitrate string like '50m', '1g', or integer bytes")
+            formatter
+                .write_str("optional bandwidth bitrate string like '50m', '1g', or integer bytes")
         }
 
         fn visit_none<E>(self) -> Result<Option<u64>, E>
@@ -374,7 +379,9 @@ where
         where
             E: serde::de::Error,
         {
-            parse_bandwidth_to_bytes(value).map(Some).map_err(serde::de::Error::custom)
+            parse_bandwidth_to_bytes(value)
+                .map(Some)
+                .map_err(serde::de::Error::custom)
         }
     }
 
@@ -394,7 +401,10 @@ impl Default for HttpApiConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            listen_addr: SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)), 8080),
+            listen_addr: SocketAddr::new(
+                std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
+                8080,
+            ),
             cors_enabled: true,
             auth_token: None,
         }
@@ -503,8 +513,18 @@ pub struct NetworkConfig {
     pub bind_interfaces: Vec<String>,
     pub enable_ipv6: bool,
     pub enable_dht: bool,
+    /// BEP 43: Run DHT in read-only mode (adds ro=1 to queries, does not answer queries).
+    pub dht_read_only: bool,
     pub enable_pex: bool,
     pub enable_lsd: bool,
+    /// BEP 26: advertise and discover peers on the LAN with multicast DNS.
+    pub enable_zeroconf: bool,
+    /// The address to tell trackers we are reachable at (VPN, NAT or a reverse-proxy setup where
+    /// the tracker would otherwise see the wrong one). Empty means let the tracker decide.
+    pub announce_ip: Option<std::net::IpAddr>,
+    /// Enable BEP 29 Micro Transport Protocol (uTP) and LEDBAT congestion control.
+    pub enable_utp: bool,
+    /// Peer-wire encryption preference: "plaintext_only", "prefer_encrypted", or "forced_encrypted".
     pub encryption: String,
     pub max_peers_per_torrent: usize,
     pub max_global_peers: usize,
@@ -514,6 +534,17 @@ pub struct NetworkConfig {
     /// Optional path to an `ipfilter.dat`-style blocklist file (eMule/PeerGuardian range
     /// format or plain CIDR, one rule per line), merged with `blocked_ip_ranges` at startup.
     pub ip_filter_file: Option<String>,
+    /// Allow web seed (`url-list`) URLs that resolve to loopback/private addresses. Off by
+    /// default: web seed URLs come from the torrent, and a hostile torrent must not be able
+    /// to make the daemon issue requests to services on its own network. Enable it only if
+    /// you host web seed mirrors on your LAN.
+    pub allow_local_web_seeds: bool,
+    /// Also announce public (non-private) torrents to a built-in list of well-known public
+    /// trackers, in addition to the ones the torrent lists. Off by default because it reveals
+    /// every public torrent's info hash to third-party trackers you did not choose.
+    pub enable_fallback_trackers: bool,
+    /// Enable automatic port forwarding on the gateway via PCP, NAT-PMP and UPnP-IGD.
+    pub enable_nat: bool,
 }
 
 impl Default for NetworkConfig {
@@ -523,13 +554,20 @@ impl Default for NetworkConfig {
             bind_interfaces: Vec::new(),
             enable_ipv6: true,
             enable_dht: true,
+            dht_read_only: false,
             enable_pex: true,
             enable_lsd: true,
+            enable_zeroconf: false,
+            announce_ip: None,
+            enable_utp: true,
             encryption: "prefer_encrypted".to_string(),
             max_peers_per_torrent: 80,
             max_global_peers: 2000,
             blocked_ip_ranges: Vec::new(),
             ip_filter_file: None,
+            allow_local_web_seeds: false,
+            enable_fallback_trackers: false,
+            enable_nat: true,
         }
     }
 }
@@ -550,6 +588,120 @@ impl Default for CircuitBreakerConfig {
             failure_threshold: 3,
             initial_backoff_seconds: 30,
             max_backoff_seconds: 600,
+        }
+    }
+}
+
+/// An outbound proxy for peer and HTTP traffic.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProxyConfig {
+    /// `none`, `socks5` or `http` (HTTP CONNECT).
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub host: String,
+    pub port: u16,
+    pub username: Option<String>,
+    pub password: Option<String>,
+    /// Open peer connections through the proxy (turns uTP off, since uTP is UDP).
+    pub proxy_peer_connections: bool,
+    /// Send tracker, web seed, RSS, search and update HTTP requests through the proxy (UDP
+    /// trackers are then not used).
+    pub proxy_tracker_connections: bool,
+    /// Let the proxy resolve host names, so no DNS lookup leaves this host (SOCKS5h).
+    pub proxy_hostnames: bool,
+    /// Anonymous mode: no DHT, LSD, zeroconf, uTP, port mapping or listening sockets, so nothing
+    /// can bypass the proxy.
+    pub force_proxy: bool,
+}
+
+impl Default for ProxyConfig {
+    fn default() -> Self {
+        Self {
+            kind: "none".into(),
+            host: String::new(),
+            port: 1080,
+            username: None,
+            password: None,
+            proxy_peer_connections: true,
+            proxy_tracker_connections: true,
+            proxy_hostnames: true,
+            force_proxy: false,
+        }
+    }
+}
+
+/// BEP 39 torrent updates.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UpdatesConfig {
+    /// Periodically ask the `update-url` of torrents that have one.
+    pub enabled: bool,
+    pub check_interval_secs: u64,
+}
+
+impl Default for UpdatesConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            check_interval_secs: 86_400,
+        }
+    }
+}
+
+/// BEP 18 search engines.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SearchConfig {
+    /// `.btsearch` descriptions, as file paths or http(s) URLs.
+    pub engines: Vec<String>,
+}
+
+/// BEP 35 signed torrents.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SigningConfig {
+    /// Directory of trusted signer certificates (`*.pem`, `*.crt`, `*.der`, `*.cer`) and RSA
+    /// public keys (`*.pub`). The file name (without extension) is the signer's name.
+    pub trusted_signers_dir: Option<PathBuf>,
+    /// Refuse to add any torrent that is not validly signed by a trusted signer.
+    pub require_trusted_signature: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RssConfig {
+    pub enabled: bool,
+    pub poll_interval_secs: u64,
+    pub feeds: Vec<RssFeedConfig>,
+}
+
+impl Default for RssConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            poll_interval_secs: 900,
+            feeds: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct RssFeedConfig {
+    pub url: String,
+    pub name: Option<String>,
+    pub auto_download: bool,
+    pub filter: Option<String>,
+}
+
+impl Default for RssFeedConfig {
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            name: None,
+            auto_download: true,
+            filter: None,
         }
     }
 }
@@ -810,7 +962,9 @@ impl Config {
     /// Overlays settings from `SYNAPSE_*` environment variables onto this configuration.
     pub fn apply_env_overrides(&mut self) {
         // Disk
-        if let Ok(val) = std::env::var("SYNAPSE_ROOT_DIR").or_else(|_| std::env::var("SYNAPSE_DATA_DIR")) {
+        if let Ok(val) =
+            std::env::var("SYNAPSE_ROOT_DIR").or_else(|_| std::env::var("SYNAPSE_DATA_DIR"))
+        {
             self.disk.root_dir = Some(PathBuf::from(val));
         }
         if let Ok(val) = std::env::var("SYNAPSE_DOWNLOAD_DIR") {
@@ -837,8 +991,8 @@ impl Config {
         }
 
         // Network
-        if let Ok(val) = std::env::var("SYNAPSE_PEER_PORT")
-            .or_else(|_| std::env::var("SYNAPSE_LISTEN_PORT"))
+        if let Ok(val) =
+            std::env::var("SYNAPSE_PEER_PORT").or_else(|_| std::env::var("SYNAPSE_LISTEN_PORT"))
         {
             if let Ok(port) = val.parse::<u16>() {
                 self.network.listen_port = port;
@@ -854,9 +1008,22 @@ impl Config {
                 self.network.enable_dht = b;
             }
         }
+        if let Ok(val) = std::env::var("SYNAPSE_DHT_READ_ONLY") {
+            if let Ok(b) = val.parse::<bool>() {
+                self.network.dht_read_only = b;
+            }
+        }
         if let Ok(val) = std::env::var("SYNAPSE_ENABLE_PEX") {
             if let Ok(b) = val.parse::<bool>() {
                 self.network.enable_pex = b;
+            }
+        }
+        if let Ok(val) = std::env::var("SYNAPSE_ANNOUNCE_IP") {
+            self.network.announce_ip = val.trim().parse().ok();
+        }
+        if let Ok(val) = std::env::var("SYNAPSE_ENABLE_ZEROCONF") {
+            if let Ok(b) = val.parse::<bool>() {
+                self.network.enable_zeroconf = b;
             }
         }
         if let Ok(val) = std::env::var("SYNAPSE_ENABLE_LSD") {
@@ -877,6 +1044,11 @@ impl Config {
                 self.network.max_global_peers = n;
             }
         }
+        if let Ok(val) = std::env::var("SYNAPSE_RSS_ENABLED") {
+            if let Ok(b) = val.parse::<bool>() {
+                self.rss.enabled = b;
+            }
+        }
 
         // RPC & HTTP
         if let Ok(val) = std::env::var("SYNAPSE_RPC_LISTEN_ADDR") {
@@ -889,7 +1061,9 @@ impl Config {
             self.rpc.auth_token = Some(val.clone());
             self.http_api.auth_token = Some(val);
         }
-        if let Ok(val) = std::env::var("SYNAPSE_HTTP_ENABLED").or_else(|_| std::env::var("SYNAPSE_HTTP_API_ENABLED")) {
+        if let Ok(val) = std::env::var("SYNAPSE_HTTP_ENABLED")
+            .or_else(|_| std::env::var("SYNAPSE_HTTP_API_ENABLED"))
+        {
             if let Ok(b) = val.parse::<bool>() {
                 self.http_api.enabled = b;
             }
@@ -1133,8 +1307,14 @@ mod tests {
         let cfg = Config::load(Some(&path)).unwrap();
         assert_eq!(cfg.log_level, LogLevel::Debug);
         assert_eq!(cfg.disk.max_open_files, 100);
-        assert_eq!(cfg.disk.download_dir, PathBuf::from("/tmp/synapse-downloads"));
-        assert_eq!(cfg.disk.incomplete_dir, Some(PathBuf::from("/tmp/synapse-incomplete")));
+        assert_eq!(
+            cfg.disk.download_dir,
+            PathBuf::from("/tmp/synapse-downloads")
+        );
+        assert_eq!(
+            cfg.disk.incomplete_dir,
+            Some(PathBuf::from("/tmp/synapse-incomplete"))
+        );
         assert!(cfg.disk.incomplete_dir_enabled);
         assert_eq!(cfg.queue.download_queue_size, 8);
         assert_eq!(cfg.queue.seed_queue_size, 15);
@@ -1201,10 +1381,22 @@ mod tests {
 
         let cfg = Config::load(Some(&path)).unwrap();
         assert_eq!(cfg.disk.root_dir, Some(PathBuf::from("/mnt/shared/media")));
-        assert_eq!(cfg.disk.download_dir, PathBuf::from("/mnt/shared/media/downloads"));
-        assert_eq!(cfg.disk.incomplete_dir, Some(PathBuf::from("/mnt/shared/media/incomplete")));
-        assert_eq!(cfg.disk.watch_dir, Some(PathBuf::from("/mnt/shared/media/watch")));
-        assert_eq!(cfg.disk.session_dir, PathBuf::from("/mnt/shared/media/session"));
+        assert_eq!(
+            cfg.disk.download_dir,
+            PathBuf::from("/mnt/shared/media/downloads")
+        );
+        assert_eq!(
+            cfg.disk.incomplete_dir,
+            Some(PathBuf::from("/mnt/shared/media/incomplete"))
+        );
+        assert_eq!(
+            cfg.disk.watch_dir,
+            Some(PathBuf::from("/mnt/shared/media/watch"))
+        );
+        assert_eq!(
+            cfg.disk.session_dir,
+            PathBuf::from("/mnt/shared/media/session")
+        );
     }
 
     #[test]
@@ -1219,7 +1411,10 @@ mod tests {
         assert_eq!(parse_bandwidth_to_bytes("50M").unwrap(), 6_250_000);
         assert_eq!(parse_bandwidth_to_bytes("  1G  ").unwrap(), 125_000_000);
         assert_eq!(parse_bandwidth_to_bytes("50 mbps").unwrap(), 6_250_000);
-        assert_eq!(parse_bandwidth_to_bytes("1000 mbit/s").unwrap(), 125_000_000);
+        assert_eq!(
+            parse_bandwidth_to_bytes("1000 mbit/s").unwrap(),
+            125_000_000
+        );
         assert_eq!(parse_bandwidth_to_bytes("100k").unwrap(), 12_500);
 
         // Floats
@@ -1280,7 +1475,8 @@ mod tests {
         let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         let example_path = manifest_dir.join("../../example_config.toml");
         if example_path.exists() {
-            let cfg = Config::load(Some(&example_path)).expect("example_config.toml must be valid syntax and parse cleanly");
+            let cfg = Config::load(Some(&example_path))
+                .expect("example_config.toml must be valid syntax and parse cleanly");
             assert!(cfg.queue.download_queue_enabled);
             assert!(cfg.network.enable_pex);
             assert!(cfg.network.enable_lsd);
@@ -1318,7 +1514,10 @@ mod tests {
             parsed.web.listen_addr,
             Some("0.0.0.0:9091".parse().unwrap())
         );
-        assert_eq!(parsed.web.web_root, Some(PathBuf::from("/var/www/synapse-custom")));
+        assert_eq!(
+            parsed.web.web_root,
+            Some(PathBuf::from("/var/www/synapse-custom"))
+        );
     }
 
     #[test]
@@ -1343,4 +1542,3 @@ mod tests {
         assert_eq!(parsed.circuit_breaker.max_backoff_seconds, 300);
     }
 }
-

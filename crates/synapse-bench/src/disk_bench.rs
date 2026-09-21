@@ -6,7 +6,10 @@ use tempfile::tempdir;
 use tracing::info;
 
 pub async fn run_disk_benchmark(total_mb: usize, block_size_kb: usize) {
-    info!("🧪 Starting Disk I/O Subsystem Benchmark (Data: {} MB, Block: {} KB)", total_mb, block_size_kb);
+    info!(
+        "🧪 Starting Disk I/O Subsystem Benchmark (Data: {} MB, Block: {} KB)",
+        total_mb, block_size_kb
+    );
 
     let tmp = tempdir().expect("Failed to create tempdir");
     let target_file = Arc::new(tmp.path().join("bench_payload.dat"));
@@ -30,29 +33,48 @@ pub async fn run_disk_benchmark(total_mb: usize, block_size_kb: usize) {
         });
     }
 
-    engine.write_batch(write_jobs).await.expect("Write batch failed");
+    engine
+        .write_batch(write_jobs)
+        .await
+        .expect("Write batch failed");
     engine.sync(target_file.clone()).await.expect("Sync failed");
     let write_duration = start_write.elapsed();
     let write_throughput = (total_mb as f64) / write_duration.as_secs_f64();
-    info!("✅ Sequential Write: {} MB in {:.3}s ({:.1} MB/s)", total_mb, write_duration.as_secs_f64(), write_throughput);
+    info!(
+        "✅ Sequential Write: {} MB in {:.3}s ({:.1} MB/s)",
+        total_mb,
+        write_duration.as_secs_f64(),
+        write_throughput
+    );
 
     // Sequential Read Benchmark
     let start_read = Instant::now();
     for i in 0..block_count {
         let offset = (i * block_size) as u64;
-        let read_buf = engine.read(ReadJob {
-            path: target_file.clone(),
-            offset,
-            len: block_size,
-        }).await.expect("Read block failed");
+        let read_buf = engine
+            .read(ReadJob {
+                path: target_file.clone(),
+                offset,
+                len: block_size,
+            })
+            .await
+            .expect("Read block failed");
         assert_eq!(read_buf.len(), block_size);
     }
     let read_duration = start_read.elapsed();
     let read_throughput = (total_mb as f64) / read_duration.as_secs_f64();
-    info!("✅ Sequential Read: {} MB in {:.3}s ({:.1} MB/s)", total_mb, read_duration.as_secs_f64(), read_throughput);
+    info!(
+        "✅ Sequential Read: {} MB in {:.3}s ({:.1} MB/s)",
+        total_mb,
+        read_duration.as_secs_f64(),
+        read_throughput
+    );
 
     println!("\n========================================================");
-    println!("📊 SYNAPSE 2.0 DISK I/O ENGINE BENCHMARK (Size: {} MB)", total_mb);
+    println!(
+        "📊 SYNAPSE 2.0 DISK I/O ENGINE BENCHMARK (Size: {} MB)",
+        total_mb
+    );
     println!("========================================================");
     println!("  • Block Size:            {:>10} KB", block_size_kb);
     println!("  • Total Blocks:          {:>10}", block_count);

@@ -43,7 +43,7 @@ Synapse 2.0 is a zero-allocation, ultra-high-density BitTorrent engine and daemo
 |  +-----------------------------v-------------------------------------------------------------+  |
 |  | Subsystems & Persistence:                                                                 |  |
 |  | - SessionStore: Encrypted redb ACID database (ChaCha20-Poly1305 AEAD)                     |  |
-|  | - NatManager: UPnP-IGD & NAT-PMP port mapper                                              |  |
+|  | - NatManager: PCP, NAT-PMP and UPnP port mapper                                       |  |
 |  | - LsdManager: SSDP local multicast peer discovery (BEP 14/22)                            |  |
 |  | - PexManager: Gossip delta exchange (BEP 11)                                              |  |
 |  | - WebSeedManager: HTTP/HTTPS piece mirror engine (BEP 19, BEP 17)                         |  |

@@ -66,13 +66,16 @@ impl SynapseService {
                     }
                 }
             }
-            return Err(Status::unauthenticated("Invalid or missing authorization token"));
+            return Err(Status::unauthenticated(
+                "Invalid or missing authorization token",
+            ));
         }
         Ok(())
     }
 
     pub fn upsert_torrent(&self, summary: TorrentSummary) {
-        self.active_summaries.insert(summary.hash.clone(), summary.clone());
+        self.active_summaries
+            .insert(summary.hash.clone(), summary.clone());
         self.event_bus.emit_summary_added(summary);
     }
 
@@ -90,7 +93,9 @@ impl SynapseService {
     /// reactively. `SubscribeTorrents`/`GetSessionStats`'s streaming sibling both read from the
     /// state this keeps current, not from the engine directly.
     pub fn sync_from_engine(&self) {
-        let Some(ref engine) = self.swarm_engine else { return };
+        let Some(ref engine) = self.swarm_engine else {
+            return;
+        };
         let live = engine.list_torrents();
         let mut seen = std::collections::HashSet::with_capacity(live.len());
 
@@ -128,11 +133,22 @@ impl SynapseService {
     /// `session_stats` so `SubscribeSessionStats` (the streaming sibling that was still
     /// hardcoded at its `SynapseService::new()` default forever) reflects reality too.
     pub fn refresh_session_stats(&self) {
-        let Some(ref engine) = self.swarm_engine else { return };
+        let Some(ref engine) = self.swarm_engine else {
+            return;
+        };
         let swarms = engine.list_torrents();
-        let downloading = swarms.iter().filter(|s| matches!(s.state, synapse_engine::SwarmState::Downloading)).count() as u32;
-        let seeding = swarms.iter().filter(|s| matches!(s.state, synapse_engine::SwarmState::Seeding)).count() as u32;
-        let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as i64;
+        let downloading = swarms
+            .iter()
+            .filter(|s| matches!(s.state, synapse_engine::SwarmState::Downloading))
+            .count() as u32;
+        let seeding = swarms
+            .iter()
+            .filter(|s| matches!(s.state, synapse_engine::SwarmState::Seeding))
+            .count() as u32;
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
         let free_space = engine.free_disk_space_bytes();
         self.update_stats(SessionStatsUpdate {
             rate_download: swarms.iter().map(|s| s.download_rate).sum(),
@@ -188,7 +204,11 @@ fn circuit_state_to_proto(state: synapse_tracker::CircuitState) -> CircuitBreake
     }
 }
 
-fn host_status_to_proto(host: String, breaker: &synapse_tracker::CanaryCircuitBreaker, info: synapse_tracker::HostCircuitInfo) -> CircuitBreakerStatus {
+fn host_status_to_proto(
+    host: String,
+    breaker: &synapse_tracker::CanaryCircuitBreaker,
+    info: synapse_tracker::HostCircuitInfo,
+) -> CircuitBreakerStatus {
     CircuitBreakerStatus {
         host,
         state: circuit_state_to_proto(info.state) as i32,
@@ -202,7 +222,10 @@ fn host_status_to_proto(host: String, breaker: &synapse_tracker::CanaryCircuitBr
 /// `None` when nothing actually changed — callers use this to avoid emitting a no-op delta
 /// every sync tick for a torrent that's genuinely idle (e.g. fully seeded, no peers).
 fn diff_summary(old: &TorrentSummary, new: &TorrentSummary) -> Option<TorrentDelta> {
-    let mut delta = TorrentDelta { hash: new.hash.clone(), ..Default::default() };
+    let mut delta = TorrentDelta {
+        hash: new.hash.clone(),
+        ..Default::default()
+    };
     let mut changed = false;
 
     if (old.progress - new.progress).abs() > f32::EPSILON {
@@ -254,16 +277,19 @@ fn diff_summary(old: &TorrentSummary, new: &TorrentSummary) -> Option<TorrentDel
 
 #[tonic::async_trait]
 impl SynapseControl for SynapseService {
-    type SubscribeTorrentsStream = Pin<
-        Box<dyn Stream<Item = Result<TorrentListEvent, Status>> + Send + 'static>,
-    >;
+    type SubscribeTorrentsStream =
+        Pin<Box<dyn Stream<Item = Result<TorrentListEvent, Status>> + Send + 'static>>;
 
     async fn subscribe_torrents(
         &self,
         request: Request<SubscribeTorrentsRequest>,
     ) -> Result<Response<Self::SubscribeTorrentsStream>, Status> {
         let req = request.into_inner();
-        let chunk_size = if req.chunk_size == 0 { 500 } else { req.chunk_size as usize };
+        let chunk_size = if req.chunk_size == 0 {
+            500
+        } else {
+            req.chunk_size as usize
+        };
 
         let summaries: Vec<TorrentSummary> = self
             .active_summaries
@@ -271,10 +297,8 @@ impl SynapseControl for SynapseService {
             .map(|r| r.value().clone())
             .collect();
 
-        let chunks: Vec<Vec<TorrentSummary>> = summaries
-            .chunks(chunk_size)
-            .map(|c| c.to_vec())
-            .collect();
+        let chunks: Vec<Vec<TorrentSummary>> =
+            summaries.chunks(chunk_size).map(|c| c.to_vec()).collect();
 
         let total_chunks = chunks.len().max(1) as u32;
         let mut snapshot_events = Vec::new();
@@ -323,9 +347,8 @@ impl SynapseControl for SynapseService {
         Ok(Response::new(Box::pin(combined)))
     }
 
-    type SubscribeSessionStatsStream = Pin<
-        Box<dyn Stream<Item = Result<SessionStatsUpdate, Status>> + Send + 'static>,
-    >;
+    type SubscribeSessionStatsStream =
+        Pin<Box<dyn Stream<Item = Result<SessionStatsUpdate, Status>> + Send + 'static>>;
 
     async fn subscribe_session_stats(
         &self,
@@ -348,9 +371,8 @@ impl SynapseControl for SynapseService {
         Ok(Response::new(Box::pin(stream)))
     }
 
-    type SubscribeTorrentDetailStream = Pin<
-        Box<dyn Stream<Item = Result<TorrentDetailEvent, Status>> + Send + 'static>,
-    >;
+    type SubscribeTorrentDetailStream =
+        Pin<Box<dyn Stream<Item = Result<TorrentDetailEvent, Status>> + Send + 'static>>;
 
     async fn subscribe_torrent_detail(
         &self,
@@ -358,7 +380,11 @@ impl SynapseControl for SynapseService {
     ) -> Result<Response<Self::SubscribeTorrentDetailStream>, Status> {
         let req = request.into_inner();
         let hash = req.hash;
-        let interval_ms = if req.refresh_interval_ms == 0 { 1000 } else { req.refresh_interval_ms as u64 };
+        let interval_ms = if req.refresh_interval_ms == 0 {
+            1000
+        } else {
+            req.refresh_interval_ms as u64
+        };
         let swarm_opt = self.swarm_engine.clone();
 
         let stream = async_stream::stream! {
@@ -522,6 +548,72 @@ impl SynapseControl for SynapseService {
         Ok(Response::new(Box::pin(stream)))
     }
 
+    type SubscribeAlertsStream =
+        Pin<Box<dyn Stream<Item = Result<AlertEvent, Status>> + Send + 'static>>;
+
+    async fn subscribe_alerts(
+        &self,
+        request: Request<SubscribeAlertsRequest>,
+    ) -> Result<Response<Self::SubscribeAlertsStream>, Status> {
+        let req = request.into_inner();
+        let filter_hash = req.info_hash.and_then(|h| {
+            let trimmed = h.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                hex::decode(trimmed).ok().and_then(|bytes| {
+                    if bytes.len() == 20 {
+                        let mut arr = [0u8; 20];
+                        arr.copy_from_slice(&bytes);
+                        Some(arr)
+                    } else {
+                        None
+                    }
+                })
+            }
+        });
+
+        let rx_opt = self.swarm_engine.as_ref().map(|s| s.subscribe_alerts());
+
+        let stream = async_stream::stream! {
+            if let Some(mut rx) = rx_opt {
+                loop {
+                    match rx.recv().await {
+                        Ok(alert) => {
+                            if let Some(ref filter) = filter_hash {
+                                if *filter != alert.info_hash() {
+                                    continue;
+                                }
+                            }
+                            let now_ms = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_millis() as i64;
+                            let json = crate::http_api::alert_to_json(&alert);
+                            let event_type = json["type"].as_str().unwrap_or("alert").to_string();
+                            let info_hash_hex = hex::encode(alert.info_hash());
+
+                            yield Ok(AlertEvent {
+                                event_type,
+                                payload_json: json.to_string(),
+                                timestamp_ms: now_ms,
+                                info_hash: Some(info_hash_hex),
+                            });
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_skipped)) => {
+                            continue;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            break;
+                        }
+                    }
+                }
+            }
+        };
+
+        Ok(Response::new(Box::pin(stream)))
+    }
+
     async fn add_torrent(
         &self,
         request: Request<AddTorrentRequest>,
@@ -530,7 +622,12 @@ impl SynapseControl for SynapseService {
         let (hash, name, total_size, info_opt) = match req.source {
             Some(add_torrent_request::Source::MagnetUri(uri)) => {
                 if let Ok(info) = synapse_meta::Info::from_magnet(&uri) {
-                    (hex::encode(info.hash), info.name.clone(), info.total_len, Some(info))
+                    (
+                        hex::encode(info.hash),
+                        info.name.clone(),
+                        info.total_len,
+                        Some(info),
+                    )
                 } else {
                     return Ok(Response::new(AddTorrentResponse {
                         success: false,
@@ -541,9 +638,22 @@ impl SynapseControl for SynapseService {
                 }
             }
             Some(add_torrent_request::Source::TorrentBytes(bytes)) => {
+                if bytes.len() > synapse_meta::MAX_TORRENT_FILE_BYTES {
+                    return Ok(Response::new(AddTorrentResponse {
+                        success: false,
+                        hash: String::new(),
+                        name: String::new(),
+                        error: Some("Torrent payload exceeds the maximum accepted size".into()),
+                    }));
+                }
                 if let Ok(bencode) = synapse_bencode::decode_buf(&bytes) {
                     if let Ok(info) = synapse_meta::Info::from_bencode(bencode) {
-                        (hex::encode(info.hash), info.name.clone(), info.total_len, Some(info))
+                        (
+                            hex::encode(info.hash),
+                            info.name.clone(),
+                            info.total_len,
+                            Some(info),
+                        )
                     } else {
                         return Ok(Response::new(AddTorrentResponse {
                             success: false,
@@ -563,7 +673,12 @@ impl SynapseControl for SynapseService {
             }
             Some(add_torrent_request::Source::TorrentUrl(url)) => {
                 match crate::url_fetcher::fetch_or_parse_torrent(&url).await {
-                    Ok(info) => (hex::encode(info.hash), info.name.clone(), info.total_len, Some(info)),
+                    Ok(info) => (
+                        hex::encode(info.hash),
+                        info.name.clone(),
+                        info.total_len,
+                        Some(info),
+                    ),
                     Err(e) => {
                         return Ok(Response::new(AddTorrentResponse {
                             success: false,
@@ -575,11 +690,16 @@ impl SynapseControl for SynapseService {
                 }
             }
             Some(add_torrent_request::Source::FilePath(path)) => {
-                match tokio::fs::read(&path).await {
+                match crate::url_fetcher::read_torrent_file(std::path::Path::new(&path)).await {
                     Ok(bytes) => {
                         if let Ok(bencode) = synapse_bencode::decode_buf(&bytes) {
                             if let Ok(info) = synapse_meta::Info::from_bencode(bencode) {
-                                (hex::encode(info.hash), info.name.clone(), info.total_len, Some(info))
+                                (
+                                    hex::encode(info.hash),
+                                    info.name.clone(),
+                                    info.total_len,
+                                    Some(info),
+                                )
                             } else {
                                 return Ok(Response::new(AddTorrentResponse {
                                     success: false,
@@ -616,7 +736,13 @@ impl SynapseControl for SynapseService {
             .unwrap_or_else(|| {
                 self.swarm_engine
                     .as_ref()
-                    .map(|s| s.settings().read().download_dir.to_string_lossy().into_owned())
+                    .map(|s| {
+                        s.settings()
+                            .read()
+                            .download_dir
+                            .to_string_lossy()
+                            .into_owned()
+                    })
                     .unwrap_or_else(|| "/downloads".into())
             });
 
@@ -635,6 +761,14 @@ impl SynapseControl for SynapseService {
 
         if let Some(info) = info_opt {
             if let Some(ref swarm) = self.swarm_engine {
+                if let Err(error) = swarm.check_signature_policy(&info) {
+                    return Ok(Response::new(AddTorrentResponse {
+                        success: false,
+                        hash: String::new(),
+                        name: String::new(),
+                        error: Some(error),
+                    }));
+                }
                 let info_hash = info.hash;
                 swarm.add_torrent(Arc::new(info), std::path::PathBuf::from(&dl_dir), None);
                 if start_paused {
@@ -661,7 +795,10 @@ impl SynapseControl for SynapseService {
             ratio: 0.0,
             error_message: None,
             download_dir: dl_dir,
-            added_at: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64,
+            added_at: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64,
             piece_count,
             piece_size,
         };
@@ -950,6 +1087,10 @@ impl SynapseControl for SynapseService {
             start_added_torrents: s.start_added_torrents,
             trash_original_torrent_files: s.trash_original_torrent_files,
             is_alt_speed_active,
+            enable_utp: s.enable_utp,
+            dht_read_only: s.dht_read_only,
+            zeroconf_enabled: s.zeroconf_enabled,
+            announce_ip: s.announce_ip.map(|ip| ip.to_string()).unwrap_or_default(),
         }))
     }
 
@@ -994,6 +1135,10 @@ impl SynapseControl for SynapseService {
             dht_enabled: req.dht_enabled,
             pex_enabled: req.pex_enabled,
             lsd_enabled: req.lsd_enabled,
+            enable_utp: req.enable_utp,
+            dht_read_only: req.dht_read_only,
+            zeroconf_enabled: req.zeroconf_enabled,
+            announce_ip: req.announce_ip,
             encryption: req.encryption,
 
             download_dir: req.download_dir,
@@ -1005,6 +1150,7 @@ impl SynapseControl for SynapseService {
             peer_port: req.peer_port.map(|p| p as u16),
             rpc_listen_addr: req.rpc_listen_addr,
             http_listen_addr: req.http_listen_addr,
+            ..Default::default()
         };
 
         let warnings = engine.update_session_settings(update);
@@ -1030,7 +1176,9 @@ impl SynapseControl for SynapseService {
         _request: Request<Empty>,
     ) -> Result<Response<CircuitBreakerListResponse>, Status> {
         let Some(ref engine) = self.swarm_engine else {
-            return Ok(Response::new(CircuitBreakerListResponse { breakers: vec![] }));
+            return Ok(Response::new(CircuitBreakerListResponse {
+                breakers: vec![],
+            }));
         };
         let breaker = engine.tracker_circuit_breaker();
         let breakers = breaker

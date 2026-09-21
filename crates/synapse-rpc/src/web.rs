@@ -3,12 +3,12 @@
 //! Provides a zero-dependency, self-contained single-page application (SPA)
 //! served directly on the daemon HTTP port when `web.enabled = true`.
 
+use crate::http_api::ApiState;
 use axum::{
     extract::State,
     http::{header, StatusCode},
     response::{Html, IntoResponse, Response},
 };
-use crate::http_api::ApiState;
 
 pub async fn web_index_handler(State(state): State<ApiState>) -> Response {
     if !state.web_config.enabled {
@@ -33,7 +33,11 @@ pub async fn web_css_handler(State(state): State<ApiState>) -> Response {
             return ([(header::CONTENT_TYPE, "text/css; charset=utf-8")], content).into_response();
         }
     }
-    ([(header::CONTENT_TYPE, "text/css; charset=utf-8")], STYLE_CSS).into_response()
+    (
+        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+        STYLE_CSS,
+    )
+        .into_response()
 }
 
 pub async fn web_js_handler(State(state): State<ApiState>) -> Response {
@@ -43,10 +47,24 @@ pub async fn web_js_handler(State(state): State<ApiState>) -> Response {
     if let Some(ref root) = state.web_config.web_root {
         let path = root.join("app.js");
         if let Ok(content) = tokio::fs::read_to_string(&path).await {
-            return ([(header::CONTENT_TYPE, "application/javascript; charset=utf-8")], content).into_response();
+            return (
+                [(
+                    header::CONTENT_TYPE,
+                    "application/javascript; charset=utf-8",
+                )],
+                content,
+            )
+                .into_response();
         }
     }
-    ([(header::CONTENT_TYPE, "application/javascript; charset=utf-8")], APP_JS).into_response()
+    (
+        [(
+            header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
+        APP_JS,
+    )
+        .into_response()
 }
 
 pub async fn web_favicon_handler() -> Response {
@@ -150,7 +168,7 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
         <div class="daemon-info-card">
           <div><small>Engine:</small> <strong>Synapse 2.0</strong></div>
           <div><small>Peer ID:</small> <code>-SY2200-</code></div>
-          <div id="daemon-version"><small>Version:</small> 2.2.4</div>
+          <div id="daemon-version"><small>Version:</small> 2.2.5</div>
           <div id="daemon-dht"><small>DHT Nodes:</small> <span id="stat-dht-nodes">0</span></div>
         </div>
       </div>

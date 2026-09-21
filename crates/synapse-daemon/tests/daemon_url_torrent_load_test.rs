@@ -9,15 +9,28 @@ use tempfile::tempdir;
 
 /// Generates a valid minimal .torrent bencoded file payload for testing.
 fn create_test_torrent_bytes(name: &str, length: usize) -> Vec<u8> {
-    let pieces_hash = vec![0x42u8; 20]; // 1 piece of 20 bytes SHA-1
+    // One 20-byte SHA-1 per 256 KiB piece, as the metainfo layout check requires.
+    let pieces_hash = vec![0x42u8; length.div_ceil(262144) * 20];
     let torrent_dict = synapse_bencode::BEncode::Dict(std::collections::BTreeMap::from([
         (
             b"info".to_vec(),
             synapse_bencode::BEncode::Dict(std::collections::BTreeMap::from([
-                (b"name".to_vec(), synapse_bencode::BEncode::String(name.as_bytes().to_vec())),
-                (b"piece length".to_vec(), synapse_bencode::BEncode::Int(262144)),
-                (b"pieces".to_vec(), synapse_bencode::BEncode::String(pieces_hash)),
-                (b"length".to_vec(), synapse_bencode::BEncode::Int(length as i64)),
+                (
+                    b"name".to_vec(),
+                    synapse_bencode::BEncode::String(name.as_bytes().to_vec()),
+                ),
+                (
+                    b"piece length".to_vec(),
+                    synapse_bencode::BEncode::Int(262144),
+                ),
+                (
+                    b"pieces".to_vec(),
+                    synapse_bencode::BEncode::String(pieces_hash),
+                ),
+                (
+                    b"length".to_vec(),
+                    synapse_bencode::BEncode::Int(length as i64),
+                ),
             ])),
         ),
         (
@@ -41,7 +54,13 @@ async fn test_daemon_secure_url_torrent_ingestion_and_injection_defense() {
             "/debian.torrent",
             get(move || {
                 let p = mock_payload_clone.clone();
-                async move { ([(axum::http::header::CONTENT_TYPE, "application/x-bittorrent")], p).into_response() }
+                async move {
+                    (
+                        [(axum::http::header::CONTENT_TYPE, "application/x-bittorrent")],
+                        p,
+                    )
+                        .into_response()
+                }
             }),
         )
         .route(
@@ -87,7 +106,10 @@ async fn test_daemon_secure_url_torrent_ingestion_and_injection_defense() {
     assert_eq!(res.status(), StatusCode::OK);
     let json: serde_json::Value = res.json().await.unwrap();
     assert_eq!(json["success"], true);
-    assert!(json["message"].as_str().unwrap().contains("Torrent added successfully"));
+    assert!(json["message"]
+        .as_str()
+        .unwrap()
+        .contains("Torrent added successfully"));
 
     // Verify torrent is active in SwarmEngine
     let torrents = swarm.list_torrents();

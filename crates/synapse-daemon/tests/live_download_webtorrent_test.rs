@@ -41,10 +41,7 @@ fn build_synthetic_torrent(name: &str, file_len: usize, piece_len: u32) -> synap
     );
 
     let mut torrent_dict = std::collections::BTreeMap::new();
-    torrent_dict.insert(
-        b"info".to_vec(),
-        synapse_bencode::BEncode::Dict(info_dict),
-    );
+    torrent_dict.insert(b"info".to_vec(), synapse_bencode::BEncode::Dict(info_dict));
 
     synapse_meta::Info::from_bencode(synapse_bencode::BEncode::Dict(torrent_dict))
         .expect("valid synthetic test torrent")
@@ -81,6 +78,7 @@ async fn test_live_download_webtorrent_swarms_and_queue_pipeline() {
         share_ratio_limit: None,
         idle_seeding_limit_enabled: false,
         seed_time_limit_secs: None,
+        ..Default::default()
     });
 
     // 3. Securely fetch and ingest the 5 torrents via URL
@@ -108,7 +106,14 @@ async fn test_live_download_webtorrent_swarms_and_queue_pipeline() {
 
     if loaded_handles.is_empty() {
         info!("⚠️ No remote torrents could be fetched (network offline / isolated environment). Generating synthetic torrents for telemetry test.");
-        for (i, name) in ["synthetic-bunny.iso", "synthetic-sintel.mkv", "synthetic-tears.mp4"].iter().enumerate() {
+        for (i, name) in [
+            "synthetic-bunny.iso",
+            "synthetic-sintel.mkv",
+            "synthetic-tears.mp4",
+        ]
+        .iter()
+        .enumerate()
+        {
             let info = build_synthetic_torrent(name, 1024 * 1024 * (i + 1), 64 * 1024);
             let info_arc = Arc::new(info);
             let handle = swarm.add_torrent(info_arc.clone(), download_dir.clone(), None);

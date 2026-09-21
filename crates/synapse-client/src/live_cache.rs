@@ -78,7 +78,10 @@ async fn run_delta_sync_loop(
     let max_backoff = Duration::from_secs(30);
 
     loop {
-        debug!("Connecting to Synapse live delta stream at {}", client.endpoint());
+        debug!(
+            "Connecting to Synapse live delta stream at {}",
+            client.endpoint()
+        );
         match client.subscribe_torrents(250, 100).await {
             Ok(mut stream) => {
                 info!("Connected to Synapse live delta stream");
@@ -97,7 +100,10 @@ async fn run_delta_sync_loop(
                                     map.insert(t.hash.clone(), t);
                                 }
                                 *torrents.write() = map;
-                                debug!("Applied full torrent snapshot ({} swarms)", torrents.read().len());
+                                debug!(
+                                    "Applied full torrent snapshot ({} swarms)",
+                                    torrents.read().len()
+                                );
                             }
                         }
                         Some(Event::Added(t)) => {
@@ -117,7 +123,10 @@ async fn run_delta_sync_loop(
             }
             Err(e) => {
                 connected.store(false, Ordering::Release);
-                warn!("Failed to connect to Synapse stream: {e}; retrying in {:?}", backoff);
+                warn!(
+                    "Failed to connect to Synapse stream: {e}; retrying in {:?}",
+                    backoff
+                );
             }
         }
 

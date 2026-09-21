@@ -7,13 +7,13 @@
 //! - `PostScriptPlugin`: non-blocking execution of external post-processing scripts or copy-scripts
 //!   with rich environment variable and argument passing.
 
+use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info, warn};
 
 #[derive(Debug, thiserror::Error)]
@@ -64,7 +64,10 @@ pub struct TorrentCompletedEvent {
 #[async_trait]
 pub trait LifecyclePlugin: Send + Sync {
     fn name(&self) -> &str;
-    async fn on_torrent_completed(&self, event: &TorrentCompletedEvent) -> Result<(), LifecycleError>;
+    async fn on_torrent_completed(
+        &self,
+        event: &TorrentCompletedEvent,
+    ) -> Result<(), LifecycleError>;
 }
 
 /// Conduit Plugin: automates payload hardlinking and offline WAL persistence.
@@ -75,7 +78,11 @@ pub struct ConduitPlugin {
 }
 
 impl ConduitPlugin {
-    pub fn new(staging_dir: Option<PathBuf>, auto_hardlink: bool, wal_path: Option<PathBuf>) -> Self {
+    pub fn new(
+        staging_dir: Option<PathBuf>,
+        auto_hardlink: bool,
+        wal_path: Option<PathBuf>,
+    ) -> Self {
         if let Some(ref wal_path) = wal_path {
             if let Some(parent) = wal_path.parent() {
                 let _ = fs::create_dir_all(parent);
@@ -124,34 +131,37 @@ impl ConduitPlugin {
         }
     }
 
-/// Hardlinks `src` to `dst`, falling back to a real copy across filesystem boundaries
-/// (`EXDEV`) — crate-visible so `instructions::ConduitInstructionsPlugin` can reuse the same
-/// link-or-copy semantics for its own "post_cmd said hardlink" case instead of duplicating it.
-pub(crate) fn link_or_copy(src: &Path, dst: &Path) -> std::io::Result<()> {
-    if let Some(parent) = dst.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    if dst.exists() {
-        let _ = fs::remove_file(dst);
-    }
-    match fs::hard_link(src, dst) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {
-            debug!("Cross-device hardlink detected for {:?} -> {:?}, falling back to copy", src, dst);
-            fs::copy(src, dst)?;
-            Ok(())
+    /// Hardlinks `src` to `dst`, falling back to a real copy across filesystem boundaries
+    /// (`EXDEV`) — crate-visible so `instructions::ConduitInstructionsPlugin` can reuse the same
+    /// link-or-copy semantics for its own "post_cmd said hardlink" case instead of duplicating it.
+    pub(crate) fn link_or_copy(src: &Path, dst: &Path) -> std::io::Result<()> {
+        if let Some(parent) = dst.parent() {
+            fs::create_dir_all(parent)?;
         }
-        Err(e) => {
-            if e.raw_os_error() == Some(18) {
-                debug!("Cross-device hardlink (EXDEV) detected for {:?} -> {:?}, falling back to copy", src, dst);
+        if dst.exists() {
+            let _ = fs::remove_file(dst);
+        }
+        match fs::hard_link(src, dst) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {
+                debug!(
+                    "Cross-device hardlink detected for {:?} -> {:?}, falling back to copy",
+                    src, dst
+                );
                 fs::copy(src, dst)?;
                 Ok(())
-            } else {
-                Err(e)
+            }
+            Err(e) => {
+                if e.raw_os_error() == Some(18) {
+                    debug!("Cross-device hardlink (EXDEV) detected for {:?} -> {:?}, falling back to copy", src, dst);
+                    fs::copy(src, dst)?;
+                    Ok(())
+                } else {
+                    Err(e)
+                }
             }
         }
     }
-}
 
     fn append_to_wal(&self, wal_path: &Path, event: &TorrentCompletedEvent) -> std::io::Result<()> {
         let mut file = OpenOptions::new()
@@ -164,7 +174,10 @@ pub(crate) fn link_or_copy(src: &Path, dst: &Path) -> std::io::Result<()> {
 
         writeln!(file, "{}", line)?;
         file.sync_all()?;
-        debug!("Appended completion event for {} to WAL", event.info_hash_hex);
+        debug!(
+            "Appended completion event for {} to WAL",
+            event.info_hash_hex
+        );
         Ok(())
     }
 
@@ -205,10 +218,16 @@ impl LifecyclePlugin for ConduitPlugin {
         "conduit"
     }
 
-    async fn on_torrent_completed(&self, event: &TorrentCompletedEvent) -> Result<(), LifecycleError> {
+    async fn on_torrent_completed(
+        &self,
+        event: &TorrentCompletedEvent,
+    ) -> Result<(), LifecycleError> {
         if let Some(ref wal_path) = self.wal_path {
             if let Err(e) = self.append_to_wal(wal_path, event) {
-                error!("Failed to append completion event to WAL {:?}: {}", wal_path, e);
+                error!(
+                    "Failed to append completion event to WAL {:?}: {}",
+                    wal_path, e
+                );
                 return Err(LifecycleError::Io(e));
             }
         }
@@ -237,13 +256,22 @@ impl LifecyclePlugin for PostScriptPlugin {
         &self.plugin_name
     }
 
-    async fn on_torrent_completed(&self, event: &TorrentCompletedEvent) -> Result<(), LifecycleError> {
+    async fn on_torrent_completed(
+        &self,
+        event: &TorrentCompletedEvent,
+    ) -> Result<(), LifecycleError> {
         if !self.script_path.exists() {
-            warn!("Post-processing script {:?} not found, skipping execution", self.script_path);
+            warn!(
+                "Post-processing script {:?} not found, skipping execution",
+                self.script_path
+            );
             return Ok(());
         }
 
-        info!("Executing {} post-processing script: {:?}", self.plugin_name, self.script_path);
+        info!(
+            "Executing {} post-processing script: {:?}",
+            self.plugin_name, self.script_path
+        );
 
         let staged = event.staged_path.clone().unwrap_or_default();
         let status = tokio::process::Command::new(&self.script_path)
@@ -263,18 +291,27 @@ impl LifecyclePlugin for PostScriptPlugin {
 
         match status {
             Ok(s) if s.success() => {
-                info!("Post-processing script {:?} completed successfully", self.script_path);
+                info!(
+                    "Post-processing script {:?} completed successfully",
+                    self.script_path
+                );
                 Ok(())
             }
             Ok(s) => {
-                warn!("Post-processing script {:?} exited with non-zero status: {}", self.script_path, s);
+                warn!(
+                    "Post-processing script {:?} exited with non-zero status: {}",
+                    self.script_path, s
+                );
                 Err(LifecycleError::Plugin {
                     plugin: self.plugin_name.clone(),
                     message: format!("Script exited with {}", s),
                 })
             }
             Err(e) => {
-                error!("Failed to spawn post-processing script {:?}: {}", self.script_path, e);
+                error!(
+                    "Failed to spawn post-processing script {:?}: {}",
+                    self.script_path, e
+                );
                 Err(LifecycleError::Io(e))
             }
         }
@@ -315,7 +352,9 @@ impl ConduitLifecycleDispatcher {
             plugins.push(Arc::new(PostScriptPlugin::new("copy_script", copy_script)));
         }
         if let Some(instructions_cfg) = config.instructions {
-            plugins.push(Arc::new(crate::instructions::ConduitInstructionsPlugin::new(instructions_cfg)));
+            plugins.push(Arc::new(
+                crate::instructions::ConduitInstructionsPlugin::new(instructions_cfg),
+            ));
         }
 
         Self {
@@ -355,14 +394,20 @@ impl ConduitLifecycleDispatcher {
         let mut staged_path: Option<String> = None;
 
         // Perform staging hardlinks via conduit plugin
-        match self.conduit_plugin.perform_hardlinks(download_dir, name, files) {
+        match self
+            .conduit_plugin
+            .perform_hardlinks(download_dir, name, files)
+        {
             Ok(Some(staged)) => {
                 info!("Successfully staged hardlinks for {} in {:?}", name, staged);
                 staged_path = Some(staged.to_string_lossy().to_string());
             }
             Ok(None) => {}
             Err(e) => {
-                warn!("Failed to stage hardlinks for {}: {} (falling back to direct path)", name, e);
+                warn!(
+                    "Failed to stage hardlinks for {}: {} (falling back to direct path)",
+                    name, e
+                );
             }
         }
 
@@ -375,13 +420,24 @@ impl ConduitLifecycleDispatcher {
             staged_path,
             timestamp_ms: now_ms,
             trackers: trackers.to_vec(),
-            files: files.iter().map(|f| CompletedFileInfo { path: f.path.to_string_lossy().to_string(), length: f.length }).collect(),
+            files: files
+                .iter()
+                .map(|f| CompletedFileInfo {
+                    path: f.path.to_string_lossy().to_string(),
+                    length: f.length,
+                })
+                .collect(),
         };
 
         // Dispatch to all registered plugins asynchronously
         for plugin in &self.plugins {
             if let Err(e) = plugin.on_torrent_completed(&event).await {
-                error!("Plugin {} failed on completed event for {}: {}", plugin.name(), event.name, e);
+                error!(
+                    "Plugin {} failed on completed event for {}: {}",
+                    plugin.name(),
+                    event.name,
+                    e
+                );
             }
         }
 

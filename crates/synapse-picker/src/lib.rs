@@ -8,7 +8,9 @@ pub mod priority;
 pub mod superseed;
 
 pub use bitfield::{Bitfield, RoaringBitfield};
-pub use choker::{ChokeDecisions, Choker, PeerStats};
+pub use choker::{
+    ChokeDecisions, Choker, PeerStats, SeedChokingAlgorithm, SessionChoker, SwarmChokerDemand,
+};
 pub use picker::{Mode, Picker};
 pub use priority::{FilePriority, PriorityMap};
 pub use superseed::SuperSeeder;

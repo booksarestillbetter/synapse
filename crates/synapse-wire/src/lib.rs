@@ -22,7 +22,7 @@ use tokio_util::codec::{Decoder, Encoder};
 /// how much a peer can force us to buffer just by sending a length prefix, before we've
 /// seen anything else. Individual message types apply tighter limits once their id is
 /// known (see `decode_message`).
-pub const MAX_MESSAGE_LEN: u32 = 8 * 1024 * 1024;
+pub const MAX_MESSAGE_LEN: u32 = 1024 * 1024;
 
 /// Practical cap on a `Piece` message's block payload. 16KiB is the conventional
 /// BitTorrent block size; this leaves generous headroom above it for clients using
@@ -40,21 +40,32 @@ pub mod extension;
 pub mod holepunch;
 pub mod lsd;
 pub mod pex;
-pub mod pubsub;
-pub mod stun;
+pub mod udp_mux;
 pub mod utp;
+pub mod zeroconf;
 
 pub use bep40::{canonical_peer_priority, canonical_peer_score};
-pub use crypto::{EncryptedStream, EncryptionMode, Rc4Cipher};
-pub use extension::{ExtensionHandshake, UtMetadataMessage, UT_METADATA_PIECE_LEN};
+pub use crypto::{
+    mse_handshake_initiator, mse_handshake_receiver, mse_req2, EncryptedStream, EncryptionMode,
+    Rc4Cipher, ReceiverHandshakeResult, CRYPTO_PLAINTEXT, CRYPTO_RC4,
+};
+pub use extension::{
+    ExtensionHandshake, LtDontHave, TrHashPiece, UtMetadataMessage, TR_HASHPIECE,
+    UT_METADATA_PIECE_LEN,
+};
 pub use holepunch::{HolepunchMessage, HolepunchType};
-pub use lsd::{format_lsd_announce, parse_lsd_announce, LsdAnnounce, LsdError, LSD_MULTICAST_IPV4, LSD_PORT};
+pub use lsd::{
+    format_lsd_announce, parse_lsd_announce, LsdAnnounce, LsdError, LSD_MULTICAST_IPV4,
+    LSD_MULTICAST_IPV6, LSD_PORT,
+};
 pub use pex::{
     UtPexMessage, PEX_FLAG_ENCRYPTION_PREFERRED, PEX_FLAG_SEEDER, PEX_FLAG_UTP_SUPPORTED,
 };
-pub use pubsub::PubSubMessage;
-pub use stun::{encode_stun_binding_request, parse_stun_binding_response, STUN_MAGIC_COOKIE};
-pub use utp::{UtpHeader, UtpPacket, UtpType, UTP_HEADER_LEN, UTP_VERSION};
+pub use udp_mux::{UdpMux, UdpProtocol, UdpTransport};
+pub use utp::{
+    build_sack_bitmask, parse_sack_bitmask, UtpHeader, UtpPacket, UtpType, UTP_HEADER_LEN,
+    UTP_VERSION,
+};
 
 const HANDSHAKE_LEN: usize = 68;
 const PROTOCOL_STR: &[u8] = b"BitTorrent protocol";
@@ -101,6 +112,28 @@ pub enum Message {
     Extension {
         id: u8,
         payload: Bytes,
+    },
+    HashRequest {
+        pieces_root: [u8; 32],
+        base_layer: u32,
+        index: u32,
+        count: u32,
+        proof_layers: u32,
+    },
+    Hashes {
+        pieces_root: [u8; 32],
+        base_layer: u32,
+        index: u32,
+        count: u32,
+        proof_layers: u32,
+        hashes: Bytes,
+    },
+    HashReject {
+        pieces_root: [u8; 32],
+        base_layer: u32,
+        index: u32,
+        count: u32,
+        proof_layers: u32,
     },
 }
 
@@ -155,7 +188,9 @@ fn decode_handshake(
         return Ok(None);
     }
     if src[0] != 19 {
-        return Err(WireError::Protocol("invalid handshake protocol-string length"));
+        return Err(WireError::Protocol(
+            "invalid handshake protocol-string length",
+        ));
     }
     if &src[1..20] != PROTOCOL_STR {
         return Err(WireError::Protocol("unexpected handshake protocol string"));
@@ -187,7 +222,9 @@ fn decode_message(src: &mut BytesMut) -> Result<Option<Message>, WireError> {
         return Ok(Some(Message::KeepAlive));
     }
     if len > MAX_MESSAGE_LEN {
-        return Err(WireError::Protocol("message length exceeds MAX_MESSAGE_LEN"));
+        return Err(WireError::Protocol(
+            "message length exceeds MAX_MESSAGE_LEN",
+        ));
     }
     let total = 4 + len as usize;
     if src.len() < total {
@@ -201,15 +238,17 @@ fn decode_message(src: &mut BytesMut) -> Result<Option<Message>, WireError> {
 
     let msg = match id {
         0..=3 if payload_len != 0 => {
-            return Err(WireError::Protocol("fixed-size message has a non-zero payload"))
+            return Err(WireError::Protocol(
+                "fixed-size message has a non-zero payload",
+            ))
         }
         0 => Message::Choke,
         1 => Message::Unchoke,
         2 => Message::Interested,
         3 => Message::Uninterested,
-        4 if payload_len == 4 => Message::Have(u32::from_be_bytes([
-            src[5], src[6], src[7], src[8],
-        ])),
+        4 if payload_len == 4 => {
+            Message::Have(u32::from_be_bytes([src[5], src[6], src[7], src[8]]))
+        }
         4 => return Err(WireError::Protocol("Have message has the wrong length")),
         5 => Message::Bitfield(Bytes::new()), // payload filled in below, after split_to
         6 if payload_len == 12 => Message::Request {
@@ -232,40 +271,109 @@ fn decode_message(src: &mut BytesMut) -> Result<Option<Message>, WireError> {
         8 => return Err(WireError::Protocol("Cancel message has the wrong length")),
         9 if payload_len == 2 => Message::Port(u16::from_be_bytes([src[5], src[6]])),
         9 => return Err(WireError::Protocol("Port message has the wrong length")),
-        13 if payload_len == 4 => Message::SuggestPiece(u32::from_be_bytes([
-            src[5], src[6], src[7], src[8],
-        ])),
-        13 => return Err(WireError::Protocol("SuggestPiece message has the wrong length")),
+        13 if payload_len == 4 => {
+            Message::SuggestPiece(u32::from_be_bytes([src[5], src[6], src[7], src[8]]))
+        }
+        13 => {
+            return Err(WireError::Protocol(
+                "SuggestPiece message has the wrong length",
+            ))
+        }
         14 if payload_len == 0 => Message::HaveAll,
-        14 => return Err(WireError::Protocol("HaveAll message has a non-zero payload")),
+        14 => {
+            return Err(WireError::Protocol(
+                "HaveAll message has a non-zero payload",
+            ))
+        }
         15 if payload_len == 0 => Message::HaveNone,
-        15 => return Err(WireError::Protocol("HaveNone message has a non-zero payload")),
+        15 => {
+            return Err(WireError::Protocol(
+                "HaveNone message has a non-zero payload",
+            ))
+        }
         16 if payload_len == 12 => Message::RejectRequest {
             index: u32::from_be_bytes([src[5], src[6], src[7], src[8]]),
             begin: u32::from_be_bytes([src[9], src[10], src[11], src[12]]),
             length: u32::from_be_bytes([src[13], src[14], src[15], src[16]]),
         },
-        16 => return Err(WireError::Protocol("RejectRequest message has the wrong length")),
-        17 if payload_len == 4 => Message::AllowedFast(u32::from_be_bytes([
-            src[5], src[6], src[7], src[8],
-        ])),
-        17 => return Err(WireError::Protocol("AllowedFast message has the wrong length")),
+        16 => {
+            return Err(WireError::Protocol(
+                "RejectRequest message has the wrong length",
+            ))
+        }
+        17 if payload_len == 4 => {
+            Message::AllowedFast(u32::from_be_bytes([src[5], src[6], src[7], src[8]]))
+        }
+        17 => {
+            return Err(WireError::Protocol(
+                "AllowedFast message has the wrong length",
+            ))
+        }
         20 if payload_len >= 1 => Message::Extension {
             id: 0, // filled in below
             payload: Bytes::new(),
         },
         20 => return Err(WireError::Protocol("Extension message is too short")),
+        // BEP 52 hash messages: root (32) then four big-endian u32s -- base layer, index,
+        // length, proof layers -- i.e. 48 bytes after the id.
+        21 if payload_len == 48 => {
+            let mut pieces_root = [0u8; 32];
+            pieces_root.copy_from_slice(&src[5..37]);
+            Message::HashRequest {
+                pieces_root,
+                base_layer: u32::from_be_bytes([src[37], src[38], src[39], src[40]]),
+                index: u32::from_be_bytes([src[41], src[42], src[43], src[44]]),
+                count: u32::from_be_bytes([src[45], src[46], src[47], src[48]]),
+                proof_layers: u32::from_be_bytes([src[49], src[50], src[51], src[52]]),
+            }
+        }
+        21 => {
+            return Err(WireError::Protocol(
+                "HashRequest message has the wrong length",
+            ))
+        }
+        22 if payload_len >= 48 => {
+            let mut pieces_root = [0u8; 32];
+            pieces_root.copy_from_slice(&src[5..37]);
+            Message::Hashes {
+                pieces_root,
+                base_layer: u32::from_be_bytes([src[37], src[38], src[39], src[40]]),
+                index: u32::from_be_bytes([src[41], src[42], src[43], src[44]]),
+                count: u32::from_be_bytes([src[45], src[46], src[47], src[48]]),
+                proof_layers: u32::from_be_bytes([src[49], src[50], src[51], src[52]]),
+                hashes: Bytes::new(),
+            }
+        }
+        22 => return Err(WireError::Protocol("Hashes message is too short")),
+        23 if payload_len == 48 => {
+            let mut pieces_root = [0u8; 32];
+            pieces_root.copy_from_slice(&src[5..37]);
+            Message::HashReject {
+                pieces_root,
+                base_layer: u32::from_be_bytes([src[37], src[38], src[39], src[40]]),
+                index: u32::from_be_bytes([src[41], src[42], src[43], src[44]]),
+                count: u32::from_be_bytes([src[45], src[46], src[47], src[48]]),
+                proof_layers: u32::from_be_bytes([src[49], src[50], src[51], src[52]]),
+            }
+        }
+        23 => {
+            return Err(WireError::Protocol(
+                "HashReject message has the wrong length",
+            ))
+        }
         _ => return Err(WireError::Protocol("unknown message id")),
     };
 
     // Checks above validated lengths against the buffer contents still sitting in
     // `src`; now actually take ownership of the frame and fill in any payload that was
-    // deferred (`Bitfield`/`Piece::data`/`Extension`) via zero-copy `Bytes` slicing.
+    // deferred (`Bitfield`/`Piece::data`/`Extension`/`Hashes`) via zero-copy `Bytes` slicing.
     if id == 7 && payload_len as u32 > MAX_BLOCK_LEN + 8 {
         return Err(WireError::Protocol("Piece block exceeds MAX_BLOCK_LEN"));
     }
     if id == 20 && payload_len as u32 > MAX_EXTENSION_LEN {
-        return Err(WireError::Protocol("Extension payload exceeds MAX_EXTENSION_LEN"));
+        return Err(WireError::Protocol(
+            "Extension payload exceeds MAX_EXTENSION_LEN",
+        ));
     }
 
     let frame = src.split_to(total).freeze();
@@ -279,6 +387,24 @@ fn decode_message(src: &mut BytesMut) -> Result<Option<Message>, WireError> {
         (20, _) => Message::Extension {
             id: frame[5],
             payload: frame.slice(6..total),
+        },
+        (
+            22,
+            Message::Hashes {
+                pieces_root,
+                base_layer,
+                index,
+                count,
+                proof_layers,
+                ..
+            },
+        ) => Message::Hashes {
+            pieces_root,
+            base_layer,
+            index,
+            count,
+            proof_layers,
+            hashes: frame.slice(53..total),
         },
         (_, msg) => msg,
     };
@@ -402,6 +528,56 @@ impl Encoder<Message> for PeerCodec {
                 dst.put_u8(id);
                 dst.put_slice(&payload);
             }
+            Message::HashRequest {
+                pieces_root,
+                base_layer,
+                index,
+                count,
+                proof_layers,
+            } => {
+                dst.reserve(53);
+                dst.put_u32(49);
+                dst.put_u8(21);
+                dst.put_slice(&pieces_root);
+                dst.put_u32(base_layer);
+                dst.put_u32(index);
+                dst.put_u32(count);
+                dst.put_u32(proof_layers);
+            }
+            Message::Hashes {
+                pieces_root,
+                base_layer,
+                index,
+                count,
+                proof_layers,
+                hashes,
+            } => {
+                dst.reserve(53 + hashes.len());
+                dst.put_u32(49 + hashes.len() as u32);
+                dst.put_u8(22);
+                dst.put_slice(&pieces_root);
+                dst.put_u32(base_layer);
+                dst.put_u32(index);
+                dst.put_u32(count);
+                dst.put_u32(proof_layers);
+                dst.put_slice(&hashes);
+            }
+            Message::HashReject {
+                pieces_root,
+                base_layer,
+                index,
+                count,
+                proof_layers,
+            } => {
+                dst.reserve(53);
+                dst.put_u32(49);
+                dst.put_u8(23);
+                dst.put_slice(&pieces_root);
+                dst.put_u32(base_layer);
+                dst.put_u32(index);
+                dst.put_u32(count);
+                dst.put_u32(proof_layers);
+            }
         }
         Ok(())
     }
@@ -477,8 +653,14 @@ mod tests {
     fn test_fast_extension_messages_roundtrip() {
         assert_eq!(roundtrip(Message::HaveAll), Message::HaveAll);
         assert_eq!(roundtrip(Message::HaveNone), Message::HaveNone);
-        assert_eq!(roundtrip(Message::SuggestPiece(128)), Message::SuggestPiece(128));
-        assert_eq!(roundtrip(Message::AllowedFast(512)), Message::AllowedFast(512));
+        assert_eq!(
+            roundtrip(Message::SuggestPiece(128)),
+            Message::SuggestPiece(128)
+        );
+        assert_eq!(
+            roundtrip(Message::AllowedFast(512)),
+            Message::AllowedFast(512)
+        );
         assert_eq!(
             roundtrip(Message::RejectRequest {
                 index: 10,
@@ -539,13 +721,7 @@ mod tests {
             id: 1,
             payload: payload.clone(),
         };
-        assert_eq!(
-            roundtrip(msg),
-            Message::Extension {
-                id: 1,
-                payload
-            }
-        );
+        assert_eq!(roundtrip(msg), Message::Extension { id: 1, payload });
     }
 
     #[test]
@@ -622,5 +798,102 @@ mod tests {
         assert_eq!(codec.decode(&mut buf).unwrap(), Some(Message::Unchoke));
         assert_eq!(codec.decode(&mut buf).unwrap(), Some(Message::Have(3)));
         assert_eq!(codec.decode(&mut buf).unwrap(), None);
+    }
+
+    #[test]
+    fn test_bep52_hash_messages_roundtrip() {
+        let root = [0x5Au8; 32];
+
+        // HashRequest
+        let req = Message::HashRequest {
+            pieces_root: root,
+            base_layer: 0,
+            index: 4,
+            count: 2,
+            proof_layers: 1,
+        };
+        assert_eq!(roundtrip(req.clone()), req);
+
+        // Hashes
+        let hashes = Message::Hashes {
+            pieces_root: root,
+            base_layer: 0,
+            index: 4,
+            count: 2,
+            proof_layers: 1,
+            hashes: Bytes::from_static(&[0x42; 64]),
+        };
+        assert_eq!(roundtrip(hashes.clone()), hashes);
+
+        // HashReject
+        let reject = Message::HashReject {
+            pieces_root: root,
+            base_layer: 0,
+            index: 4,
+            count: 2,
+            proof_layers: 1,
+        };
+        assert_eq!(roundtrip(reject.clone()), reject);
+    }
+
+    /// BEP 52 fixes these layouts: length prefix 0x31 (49) for request/reject, and four
+    /// big-endian u32 fields after the 32-byte root, in the order base layer, index, length,
+    /// proof layers. Checked against hand-assembled bytes so the codec is not merely
+    /// self-consistent.
+    #[test]
+    fn bep52_hash_messages_use_the_spec_byte_layout() {
+        let root = [0xAB; 32];
+        let mut expected = vec![0, 0, 0, 0x31, 21];
+        expected.extend_from_slice(&root);
+        expected.extend_from_slice(&[0, 0, 0, 6]); // base layer
+        expected.extend_from_slice(&[0, 0, 1, 0]); // index 256
+        expected.extend_from_slice(&[0, 0, 0, 2]); // length
+        expected.extend_from_slice(&[0, 0, 0, 3]); // proof layers
+
+        let mut buf = BytesMut::new();
+        let mut codec = PeerCodec::new();
+        codec.handshake_read = true;
+        codec
+            .encode(
+                Message::HashRequest {
+                    pieces_root: root,
+                    base_layer: 6,
+                    index: 256,
+                    count: 2,
+                    proof_layers: 3,
+                },
+                &mut buf,
+            )
+            .unwrap();
+        assert_eq!(&buf[..], &expected[..]);
+
+        let mut src = BytesMut::from(&expected[..]);
+        assert_eq!(
+            codec.decode(&mut src).unwrap(),
+            Some(Message::HashRequest {
+                pieces_root: root,
+                base_layer: 6,
+                index: 256,
+                count: 2,
+                proof_layers: 3
+            })
+        );
+
+        // Hashes: same header with id 22 and the hashes appended; length = 49 + payload.
+        let mut hashes_frame = vec![0, 0, 0, 0x31 + 64, 22];
+        hashes_frame.extend_from_slice(&expected[5..]);
+        hashes_frame.extend_from_slice(&[0x11; 64]);
+        let mut src = BytesMut::from(&hashes_frame[..]);
+        assert_eq!(
+            codec.decode(&mut src).unwrap(),
+            Some(Message::Hashes {
+                pieces_root: root,
+                base_layer: 6,
+                index: 256,
+                count: 2,
+                proof_layers: 3,
+                hashes: Bytes::from(vec![0x11; 64]),
+            })
+        );
     }
 }

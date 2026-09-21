@@ -6,6 +6,41 @@
 use std::sync::Arc;
 use url::Url;
 
+/// Whether a web seed's response really is the byte range we asked for.
+///
+/// A `206` must carry a `Content-Range: bytes A-B/T` naming exactly `[start, start+len)`;
+/// otherwise the bytes belong to some other part of the file and would corrupt the piece
+/// (or, hash-checked, just get the piece discarded and the seed penalised). A `200` means
+/// the server ignored `Range` and sent the whole resource, which is only usable when the
+/// request started at offset 0 and the whole resource is exactly `len` bytes.
+pub fn response_matches_range(
+    status: u16,
+    content_range: Option<&str>,
+    body_len: usize,
+    start: u64,
+    len: u64,
+) -> bool {
+    if body_len as u64 != len {
+        return false;
+    }
+    match status {
+        206 => {
+            let Some(rest) = content_range.and_then(|h| h.trim().strip_prefix("bytes ")) else {
+                return false;
+            };
+            let Some((range, _total)) = rest.split_once('/') else {
+                return false;
+            };
+            let Some((a, b)) = range.split_once('-') else {
+                return false;
+            };
+            matches!((a.trim().parse::<u64>(), b.trim().parse::<u64>()), (Ok(a), Ok(b)) if a == start && b == start + len - 1)
+        }
+        200 => start == 0,
+        _ => false,
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct WebSeedTarget {
     pub base_url: Arc<Url>,
@@ -29,11 +64,7 @@ pub struct WebSeedManager {
 
 impl WebSeedManager {
     pub fn new(url_list: &[Arc<Url>]) -> Self {
-        let seeds = url_list
-            .iter()
-            .cloned()
-            .map(WebSeedTarget::new)
-            .collect();
+        let seeds = url_list.iter().cloned().map(WebSeedTarget::new).collect();
 
         Self { seeds }
     }
@@ -64,6 +95,19 @@ impl WebSeedManager {
         let range_header = format!("bytes={}-{}", start_byte, end_byte);
 
         Ok((target_url, range_header))
+    }
+
+    /// Formats a BEP 17 Hoffman-style HTTP seeding request URL for a piece and byte range.
+    pub fn format_hoffman_request(
+        &self,
+        base_url: &Url,
+        info_hash: &[u8; 20],
+        piece_idx: u32,
+        range: Option<(u32, u32)>,
+    ) -> Result<Url, url::ParseError> {
+        let hoffman = crate::hoffman::HoffmanWebSeed::new(base_url.as_str().to_string());
+        let formatted = hoffman.format_request_url(info_hash, piece_idx, range);
+        Url::parse(&formatted)
     }
 
     /// Records a successful block response from a webseed.
@@ -140,5 +184,51 @@ mod tests {
 
         mgr.on_success(0);
         assert_eq!(mgr.active_seeds().len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod range_tests {
+    use super::response_matches_range;
+
+    #[test]
+    fn accepts_only_the_exact_requested_range() {
+        assert!(response_matches_range(
+            206,
+            Some("bytes 100-199/1000"),
+            100,
+            100,
+            100
+        ));
+        assert!(
+            !response_matches_range(206, Some("bytes 0-99/1000"), 100, 100, 100),
+            "wrong offset"
+        );
+        assert!(
+            !response_matches_range(206, Some("bytes 100-198/1000"), 100, 100, 100),
+            "wrong end"
+        );
+        assert!(
+            !response_matches_range(206, None, 100, 100, 100),
+            "missing Content-Range"
+        );
+        assert!(
+            !response_matches_range(206, Some("items 100-199/1000"), 100, 100, 100),
+            "wrong unit"
+        );
+        assert!(
+            !response_matches_range(206, Some("bytes 100-199/1000"), 99, 100, 100),
+            "short body"
+        );
+        assert!(!response_matches_range(404, None, 100, 100, 100));
+    }
+
+    #[test]
+    fn a_200_is_usable_only_for_a_whole_small_resource_at_offset_zero() {
+        assert!(response_matches_range(200, None, 100, 0, 100));
+        assert!(
+            !response_matches_range(200, None, 100, 100, 100),
+            "server ignored Range for a mid-file request"
+        );
     }
 }

@@ -61,6 +61,8 @@ use crate::{DiskError, ReadJob, Result, WriteJob};
 pub struct IoUringDiskEngineConfig {
     pub queue_depth: u32,
     pub max_open_files: usize,
+    /// Bytes of write data that may be in flight at once (see `WriteBudget`).
+    pub max_write_buffer_bytes: usize,
 }
 
 impl Default for IoUringDiskEngineConfig {
@@ -68,6 +70,7 @@ impl Default for IoUringDiskEngineConfig {
         IoUringDiskEngineConfig {
             queue_depth: 256,
             max_open_files: 500,
+            max_write_buffer_bytes: crate::blocking::DEFAULT_MAX_WRITE_BUFFER_BYTES,
         }
     }
 }
@@ -113,6 +116,7 @@ struct PendingOp {
 
 pub struct IoUringDiskEngine {
     tx: std_mpsc::Sender<(Job, OpResponder)>,
+    budget: Arc<crate::WriteBudget>,
 }
 
 impl IoUringDiskEngine {
@@ -127,7 +131,10 @@ impl IoUringDiskEngine {
             .name("diskio-uring".into())
             .spawn(move || run_ring(ring, rx, max_open_files))
             .map_err(io::Error::other)?;
-        Ok(IoUringDiskEngine { tx })
+        Ok(IoUringDiskEngine {
+            tx,
+            budget: crate::WriteBudget::new(config.max_write_buffer_bytes),
+        })
     }
 
     fn send_gone_err(path: &std::path::Path) -> DiskError {
@@ -137,7 +144,34 @@ impl IoUringDiskEngine {
         }
     }
 
+    pub fn in_flight_write_bytes(&self) -> usize {
+        self.budget.in_flight()
+    }
+
+    pub fn max_write_buffer_bytes(&self) -> usize {
+        self.budget.threshold()
+    }
+
+    pub fn set_max_write_buffer_bytes(&self, bytes: usize) {
+        self.budget.set_threshold(bytes);
+    }
+
     pub async fn write_batch(&self, jobs: Vec<WriteJob>) -> Result<()> {
+        // Same behaviour as the blocking engine: merge contiguous blocks into single writes
+        // and hold at most `max_write_buffer_bytes` of data in flight.
+        let jobs = crate::coalesce_write_jobs(jobs);
+        let total_bytes: usize = jobs.iter().map(|j| j.data.len()).sum();
+        if total_bytes == 0 {
+            return Ok(());
+        }
+        let _reservation = self
+            .budget
+            .reserve(total_bytes)
+            .await
+            .map_err(|e| DiskError::Io {
+                path: PathBuf::from("<buffer>"),
+                source: io::Error::new(io::ErrorKind::BrokenPipe, e),
+            })?;
         let mut receivers = Vec::with_capacity(jobs.len());
         for job in jobs {
             let (otx, orx) = oneshot::channel();
@@ -202,7 +236,14 @@ fn run_ring(mut ring: IoUring, rx: std_mpsc::Receiver<(Job, OpResponder)>, max_o
         loop {
             match rx.try_recv() {
                 Ok((job, responder)) => {
-                    submit_job(&mut ring, &cache, &mut pending, &mut next_id, job, responder);
+                    submit_job(
+                        &mut ring,
+                        &cache,
+                        &mut pending,
+                        &mut next_id,
+                        job,
+                        responder,
+                    );
                 }
                 Err(std_mpsc::TryRecvError::Empty) => break,
                 Err(std_mpsc::TryRecvError::Disconnected) => return,
@@ -213,7 +254,14 @@ fn run_ring(mut ring: IoUring, rx: std_mpsc::Receiver<(Job, OpResponder)>, max_o
             // Nothing in flight: block for the next job rather than busy-polling.
             match rx.recv() {
                 Ok((job, responder)) => {
-                    submit_job(&mut ring, &cache, &mut pending, &mut next_id, job, responder);
+                    submit_job(
+                        &mut ring,
+                        &cache,
+                        &mut pending,
+                        &mut next_id,
+                        job,
+                        responder,
+                    );
                 }
                 Err(_) => return,
             }
@@ -244,7 +292,9 @@ fn run_ring(mut ring: IoUring, rx: std_mpsc::Receiver<(Job, OpResponder)>, max_o
                         fail_responder(
                             retry_op.responder,
                             retry_op.path,
-                            io::Error::other("io_uring submission queue full (short-completion retry)"),
+                            io::Error::other(
+                                "io_uring submission queue full (short-completion retry)",
+                            ),
                         );
                     } else {
                         pending.insert(retry_id, retry_op);
@@ -282,10 +332,7 @@ fn submit_job(
 
     let (entry, op) = match job {
         Job::Write {
-            path,
-            offset,
-            data,
-            ..
+            path, offset, data, ..
         } => {
             let entry = opcode::Write::new(fd, data.as_ptr(), data.len() as u32)
                 .offset(offset)
@@ -379,7 +426,11 @@ fn fail_responder(responder: OpResponder, path: PathBuf, source: io::Error) {
 /// covering just the unfinished remainder, exactly as a caller of `read(2)`/`write(2)`
 /// directly would be expected to loop and retry, rather than silently accepting
 /// truncated data or an incomplete write as success.
-fn process_completion(fd: types::Fd, mut op: PendingOp, result: i32) -> Option<(io_uring::squeue::Entry, PendingOp)> {
+fn process_completion(
+    fd: types::Fd,
+    mut op: PendingOp,
+    result: i32,
+) -> Option<(io_uring::squeue::Entry, PendingOp)> {
     if result < 0 {
         fail_responder(op.responder, op.path, io::Error::from_raw_os_error(-result));
         return None;
@@ -412,11 +463,15 @@ fn process_completion(fd: types::Fd, mut op: PendingOp, result: i32) -> Option<(
         let entry = match (&mut op._write_buf, &mut op.read_buf) {
             (Some(write_buf), None) => {
                 *write_buf = write_buf.slice(n..);
-                opcode::Write::new(fd, write_buf.as_ptr(), remaining as u32).offset(op.offset).build()
+                opcode::Write::new(fd, write_buf.as_ptr(), remaining as u32)
+                    .offset(op.offset)
+                    .build()
             }
             (None, Some(read_buf)) => {
                 let ptr = unsafe { read_buf.as_mut_ptr().add(op.progress) };
-                opcode::Read::new(fd, ptr, remaining as u32).offset(op.offset).build()
+                opcode::Read::new(fd, ptr, remaining as u32)
+                    .offset(op.offset)
+                    .build()
             }
             _ => unreachable!("a pending op has exactly one of write_buf/read_buf set"),
         };

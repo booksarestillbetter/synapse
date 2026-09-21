@@ -25,6 +25,10 @@ pub struct Ipv6Range {
 pub struct IpFilter {
     v4_ranges: Vec<Ipv4Range>,
     v6_ranges: Vec<Ipv6Range>,
+    /// True when both range lists are sorted by start and non-overlapping (see
+    /// [`IpFilter::normalize`]), which lets [`IpFilter::is_blocked`] binary-search instead
+    /// of scanning every rule. Any `add_*` clears it.
+    normalized: bool,
 }
 
 impl IpFilter {
@@ -36,6 +40,7 @@ impl IpFilter {
     pub fn add_v4_range(&mut self, start: Ipv4Addr, end: Ipv4Addr, description: &str) {
         let start_u32 = u32::from(start);
         let end_u32 = u32::from(end);
+        self.normalized = false;
         self.v4_ranges.push(Ipv4Range {
             start: start_u32.min(end_u32),
             end: start_u32.max(end_u32),
@@ -56,6 +61,7 @@ impl IpFilter {
         };
         let start = ip_u32 & mask;
         let end = start | !mask;
+        self.normalized = false;
         self.v4_ranges.push(Ipv4Range {
             start,
             end,
@@ -67,6 +73,7 @@ impl IpFilter {
     pub fn add_v6_range(&mut self, start: Ipv6Addr, end: Ipv6Addr, description: &str) {
         let start_u128 = u128::from(start);
         let end_u128 = u128::from(end);
+        self.normalized = false;
         self.v6_ranges.push(Ipv6Range {
             start: start_u128.min(end_u128),
             end: start_u128.max(end_u128),
@@ -80,9 +87,14 @@ impl IpFilter {
             return;
         }
         let ip_u128 = u128::from(ip);
-        let mask = if prefix == 0 { 0 } else { !0u128 << (128 - prefix) };
+        let mask = if prefix == 0 {
+            0
+        } else {
+            !0u128 << (128 - prefix)
+        };
         let start = ip_u128 & mask;
         let end = start | !mask;
+        self.normalized = false;
         self.v6_ranges.push(Ipv6Range {
             start,
             end,
@@ -162,7 +174,39 @@ impl IpFilter {
                 "Skipping unparseable ipfilter line"
             );
         }
+        self.normalize();
         Ok(loaded)
+    }
+
+    /// Sorts and merges overlapping/adjacent ranges so lookups are O(log n). Public
+    /// blocklists have hundreds of thousands of ranges and every accept, dial and
+    /// periodic re-check consults the filter, so a linear scan is not acceptable. Call
+    /// after a batch of `add_*`/`load_file`; `is_blocked` stays correct without it, just slower.
+    pub fn normalize(&mut self) {
+        self.v4_ranges.sort_by_key(|r| r.start);
+        let mut merged: Vec<Ipv4Range> = Vec::with_capacity(self.v4_ranges.len());
+        for r in self.v4_ranges.drain(..) {
+            match merged.last_mut() {
+                Some(last) if r.start <= last.end.saturating_add(1) => {
+                    last.end = last.end.max(r.end)
+                }
+                _ => merged.push(r),
+            }
+        }
+        self.v4_ranges = merged;
+
+        self.v6_ranges.sort_by_key(|r| r.start);
+        let mut merged6: Vec<Ipv6Range> = Vec::with_capacity(self.v6_ranges.len());
+        for r in self.v6_ranges.drain(..) {
+            match merged6.last_mut() {
+                Some(last) if r.start <= last.end.saturating_add(1) => {
+                    last.end = last.end.max(r.end)
+                }
+                _ => merged6.push(r),
+            }
+        }
+        self.v6_ranges = merged6;
+        self.normalized = true;
     }
 
     /// Checks if a given IP address is blocked.
@@ -170,11 +214,25 @@ impl IpFilter {
         match addr {
             IpAddr::V4(v4) => {
                 let val = u32::from(v4);
-                self.v4_ranges.iter().any(|r| val >= r.start && val <= r.end)
+                if self.normalized {
+                    let i = self.v4_ranges.partition_point(|r| r.start <= val);
+                    i > 0 && val <= self.v4_ranges[i - 1].end
+                } else {
+                    self.v4_ranges
+                        .iter()
+                        .any(|r| val >= r.start && val <= r.end)
+                }
             }
             IpAddr::V6(v6) => {
                 let val = u128::from(v6);
-                self.v6_ranges.iter().any(|r| val >= r.start && val <= r.end)
+                if self.normalized {
+                    let i = self.v6_ranges.partition_point(|r| r.start <= val);
+                    i > 0 && val <= self.v6_ranges[i - 1].end
+                } else {
+                    self.v6_ranges
+                        .iter()
+                        .any(|r| val >= r.start && val <= r.end)
+                }
             }
         }
     }
@@ -240,5 +298,49 @@ mod tests {
         assert!(filter.is_blocked(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 7))));
         assert!(filter.is_blocked(IpAddr::V4(Ipv4Addr::new(10, 9, 9, 9))));
         assert!(!filter.is_blocked(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 20))));
+    }
+
+    #[test]
+    fn normalized_lookups_match_linear_scan_and_merge_overlaps() {
+        let mut f = IpFilter::new();
+        f.add_v4_cidr(Ipv4Addr::new(10, 0, 0, 0), 24);
+        f.add_v4_range(
+            Ipv4Addr::new(10, 0, 0, 200),
+            Ipv4Addr::new(10, 0, 1, 50),
+            "overlap",
+        );
+        f.add_v4_cidr(Ipv4Addr::new(192, 168, 0, 0), 16);
+        f.add_v6_range(
+            "2001:db8::1".parse().unwrap(),
+            "2001:db8::ff".parse().unwrap(),
+            "v6",
+        );
+        let probes: Vec<IpAddr> = [
+            "9.255.255.255",
+            "10.0.0.0",
+            "10.0.0.255",
+            "10.0.1.50",
+            "10.0.1.51",
+            "192.168.44.1",
+            "192.169.0.0",
+            "2001:db8::1",
+            "2001:db8::100",
+            "::1",
+        ]
+        .iter()
+        .map(|s| s.parse().unwrap())
+        .collect();
+        let before: Vec<bool> = probes.iter().map(|&p| f.is_blocked(p)).collect();
+        f.normalize();
+        let after: Vec<bool> = probes.iter().map(|&p| f.is_blocked(p)).collect();
+        assert_eq!(before, after);
+        assert_eq!(
+            after,
+            vec![false, true, true, true, false, true, false, true, false, false]
+        );
+        assert_eq!(f.total_rules(), 3, "overlapping v4 ranges merge into one");
+        // Adding after normalizing stays correct (falls back to scanning until re-normalized).
+        f.add_v4_cidr(Ipv4Addr::new(172, 16, 0, 0), 12);
+        assert!(f.is_blocked("172.20.1.1".parse().unwrap()));
     }
 }

@@ -21,7 +21,10 @@ mod logging;
 mod migrate;
 
 #[derive(Parser)]
-#[command(name = "synapsed", about = "Synapse 2.0 — High-Scale Next-Gen BitTorrent Daemon")]
+#[command(
+    name = "synapsed",
+    about = "Synapse 2.0 — High-Scale Next-Gen BitTorrent Daemon"
+)]
 struct Args {
     /// Path to a config file. Defaults to the platform config dir's synapse.toml, or
     /// built-in defaults if that doesn't exist either.
@@ -35,6 +38,10 @@ struct Args {
     /// Optional HTTP API & Web UI listen port override (e.g. 8080 or 9091)
     #[arg(long)]
     http_port: Option<u16>,
+
+    /// Enable DHT read-only mode (BEP 43: do not add self to other nodes' routing tables)
+    #[arg(long)]
+    dht_read_only: bool,
 
     #[command(subcommand)]
     command: Option<Subcommand>,
@@ -56,6 +63,55 @@ enum Subcommand {
         /// Print verbose details (file tree, tracker tiers, web seeds)
         #[arg(short, long)]
         verbose: bool,
+
+        /// Directory of trusted signer certificates for checking BEP 35 signatures
+        #[arg(long)]
+        trust_dir: Option<PathBuf>,
+    },
+    /// Create a .torrent file from a file or directory
+    Create {
+        /// The file or directory to share
+        path: PathBuf,
+
+        /// Where to write the .torrent (default: <name>.torrent in the current directory)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+
+        /// Tracker announce URL (repeat for more; each is its own tier unless --same-tier)
+        #[arg(short, long = "tracker")]
+        trackers: Vec<String>,
+
+        /// Put all trackers in one tier
+        #[arg(long)]
+        same_tier: bool,
+
+        /// Web seed URL (BEP 19)
+        #[arg(short, long = "webseed")]
+        web_seeds: Vec<String>,
+
+        /// Comment stored in the torrent
+        #[arg(short, long)]
+        comment: Option<String>,
+
+        /// Mark the torrent private (BEP 27)
+        #[arg(long)]
+        private: bool,
+
+        /// `source` tag for trackers that require one
+        #[arg(long)]
+        source: Option<String>,
+
+        /// Piece size in KiB (a power of two, at least 16); default depends on the total size
+        #[arg(long)]
+        piece_size: Option<u32>,
+
+        /// Create a BitTorrent v2 torrent (BEP 52) instead of v1
+        #[arg(long, conflicts_with = "hybrid")]
+        v2: bool,
+
+        /// Create a hybrid v1+v2 torrent
+        #[arg(long)]
+        hybrid: bool,
     },
 }
 
@@ -84,13 +140,16 @@ async fn main() -> std::process::ExitCode {
 
     if let Some(Subcommand::Migrate { client }) = args.command {
         match client {
-            MigrateClient::Transmission { transmission_dir, synapse_dir, dry_run } => {
+            MigrateClient::Transmission {
+                transmission_dir,
+                synapse_dir,
+                dry_run,
+            } => {
                 let trans_dir = transmission_dir
                     .or_else(migrate::default_transmission_dir)
                     .unwrap_or_else(|| PathBuf::from("./Transmission"));
 
-                let target_dir = synapse_dir
-                    .unwrap_or_else(migrate::default_synapse_session_dir);
+                let target_dir = synapse_dir.unwrap_or_else(migrate::default_synapse_session_dir);
 
                 println!("📦 Synapse 2.0 Migration Tool — Transmission Importer");
                 println!("📂 Source Transmission Directory: {}", trans_dir.display());
@@ -104,7 +163,10 @@ async fn main() -> std::process::ExitCode {
                 match migrate::migrate_transmission(&trans_dir, &target_dir, dry_run) {
                     Ok(result) => {
                         println!("{:-<100}", "");
-                        println!("{:<40} {:<12} {:<12} {:<20} {:<12}", "NAME", "HASH", "SIZE", "PROGRESS", "STATE");
+                        println!(
+                            "{:<40} {:<12} {:<12} {:<20} {:<12}",
+                            "NAME", "HASH", "SIZE", "PROGRESS", "STATE"
+                        );
                         println!("{:-<100}", "");
                         for entry in &result.found {
                             let size_mb = (entry.total_size as f64) / 1024.0 / 1024.0;
@@ -113,8 +175,15 @@ async fn main() -> std::process::ExitCode {
                             } else {
                                 0.0
                             };
-                            let state_str = if entry.is_paused { "Paused" } else if pct >= 100.0 { "Seeding" } else { "Downloading" };
-                            let hash_short = &entry.info_hash_hex[..8.min(entry.info_hash_hex.len())];
+                            let state_str = if entry.is_paused {
+                                "Paused"
+                            } else if pct >= 100.0 {
+                                "Seeding"
+                            } else {
+                                "Downloading"
+                            };
+                            let hash_short =
+                                &entry.info_hash_hex[..8.min(entry.info_hash_hex.len())];
                             let name_truncated = if entry.name.len() > 38 {
                                 format!("{}...", &entry.name[..35])
                             } else {
@@ -135,7 +204,11 @@ async fn main() -> std::process::ExitCode {
                         if dry_run {
                             println!("\n✅ Found {} torrent(s) ready to migrate. Run without --dry-run to write session files.", result.found.len());
                         } else {
-                            println!("\n🎉 Successfully migrated {}/{} torrent(s) to Synapse!", result.migrated, result.found.len());
+                            println!(
+                                "\n🎉 Successfully migrated {}/{} torrent(s) to Synapse!",
+                                result.migrated,
+                                result.found.len()
+                            );
                             if !result.errors.is_empty() {
                                 println!("⚠️ Warnings / Errors ({}):", result.errors.len());
                                 for err in &result.errors {
@@ -153,7 +226,100 @@ async fn main() -> std::process::ExitCode {
                 }
             }
         }
-    } else if let Some(Subcommand::Inspect { paths, verbose }) = args.command {
+    } else if let Some(Subcommand::Create {
+        path,
+        output,
+        trackers,
+        same_tier,
+        web_seeds,
+        comment,
+        private,
+        source,
+        piece_size,
+        v2,
+        hybrid,
+    }) = args.command
+    {
+        let tiers = if same_tier {
+            vec![trackers]
+        } else {
+            trackers.into_iter().map(|t| vec![t]).collect()
+        };
+        let opts = synapse_meta::create::CreateOptions {
+            piece_length: piece_size.map(|k| k.saturating_mul(1024)),
+            trackers: tiers,
+            web_seeds,
+            comment,
+            created_by: Some(format!("Synapse/{}", env!("CARGO_PKG_VERSION"))),
+            private,
+            source,
+            name: None,
+            version: if hybrid {
+                synapse_meta::create::TorrentVersion::Hybrid
+            } else if v2 {
+                synapse_meta::create::TorrentVersion::V2
+            } else {
+                synapse_meta::create::TorrentVersion::V1
+            },
+            creation_date: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .map(|d| d.as_secs() as i64),
+        };
+        let mut last_pct = 101;
+        let result = synapse_meta::create::create_torrent(&path, &opts, |done, total| {
+            let pct = (done * 100).checked_div(total).unwrap_or(100) as i32;
+            if pct != last_pct {
+                last_pct = pct;
+                eprint!("\rHashing... {pct}%");
+            }
+        });
+        eprintln!();
+        return match result {
+            Ok(bytes) => {
+                let out = output.unwrap_or_else(|| {
+                    let name = path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "torrent".into());
+                    PathBuf::from(format!("{name}.torrent"))
+                });
+                match std::fs::write(&out, &bytes) {
+                    Ok(()) => {
+                        let hash = synapse_meta::Info::from_torrent_bytes(&bytes)
+                            .map(|i| hex::encode(i.hash))
+                            .unwrap_or_default();
+                        println!(
+                            "Wrote {} ({} bytes), info hash {hash}",
+                            out.display(),
+                            bytes.len()
+                        );
+                        std::process::ExitCode::SUCCESS
+                    }
+                    Err(e) => {
+                        eprintln!("cannot write {}: {e}", out.display());
+                        std::process::ExitCode::FAILURE
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("cannot create the torrent: {e}");
+                std::process::ExitCode::FAILURE
+            }
+        };
+    } else if let Some(Subcommand::Inspect {
+        paths,
+        verbose,
+        trust_dir,
+    }) = args.command
+    {
+        if let Some(dir) = trust_dir {
+            let (store, problems) = synapse_meta::TrustStore::load_dir(&dir);
+            for p in problems {
+                eprintln!("warning: {p}");
+            }
+            inspect::set_trust_store(store);
+        }
         let result = inspect::inspect_paths(&paths);
         if result.diagnostics.is_empty() {
             println!("🔍 No .torrent files found in specified path(s).");
@@ -174,13 +340,43 @@ async fn main() -> std::process::ExitCode {
             let size_mb = (diag.total_size_bytes as f64) / 1024.0 / 1024.0;
             println!("📄 File:         {}", diag.file_path.display());
             println!("🏷️  Name:         {}", diag.name);
-            println!("🔑 Info Hash:    {}", if diag.info_hash_hex.is_empty() { "N/A" } else { &diag.info_hash_hex });
+            println!(
+                "🔑 Info Hash:    {}",
+                if diag.info_hash_hex.is_empty() {
+                    "N/A"
+                } else {
+                    &diag.info_hash_hex
+                }
+            );
             println!("📦 Format:       {}", diag.format_type);
-            println!("📊 Payload Size: {:.2} MB ({} bytes, {} file(s))", size_mb, diag.total_size_bytes, diag.files_count);
-            if diag.piece_length > 0 {
-                println!("🧩 Pieces:       {} pieces × {} KB", diag.total_pieces, diag.piece_length / 1024);
+            if let Some(ref root_v1) = diag.root_hash_v1_hex {
+                println!("🌳 Merkle Root:  {} (BEP 30 SHA-1)", root_v1);
             }
-            println!("🔒 Privacy:      {}", if diag.is_private { "Private Swarm (DHT/PEX disabled)" } else { "Public Swarm" });
+            if diag.is_signed {
+                println!(
+                    "✍️  Signatures:   {} signature(s) embedded (BEP 35)",
+                    diag.signatures_count
+                );
+            }
+            println!(
+                "📊 Payload Size: {:.2} MB ({} bytes, {} file(s))",
+                size_mb, diag.total_size_bytes, diag.files_count
+            );
+            if diag.piece_length > 0 {
+                println!(
+                    "🧩 Pieces:       {} pieces × {} KB",
+                    diag.total_pieces,
+                    diag.piece_length / 1024
+                );
+            }
+            println!(
+                "🔒 Privacy:      {}",
+                if diag.is_private {
+                    "Private Swarm (DHT/PEX disabled)"
+                } else {
+                    "Public Swarm"
+                }
+            );
             let trackers_str = if diag.trackers.is_empty() {
                 "None (Trackers omitted)".to_string()
             } else if verbose {
@@ -233,13 +429,60 @@ async fn main() -> std::process::ExitCode {
         };
     }
 
-    let config = match Config::load(args.config.as_deref()) {
+    let mut config = match Config::load(args.config.as_deref()) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("failed to load config: {e}");
             return std::process::ExitCode::FAILURE;
         }
     };
+
+    if args.dht_read_only {
+        config.network.dht_read_only = true;
+    }
+
+    // Outbound proxy (SOCKS5 / HTTP CONNECT). In anonymous mode nothing that could bypass it runs.
+    match config.proxy.kind.to_ascii_lowercase().as_str() {
+        "none" | "" => {}
+        kind @ ("socks5" | "http") => {
+            if config.proxy.host.trim().is_empty() {
+                eprintln!("proxy.type is {kind} but proxy.host is empty");
+                return std::process::ExitCode::FAILURE;
+            }
+            let settings = synapse_engine::proxy::ProxySettings {
+                kind: if kind == "socks5" {
+                    synapse_engine::proxy::ProxyKind::Socks5
+                } else {
+                    synapse_engine::proxy::ProxyKind::Http
+                },
+                host: config.proxy.host.trim().to_string(),
+                port: config.proxy.port,
+                auth: config
+                    .proxy
+                    .username
+                    .clone()
+                    .map(|u| (u, config.proxy.password.clone().unwrap_or_default())),
+                proxy_peer_connections: config.proxy.proxy_peer_connections,
+                proxy_http: config.proxy.proxy_tracker_connections,
+                proxy_hostnames: config.proxy.proxy_hostnames,
+                force_proxy: config.proxy.force_proxy,
+            };
+            if settings.force_proxy {
+                config.network.enable_dht = false;
+                config.network.enable_lsd = false;
+                config.network.enable_zeroconf = false;
+                config.network.enable_utp = false;
+                config.network.enable_nat = false;
+                config.privacy.disable_dht_globally = true;
+            }
+            synapse_engine::proxy::set_global(Some(settings));
+        }
+        other => {
+            eprintln!("proxy.type must be none, socks5 or http (got {other:?})");
+            return std::process::ExitCode::FAILURE;
+        }
+    }
+    let force_proxy = synapse_engine::proxy::force_proxy();
 
     logging::init_logging(&config);
 
@@ -293,12 +536,18 @@ async fn main() -> std::process::ExitCode {
     let lifecycle_config = synapse_engine::LifecycleConfig {
         staging_dir: config.lifecycle.staging_dir.clone(),
         auto_hardlink: config.lifecycle.auto_hardlink,
-        wal_path: config.lifecycle.wal_path.clone().or_else(|| Some(config.disk.session_dir.join("completed_wal.jsonl"))),
+        wal_path: config
+            .lifecycle
+            .wal_path
+            .clone()
+            .or_else(|| Some(config.disk.session_dir.join("completed_wal.jsonl"))),
         post_script: config.lifecycle.post_script.clone(),
         copy_script: config.lifecycle.copy_script.clone(),
         instructions,
     };
-    let lifecycle = Arc::new(synapse_engine::ConduitLifecycleDispatcher::new(lifecycle_config));
+    let lifecycle = Arc::new(synapse_engine::ConduitLifecycleDispatcher::new(
+        lifecycle_config,
+    ));
 
     let dynamic_settings = settings_from_config(&config);
 
@@ -312,52 +561,123 @@ async fn main() -> std::process::ExitCode {
             config.circuit_breaker.failure_threshold,
             Duration::from_secs(config.circuit_breaker.initial_backoff_seconds),
             Duration::from_secs(config.circuit_breaker.max_backoff_seconds),
-        );
+        )
+        .with_nat_enabled(config.network.enable_nat);
     if let Some(ref watch_dir) = config.disk.watch_dir {
         swarm_builder = swarm_builder.with_watch_dir(watch_dir.clone());
     }
+    swarm_builder =
+        swarm_builder.with_dht_state_path(config.disk.session_dir.join("dht_state.bencode"));
+    {
+        let mut trust = synapse_meta::TrustStore::new();
+        if let Some(ref dir) = config.signing.trusted_signers_dir {
+            let (store, problems) = synapse_meta::TrustStore::load_dir(dir);
+            for p in problems {
+                tracing::warn!("BEP 35 trust store: {p}");
+            }
+            tracing::info!("BEP 35: {} trusted signer(s) loaded", store.len());
+            trust = store;
+        }
+        swarm_builder =
+            swarm_builder.with_signature_policy(trust, config.signing.require_trusted_signature);
+    }
+    swarm_builder = swarm_builder.with_rss_feeds(config.rss.feeds.clone());
+    let search_sources = config.search.engines.clone();
+    swarm_builder =
+        swarm_builder.with_rss_state_path(config.disk.session_dir.join("rss_state.json"));
     let swarm = Arc::new(swarm_builder);
+    for source in search_sources {
+        match swarm.search_manager().add_source(&source).await {
+            Ok(engine) => tracing::info!("BEP 18: search engine '{}' loaded", engine.short_name),
+            Err(e) => tracing::warn!("BEP 18: could not load search engine {source}: {e}"),
+        }
+    }
 
+    synapse_engine::announcer::set_fallback_trackers_enabled(
+        config.network.enable_fallback_trackers,
+    );
     swarm.load_ip_filter_config(
         &config.network.blocked_ip_ranges,
-        config.network.ip_filter_file.as_ref().map(std::path::Path::new),
+        config
+            .network
+            .ip_filter_file
+            .as_ref()
+            .map(std::path::Path::new),
     );
 
-    let listen_v4 = SocketAddr::from(([0, 0, 0, 0], config.network.listen_port));
-    let listen_v6 = SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], config.network.listen_port));
+    // Which addresses to listen on: every interface by default, or exactly the addresses listed
+    // in `network.bind_interfaces`. IPv6 listeners are only started when `enable_ipv6` is set.
+    let mut listen_addrs: Vec<SocketAddr> = Vec::new();
+    if config.network.bind_interfaces.is_empty() {
+        listen_addrs.push(SocketAddr::from(([0, 0, 0, 0], config.network.listen_port)));
+        if config.network.enable_ipv6 {
+            listen_addrs.push(SocketAddr::from(([0u16; 8], config.network.listen_port)));
+        }
+    } else {
+        for entry in &config.network.bind_interfaces {
+            match entry.parse::<std::net::IpAddr>() {
+                Ok(ip) if ip.is_ipv6() && !config.network.enable_ipv6 => {
+                    tracing::info!("Skipping IPv6 bind_interfaces entry {entry}: enable_ipv6 is false");
+                }
+                Ok(ip) => listen_addrs.push(SocketAddr::new(ip, config.network.listen_port)),
+                Err(_) => tracing::warn!(
+                    "bind_interfaces entry {entry:?} is not an IP address and is ignored (interface names are not supported)"
+                ),
+            }
+        }
+    }
 
-    // 1. Bind IPv4 listener first to guarantee standard inbound connectivity from all peers
-    let v4_ok = match swarm.clone().start_listener(listen_v4).await {
-        Ok(_) => {
-            tracing::info!("📡 SwarmEngine IPv4 listener active on {}", listen_v4);
-            true
+    // The first address that binds becomes the primary listener (advertised port, NAT mapping,
+    // uTP and DHT); IPv6 wildcard sockets are IPv6-only so they can share the port.
+    let mut bound_any = force_proxy; // anonymous mode opens no listening socket
+    for addr in listen_addrs.iter().filter(|_| !force_proxy) {
+        match swarm.clone().start_listener(*addr).await {
+            Ok(_) => {
+                tracing::info!("📡 SwarmEngine listener active on {}", addr);
+                bound_any = true;
+            }
+            Err(e) if addr.is_ipv6() => {
+                tracing::debug!("IPv6 listener unavailable on {} ({})", addr, e);
+            }
+            Err(e) => {
+                tracing::warn!("Could not bind BitTorrent listen address {}: {}", addr, e);
+            }
         }
-        Err(e) => {
-            tracing::warn!("Could not bind IPv4 BitTorrent listen port {}: {}", listen_v4, e);
-            false
-        }
-    };
+    }
 
-    // 2. Also attempt to bind IPv6 listener concurrently so native IPv6 peers can connect
-    let v6_ok = match swarm.clone().start_listener(listen_v6).await {
-        Ok(_) => {
-            tracing::info!("📡 SwarmEngine IPv6 listener active on {}", listen_v6);
-            true
-        }
-        Err(e) => {
-            tracing::debug!("IPv6 listener unavailable on {} ({})", listen_v6, e);
-            false
-        }
-    };
-
-    if !v4_ok && !v6_ok {
-        tracing::error!("Failed to bind any BitTorrent listen port (port {})", config.network.listen_port);
+    if !bound_any {
+        tracing::error!(
+            "Failed to bind any BitTorrent listen port (port {})",
+            config.network.listen_port
+        );
         return std::process::ExitCode::FAILURE;
     }
 
-    match swarm.clone().start_lsd().await {
-        Ok(_) => tracing::info!("📡 Local Peer Discovery (LSD) active"),
-        Err(e) => tracing::warn!("Could not start Local Peer Discovery (LSD): {} (continuing without it)", e),
+    // Session-wide unchoke slot allocation across swarms (and the seed choking algorithm).
+    // Without this task the per-torrent choker never receives its allocation.
+    let _session_choker_handle = swarm.clone().start_session_choker_loop();
+
+    if force_proxy {
+        tracing::info!("proxy.force_proxy: no listener, DHT, LSD, zeroconf, uTP or port mapping");
+    } else {
+        match swarm.clone().start_lsd().await {
+            Ok(_) => tracing::info!("📡 Local Peer Discovery (LSD) active"),
+            Err(e) => tracing::warn!(
+                "Could not start Local Peer Discovery (LSD): {} (continuing without it)",
+                e
+            ),
+        }
+    }
+
+    if config.network.enable_zeroconf {
+        if let Ok(group) = synapse_engine::zeroconf::MDNS_IPV4.parse() {
+            match swarm.clone().start_zeroconf(group).await {
+                Ok(_) => tracing::info!("📡 Zeroconf (BEP 26) peer discovery active"),
+                Err(e) => tracing::warn!(
+                    "Could not start Zeroconf discovery (BEP 26): {e} (continuing without it)"
+                ),
+            }
+        }
     }
 
     if config.privacy.disable_dht_globally {
@@ -449,11 +769,63 @@ async fn main() -> std::process::ExitCode {
         });
     }
 
+    // BEP 39: look for updates to torrents that carry an update-url.
+    if config.updates.enabled {
+        let update_swarm = swarm.clone();
+        let interval = Duration::from_secs(config.updates.check_interval_secs.max(3600));
+        let mut shutdown_rx = shutdown_rx.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        let _ = update_swarm.check_for_updates().await;
+                    }
+                    _ = shutdown_rx.changed() => {
+                        if *shutdown_rx.borrow() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    // BEP 36 RSS / Atom Feed Automation Background Poller
+    if config.rss.enabled && !config.rss.feeds.is_empty() {
+        let rss_swarm = swarm.clone();
+        let poll_interval = Duration::from_secs(config.rss.poll_interval_secs.max(60));
+        let mut shutdown_rx = shutdown_rx.clone();
+        tokio::spawn(async move {
+            tracing::info!(
+                "📰 BEP 36 RSS feed poller active (interval: {:?})",
+                poll_interval
+            );
+            let mut interval = tokio::time::interval(poll_interval);
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        let _ = rss_swarm.poll_rss_feeds().await;
+                    }
+                    _ = shutdown_rx.changed() => {
+                        if *shutdown_rx.borrow() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     if config.rpc.enabled {
         let rpc_addr: SocketAddr = match config.rpc.listen_addr.parse() {
             Ok(addr) => addr,
             Err(e) => {
-                tracing::error!("Invalid RPC listen address {}: {}", config.rpc.listen_addr, e);
+                tracing::error!(
+                    "Invalid RPC listen address {}: {}",
+                    config.rpc.listen_addr,
+                    e
+                );
                 return std::process::ExitCode::FAILURE;
             }
         };
@@ -464,10 +836,11 @@ async fn main() -> std::process::ExitCode {
         // rather than touching all dozen handlers individually.
         let auth_service = service.clone();
         #[allow(clippy::result_large_err)]
-        let interceptor = move |req: tonic::Request<()>| -> Result<tonic::Request<()>, tonic::Status> {
-            auth_service.verify_auth(&req)?;
-            Ok(req)
-        };
+        let interceptor =
+            move |req: tonic::Request<()>| -> Result<tonic::Request<()>, tonic::Status> {
+                auth_service.verify_auth(&req)?;
+                Ok(req)
+            };
 
         let mut grpc_shutdown = shutdown_rx.clone();
         tokio::spawn(async move {
@@ -519,12 +892,20 @@ async fn main() -> std::process::ExitCode {
         let mut http_shutdown = shutdown_rx.clone();
         tokio::spawn(async move {
             let web_enabled = web_config.enabled;
-            let app = synapse_rpc::create_http_router_all(http_engine, http_auth, metrics_enabled, web_config);
+            let app = synapse_rpc::create_http_router_all(
+                http_engine,
+                http_auth,
+                metrics_enabled,
+                web_config,
+            );
             tracing::info!("🌐 REST API & Web Server listening on http://{}", http_addr);
             if web_enabled {
                 tracing::info!("   - Web Interface:          http://{}/", http_addr);
             }
-            tracing::info!("   - Interactive Swagger UI: http://{}/swagger-ui", http_addr);
+            tracing::info!(
+                "   - Interactive Swagger UI: http://{}/swagger-ui",
+                http_addr
+            );
             if metrics_enabled {
                 tracing::info!("   - Prometheus Metrics:     http://{}/metrics", http_addr);
             }
@@ -566,7 +947,8 @@ async fn main() -> std::process::ExitCode {
             let _ = tokio::fs::create_dir_all(&imported_dir).await;
             let _ = tokio::fs::create_dir_all(&failed_dir).await;
 
-            let mut failure_counts: std::collections::HashMap<PathBuf, u32> = std::collections::HashMap::new();
+            let mut failure_counts: std::collections::HashMap<PathBuf, u32> =
+                std::collections::HashMap::new();
 
             loop {
                 tokio::select! {
@@ -588,7 +970,9 @@ async fn main() -> std::process::ExitCode {
                     if path.is_file() {
                         if let Some(ext) = path.extension() {
                             if ext == "torrent" {
-                                let data = match tokio::fs::read(&path).await {
+                                let data = match synapse_rpc::url_fetcher::read_torrent_file(&path)
+                                    .await
+                                {
                                     Ok(d) if !d.is_empty() => d,
                                     _ => continue,
                                 };
@@ -613,9 +997,33 @@ async fn main() -> std::process::ExitCode {
                                 };
 
                                 match synapse_meta::Info::from_bencode(bencode) {
+                                    Ok(info)
+                                        if watch_swarm.check_signature_policy(&info).is_err() =>
+                                    {
+                                        tracing::warn!(
+                                            "Refusing watch-directory torrent '{}': not signed by a trusted signer",
+                                            info.name
+                                        );
+                                        failure_counts.remove(&path);
+                                        let fname = path.file_name().unwrap_or_default();
+                                        let rejected_dir = path
+                                            .parent()
+                                            .unwrap_or(std::path::Path::new("."))
+                                            .join("rejected");
+                                        let _ = tokio::fs::create_dir_all(&rejected_dir).await;
+                                        let _ = tokio::fs::rename(&path, rejected_dir.join(fname))
+                                            .await;
+                                    }
                                     Ok(info) => {
-                                        tracing::info!("📥 Auto-ingesting .torrent from watch directory: {}", info.name);
-                                        watch_swarm.add_torrent(Arc::new(info), dl_dir.clone(), None);
+                                        tracing::info!(
+                                            "📥 Auto-ingesting .torrent from watch directory: {}",
+                                            info.name
+                                        );
+                                        watch_swarm.add_torrent(
+                                            Arc::new(info),
+                                            dl_dir.clone(),
+                                            None,
+                                        );
                                         failure_counts.remove(&path);
 
                                         let fname = path.file_name().unwrap_or_default();
@@ -625,7 +1033,11 @@ async fn main() -> std::process::ExitCode {
                                                 .duration_since(std::time::UNIX_EPOCH)
                                                 .unwrap_or_default()
                                                 .as_secs();
-                                            dest = imported_dir.join(format!("{}.{}", fname.to_string_lossy(), ts));
+                                            dest = imported_dir.join(format!(
+                                                "{}.{}",
+                                                fname.to_string_lossy(),
+                                                ts
+                                            ));
                                         }
                                         let _ = tokio::fs::rename(&path, dest).await;
                                     }
@@ -658,13 +1070,21 @@ async fn main() -> std::process::ExitCode {
 
     let _ = shutdown_tx.send(true);
 
-    tracing::info!("Shutting down: stopping torrent actors and flushing state to disk (5s timeout)...");
+    tracing::info!(
+        "Shutting down: stopping torrent actors and flushing state to disk (5s timeout)..."
+    );
     let shutdown_future = async {
         swarm.shutdown();
         swarm.flush_session().await;
+        // Persist the DHT node id and known nodes, and give the gateway its port mappings back.
+        swarm.persist_dht_state().await;
+        swarm.release_port_mappings().await;
     };
 
-    if tokio::time::timeout(Duration::from_secs(5), shutdown_future).await.is_err() {
+    if tokio::time::timeout(Duration::from_secs(5), shutdown_future)
+        .await
+        .is_err()
+    {
         tracing::warn!("⚠️ Graceful shutdown timed out after 5s — forcing process exit.");
     } else {
         tracing::info!("✅ Session state flushed successfully. Daemon shutdown complete.");
@@ -673,15 +1093,13 @@ async fn main() -> std::process::ExitCode {
     std::process::ExitCode::SUCCESS
 }
 
-async fn wait_for_shutdown_or_reload(
-    swarm: Arc<SwarmEngine>,
-    config_path: Option<PathBuf>,
-) {
+async fn wait_for_shutdown_or_reload(swarm: Arc<SwarmEngine>, config_path: Option<PathBuf>) {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{signal, SignalKind};
 
-        let mut sigterm = signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
+        let mut sigterm =
+            signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
         let mut sigint = signal(SignalKind::interrupt()).expect("failed to install SIGINT handler");
         let mut sigquit = signal(SignalKind::quit()).expect("failed to install SIGQUIT handler");
         let mut sighup = signal(SignalKind::hangup()).expect("failed to install SIGHUP handler");
@@ -848,22 +1266,31 @@ fn settings_from_config(config: &Config) -> synapse_engine::DynamicSessionSettin
             seed_ratio_limited: config.queue.seed_ratio_limited,
             share_ratio_limit: config.queue.seed_ratio_limit,
             idle_seeding_limit_enabled: config.queue.idle_seeding_limit_enabled,
-            seed_time_limit_secs: config.queue.idle_seeding_limit_minutes.map(|m| (m as u64) * 60),
+            seed_time_limit_secs: config
+                .queue
+                .idle_seeding_limit_minutes
+                .map(|m| (m as u64) * 60),
+            ..Default::default()
         },
 
         max_peers_per_torrent: config.network.max_peers_per_torrent,
         max_global_peers: config.network.max_global_peers,
 
         dht_enabled: config.network.enable_dht,
+        dht_read_only: config.network.dht_read_only,
         pex_enabled: config.network.enable_pex,
         lsd_enabled: config.network.enable_lsd,
+        zeroconf_enabled: config.network.enable_zeroconf,
+        announce_ip: config.network.announce_ip,
+        enable_utp: config.network.enable_utp,
         encryption: config.network.encryption.clone(),
+        allow_local_web_seeds: config.network.allow_local_web_seeds,
 
         download_dir: config.disk.download_dir.clone(),
         incomplete_dir: config.disk.incomplete_dir.clone(),
         incomplete_dir_enabled: config.disk.incomplete_dir_enabled,
         start_added_torrents: config.lifecycle.start_added_torrents,
         trash_original_torrent_files: config.lifecycle.trash_original_torrent_files,
+        ..Default::default()
     }
 }
-

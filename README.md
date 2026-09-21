@@ -20,36 +20,63 @@ Engineered from first principles to comfortably scale past **50,000+ concurrent 
 
 ### 2. Multi-Homed Network Engine & Dual-Stack IPv6 DHT
 - **Default Peer Wire Port `54345`**: Dual-stack TCP and UDP listener on port `54345`.
-- **BEP 32 IPv6 Kademlia DHT (`synapse-dht`)**: Full compact node serialization (`NodeInfoV6`, 38 bytes) and compact peer codecs (`compact_peer6`, 18 bytes) supporting dual-stack `nodes`/`nodes6` KRPC queries and responses.
+- **BEP 32 IPv6 Kademlia DHT (`synapse-dht`)**: The daemon runs a dual-stack node (IPv4 socket plus an IPv6-only socket on the same port; IPv4-only if IPv6 is unavailable). Compact node serialization (`NodeInfoV6`, 38 bytes) and compact peer codecs (`compact_peer6`, 18 bytes) supporting dual-stack `nodes`/`nodes6` KRPC queries and responses.
 - **Iterative Network Walker (`synapse-dht`)**: 160-bucket Kademlia node with autonomous token rotation, defensive routing table management, and multi-hop recursive graph traversal (`iterative_find_node`, `iterative_get_peers`).
 - **Multi-Homed Binding (`synapse-config` & `synapsed`)**: Simultaneous dual-stack binding across IPv4, IPv6, VPN, and LAN interfaces with fail-safe routing.
 
-### 3. Complete BitTorrent Protocol Standards Matrix
-- **BEP 52 BitTorrent v2 Protocol (`synapse-meta`)**: Next-generation BitTorrent v2 specification supporting **SHA-256 Merkle trees** (16 KiB leaf blocks), hierarchical `file tree` dictionaries, per-file `pieces root` verification, and v1+v2 hybrid swarms.
-- **BEP 44 Arbitrary Data Storage in DHT (`synapse-dht`)**: Decentralized key-value storage in Kademlia DHT for immutable items (SHA-1 target) and mutable items authenticated via **Ed25519** public keys, sequence numbers, and atomic Compare-And-Swap (CAS).
-- **BEP 46 Updating Torrents Via DHT Mutable Items (`synapse-dht`)**: Automated tracking and resolution of dynamic torrent revisions published under Ed25519 public keys.
-- **BEP 51 DHT Infohash Indexing (`sample_infohashes`) (`synapse-dht`)**: `sample_infohashes` KRPC query and response parsing enabling crawler sampling and swarm indexing.
-- **BEP 33 DHT Scrape (`synapse-dht`)**: Querying estimated seeder and leecher counts directly from DHT storage nodes.
-- **BEP 42 DHT Security Extension (`synapse-dht`)**: IP-derived Node ID generation (`generate_secure_node_id`) and verification (`verify_secure_node_id`) using CRC32c checksums to protect routing tables against Sybil and eclipse attacks.
-- **BEP 35 Torrent Digital Signatures (`synapse-meta`)**: Ed25519 and X.509 digital signature parsing and cryptographic provenance verification inside `.torrent` files.
-- **BEP 36 Torrent RSS / Atom Feeds (`synapse-meta`)**: RSS 2.0 and Atom XML feed parser extracting torrent download URLs, enclosures, sizes, publication dates, and infohashes.
-- **BEP 47 Padding Files & Whole-File Hashing (`synapse-meta`)**: Boundary alignment padding file detection (`.pad/`, `attr: "p"`) and full-file SHA-1 hashing.
-- **BEP 41 UDP Tracker Protocol Extensions (`synapse-tracker`)**: Type-Length-Value (TLV) extension option frames (`0xBEFE`) appended to BEP 15 UDP announces for URLData (passkeys) and authentication tokens.
-- **BEP 50 Peer Wire PubSub Extension (`synapse-wire`)**: Gossip topic publish and subscribe protocol over the peer wire.
-- **BEP 54 STUN Discovery for UDP / uTP Sockets (`synapse-wire`)**: RFC 5389 / BEP 54 STUN binding requests and `XOR-MAPPED-ADDRESS` resolution over UDP.
-- **BEP 40 Canonical Peer Priority (`synapse-wire`)**: Deterministic tie-breaking algorithm (`canonical_peer_priority`) resolving simultaneous cross-connection races between peers without duplicate sockets.
-- **BEP 48 Tracker Scrape Protocol (`synapse-tracker`)**: Multi-hash HTTP (`/scrape`) and BEP 15 UDP binary scrape queries to fetch seeders, leechers, and completed counts without active announces.
-- **BEP 43 Read-Only DHT Nodes (`synapse-dht`)**: Read-only DHT querying flag (`ro=1`) to prevent routing table pollution on constrained nodes.
-- **BEP 29 Micro Transport Protocol (uTP) & LEDBAT (`synapse-wire` & `synapse-engine`)**: Delay-based LEDBAT congestion control over UDP. Detects bottleneck queue delay against a 100ms target to immediately yield bandwidth to interactive foreground traffic while maxing out throughput when the link is idle. Supports Selective ACK (`SACK`) extensions.
-- **BEP 9 / BEP 53 Magnet Metadata Exchange (`ut_metadata`) (`synapse-wire` & `synapse-engine`)**: Direct ingestion of `magnet:?xt=urn:btih:...` URIs via BEP 10 extension handshakes and 16 KiB metadata chunk fetching with SHA-1 validation.
-- **BEP 6 Fast Extension (`synapse-wire` & `synapse-engine`)**: Instant piece negotiation (`HaveAll`, `HaveNone`), `AllowedFast` deterministic piece calculation allowing choked peers to download initial blocks, `SuggestPiece`, and `RejectRequest`.
-- **BEP 11 Peer Exchange (`ut_pex`) (`synapse-wire` & `synapse-engine`)**: Dual-stack IPv4/IPv6 peer gossip delta broadcasting and discovery.
-- **BEP 14 / BEP 22 Local Peer Discovery (LSD) (`synapse-wire` & `synapse-engine`)**: Multicast SSDP local peer discovery over UDP (`239.192.152.143:6771` and `[ff15::efc0:988f]:6771`).
-- **BEP 19 WebSeed (GetRight HTTP/FTP Seeding) (`synapse-engine`)**: Direct fetching of missing piece blocks via HTTP/HTTPS Range requests from `url-list` web mirrors.
-- **BEP 21 Partial Seeds (`dont_have`) (`synapse-picker`)**: Deselected piece masking so partial seeders are not choked or treated as complete seeders.
-- **BEP 55 Holepunch Extension (`ut_holepunch`) (`synapse-wire`)**: NAT-to-NAT direct uTP rendezvous relay coordination.
-- **Automatic NAT Traversal (UPnP-IGD & NAT-PMP / PCP) (`synapse-engine`)**: Asynchronous router port mapping for incoming TCP, uTP, and DHT traffic.
-- **Super-Seeding (Initial Seeding) Mode (`synapse-picker`)**: Piece announcement algorithm minimizing initial seeder upload bandwidth.
+### 3. BitTorrent Protocol Support
+Row-by-row status, with the evidence behind each claim, is in [`docs/BEP_SUPPORT_MATRIX.md`](docs/BEP_SUPPORT_MATRIX.md). A feature is listed as supported only when the daemon reaches it on a live connection, announce or DHT path and an integration test drives it.
+
+#### Supported
+
+- **BEP 3 — BitTorrent Protocol Specification**: Baseline wire framing, piece requests, choking, unchoking, keepalives, and bencode parser.
+- **BEP 5 — DHT Protocol (Kademlia)**: Wired into the daemon: bootstrap (from saved nodes first, then the public routers, over IPv4 and IPv6), iterative `get_peers`/`announce_peer`, routing table, tokens bound to IP and info hash, per-source rate limiting, reply quota, storage caps, one-node-per-IP/-/24 routing limits. The node id is derived from our external address once enough independent nodes agree on it (BEP 42 `ip_voter`), and the id and known nodes are persisted to `dht_state.bencode` in the session directory.
+- **BEP 6 — Fast Extension**: `HaveAll`, `HaveNone`, deterministic `AllowedFast` piece sets, `SuggestPiece`, `RejectRequest`.
+- **BEP 7 — IPv6 Tracker Extension**: `&ipv4=`/`&ipv6=` (and `&ip=`) announce parameters from `network.announce_ip`, and IPv6 peers read from HTTP (`peers6`) and UDP-over-IPv6 responses.
+- **BEP 8 — Message Stream Encryption (MSE / PE)**: 768-bit Diffie-Hellman (Oakley Group 1) key exchange, RC4 drop1024 stream encryption, `crypto_provide`/`crypto_select` mode negotiation, initial payload (`IA`) buffering, and session encryption policy enforcement (`plaintext_only`, `prefer_encrypted`, `forced_encrypted`). Verified over real sockets.
+- **BEP 9 — Extension for Peers to Send Metadata Files (`ut_metadata`)**: 16 KiB metadata piece exchange over BEP 10 extension channels for instant magnet URI resolution.
+- **BEP 10 — Extension Protocol (`LTEP`)**: Handshake dictionary negotiation for dynamic peer wire extensions (`ut_metadata`, `ut_pex`, `ut_holepunch`, `lt_donthave`, `pubsub`, etc.).
+- **BEP 11 — Peer Exchange (`ut_pex`)**: Dual-stack IPv4/IPv6 peer gossip delta broadcasting with privacy boundary isolation.
+- **BEP 12 — Multitracker Extension**: Hierarchical tiered announce list parsing and failover ordering (`announce-list`).
+- **BEP 14 — Local Peer Discovery (IPv4)**: SSDP multicast local peer discovery over `239.192.152.143:6771`.
+- **BEP 15 — UDP Tracker Protocol**: Binary UDP connect, announce, retry backoff, and transaction ID validation.
+- **BEP 16 — Super-Seeding (Initial Seeding)**: Selective piece advertisement (`Have`) to separate peers, tracking swarm propagation before assigning subsequent pieces, and unblocking peers upon external confirmation. Verified over real sockets in `superseed_e2e`.
+- **BEP 17 — HTTP Seeding (Hoffman Style)**: Hoffman URL formatting (`path?pair=key...`), automated fallback dispatch in piece download pipeline, unit and live integration verified.
+- **BEP 18 — Search Engine Specification**: `.btsearch` OpenSearch descriptions loaded from files or URLs (`[search] engines`, `/api/v1/search/engines`); `GET /api/v1/search?q=` queries them with the terms percent-encoded into the template and returns their RSS results.
+- **BEP 19 — WebSeed (GetRight HTTP/FTP Seeding)**: `url-list` HTTP/HTTPS `Range: bytes={start}-{end}` piece mirror downloading.
+- **BEP 20 — Peer ID Conventions**: Azureus-style peer identification (`-SY2200-...`).
+- **BEP 21 — Extension for Partial Seeds (`dont_have`)**: `upload_only` flag advertised in extension handshake on seeding torrents, parsed on incoming handshakes to avoid seed-to-seed starvation and unnecessary requests. Verified over real sockets.
+- **BEP 22 — Local Peer Discovery (IPv6)**: The IPv6 group `[ff15::efc0:988f]:6771` is joined and announced on alongside the IPv4 group (best effort: hosts without IPv6 multicast just use IPv4). Announcements are rate limited per source and capped per torrent.
+- **BEP 23 — Tracker Returns Compact Peer List**: 6-byte IPv4 (`4-byte IP + 2-byte port`) compact peer representation.
+- **BEP 24 — Tracker Returns External IP**: The `external ip` response key is read; an address at least two trackers agree on is available as `Announcer::external_ip`.
+- **BEP 26 — Zeroconf Peer Advertising and Discovery**: mDNS/DNS-SD: `<peer-id>._bittorrent._tcp.local` with a `_<info-hash>._sub` subtype per public torrent, browsed for the torrents we share; off by default (`network.enable_zeroconf`). LAN sources only, rate limited, a host may only vouch for its own address, private torrents never involved.
+- **BEP 27 — Private Torrents Specification**: Unconditional suppression of DHT, PEX, and LSD on private swarms (`info.private = 1`).
+- **BEP 29 — Micro Transport Protocol (`uTP`) & LEDBAT**: uTP transport with LEDBAT congestion control, RFC 6298 RTT estimation, fast retransmit, SACK, SYN flood guard, a real receive window (1 MiB cap, out-of-order buffer bounded to 256 packets), and dual-transport dialing (uTP first, TCP fallback). It shares the peer port with the DHT (`UdpMux`). Verified with multi-megabyte transfers in both directions, a slow reader, and a path with 5% loss, reordering and duplication.
+- **BEP 30 — Merkle Tree Torrents v1 (SHA-1)**: `root hash` torrents: SHA-1 tree over piece hashes (breadth-first node numbers), `Tr_hashpiece` messages with the hash list on each piece's first block, verification against the root, and a seeder that serves only data that reproduces the root. Exercised against this implementation only.
+- **BEP 32 — IPv6 DHT Extension**: `start_dht` runs a dual-stack node: an IPv4 socket plus an IPv6-only socket on the same port (`spawn_dual`), falling back to IPv4-only when IPv6 is unavailable. `RoutingTableV6` with `/64` limits, `nodes6`/`values6`, and `want` negotiation, verified over real UDP. IPv6 bootstrap routers are pinged so they enter the IPv6 table.
+- **BEP 33 — DHT Scrape**: `scrape` queries answered with seeders, leechers, and 256-byte Bloom filters (`BFsd`, `BFpe`) verified against official BEP 33 test vectors; `DhtHandle::scrape` client call. Verified over real UDP sockets.
+- **BEP 34 — DNS Tracker Preferences (SRV Records)**: SRV lookup for UDP tracker URLs without an explicit port, using the system nameservers (never a hard-coded resolver), forged answers ignored, TCP fallback, cached, RFC 2782 ordering with failover across targets that must be public addresses. Not applied to HTTP trackers.
+- **BEP 35 — Torrent Signing**: The `signatures` dictionary with X.509 certificates and RSA (PKCS#1 v1.5, SHA-256 or SHA-1) over the info dictionary plus the signature's own `info`; trusted by anchor certificate or named root from `signing.trusted_signers_dir`; `signing.require_trusted_signature` refuses other torrents; `GET /api/v1/torrents/{hash}/signatures`. Tested against OpenSSL-made certificates and signatures.
+- **BEP 36 — Torrent RSS Feeds**: RSS 2.0 / Atom read with a real XML parser (entities, CDATA, Atom links, the torrent namespace); polling, title filter, persisted handled-item state, retry of failures, a per-poll cap; item downloads cannot reach the local network; `/api/v1/rss/*`.
+- **BEP 38 — Finding Local Data Using Web Seeds**: `LocalWebSeedResolver` integration checking local mirror path hashes/pieces before remote network fetching. Verified in unit and engine tests.
+- **BEP 39 — Updating Torrents via Feed URL**: `update-url` and `originator`; `update.enabled` polls each feed with our `info_hash`; an update signed by the originator is added automatically, others wait for `POST /api/v1/updates/{hash}/apply`. The URL comes from the torrent, so the local network is off limits.
+- **BEP 40 — Canonical Peer Priority**: Deterministic tie-breaking on simultaneous duplicate connections via `canonical_peer_priority`, candidate peer dial queue prioritized via `canonical_peer_score`. Verified over real sockets.
+- **BEP 41 — UDP Tracker Protocol Extensions**: The `URLData` option carries a UDP tracker URL's path and query on announces.
+- **BEP 42 — DHT Security Extension**: Dual-stack IPv4 and IPv6 CRC32c secure node ID calculation, verification, and preferential bucket placement. Verified in `dht_ipv6_e2e` and unit tests.
+- **BEP 43 — Read-Only DHT Nodes**: `ro=1` on our queries, silence to incoming queries, `ro` peers never routed; `network.dht_read_only`, `--dht-read-only`, `SYNAPSE_DHT_READ_ONLY`, and switchable while running.
+- **BEP 44 — Arbitrary Data Storage in DHT**: `get`/`put` handlers for immutable and mutable items with Ed25519 signature verification (`verify_strict`), sequence-number and CAS rules, token bound to the item target, 1000-byte value / 64-byte salt / 700-item caps, and spec error codes (203/205/206/207/301/302). `DhtHandle::get`/`put` client calls.
+- **BEP 46 — Updating Torrents via DHT Mutable Items**: `TorrentUpdatePointer::poll_node` resolves mutable item targets via BEP 44 `get` over the DHT, parsing updated `ih` or magnet URIs with sequence-number ordering. Verified over real UDP sockets.
+- **BEP 47 — Padding Files & Whole-File Hashing**: Detection of `.pad/<size>` padding files via `is_padding_file`, complete isolation from disk I/O, and in-memory zero-synthesis during serving, rechecking, and webseed fetching. Verified over real sockets in `bep47_padding_e2e`.
+- **BEP 48 — Tracker Scrape Protocol**: HTTP and UDP scrape client methods exposed on `Announcer` and `SwarmEngine::scrape_tracker`. Verified over HTTP and UDP.
+- **BEP 51 — DHT Infohash Indexing (`sample_infohashes`)**: `sample_infohashes` answered from the announced-peer store (20 random hashes per reply, `num`, `interval`); `DhtHandle::sample_infohashes` client call. Verified over real UDP sockets.
+- **BEP 52 — BitTorrent v2 Protocol**: Hybrid and v2-only torrents (single- and multi-file) are parsed, verified and created (piece layers per BEP 52 with unpadded short final blocks; per-file piece alignment with synthesized padding). Keyed by the truncated SHA-256. A v2 magnet fetches each file's piece layer in `hash request` chunks with uncle-hash proofs and requests no pieces until it has them. Hash requests are served with proofs, including block-level (layer 0) hashes for files we hold completely. When a piece fails, block hashes are requested from a peer that did not send the piece, proven against the file root, and only then used to ban the sender of a corrupt block. Exercised against this implementation only.
+- **BEP 53 — Magnet URI Format**: BTIH, exact topics (`xt`), display names (`dn`), trackers (`tr`), web seeds (`ws`) and select-only (`so=`, bounded) file indices.
+- **BEP 54 — The lt_donthave extension**: `lt_donthave` revokes a piece we advertised (sent when a recheck finds it corrupt); a peer's revocation lowers availability only for pieces it really had.
+- **BEP 55 — Holepunch Extension (`ut_holepunch`)**: Wire codec, LTEP extension handshake advertisement (`ut_holepunch`), relay rendezvous dispatch (`Connect` to target and sender, or `Failed { err_code: 1 }` on unknown target), and direct uTP peer dialing hook (`on_peers_discovered`). Verified over real sockets in `bep55_holepunch_e2e`.
+
+#### Not implemented
+
+- **BEP 50 — Publish/Subscribe Protocol** (Not implemented): A DHT-based protocol (topics are mutable items, one-node routing tables per topic). It has no known implementation; the peer-wire relay that had been added under this number was not BEP 50 and has been removed.
 
 ### 4. Granular File Priorities & Traffic Management
 - **In-Flight Dynamic Session Settings & Transmission Parity (`synapse-engine`, `synapse-rpc`)**: Full parity with Transmission (`session-get`/`session-set`) and TransGUI (`daemonoptions.pas`), allowing seamless on-the-fly mutations of global rate limits, Turtle Mode (alt-speed), queue sizes, stalled detection, and directories without dropping peer sockets or restarting daemon tasks. See [`docs/SESSION_SETTINGS.md`](docs/SESSION_SETTINGS.md).
@@ -187,6 +214,15 @@ cargo run --release -p synapsed -- inspect /path/to/torrents/
 # Verbose output (prints tracker tiers and web seeds)
 cargo run --release -p synapsed -- inspect --verbose /path/to/torrents/
 ```
+
+### Creating `.torrent` Files
+
+```bash
+# v1 (default), or --v2 / --hybrid; --private, --source, -t <tracker> (repeatable), -w <webseed>
+synapsed create ./my-release -o my-release.torrent -t https://tracker.example/announce --hybrid
+```
+
+The same is available over REST as `POST /api/v1/torrents/create` for content inside the download directory.
 
 ### Migrating From Transmission
 Imports existing Transmission `.resume` and `.torrent` states into native Synapse encrypted sessions without re-downloading:

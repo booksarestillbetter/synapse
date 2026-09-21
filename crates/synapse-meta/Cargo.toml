@@ -11,7 +11,14 @@ synapse-bencode = { path = "../synapse-bencode" }
 thiserror = { workspace = true }
 url = "2"
 rand = "0.8"
-sha1 = "0.10"
-sha2 = "0.10"
+sha1 = { version = "0.10", features = ["oid"] }
+sha2 = { version = "0.10", features = ["oid"] }
 serde = { version = "1", features = ["derive"] }
 parking_lot = "0.12"
+quick-xml = "0.37"
+rsa = { version = "0.9", default-features = false, features = ["std", "pem"] }
+x509-cert = { version = "0.2", default-features = false, features = ["std", "pem"] }
+
+[dev-dependencies]
+proptest = { workspace = true }
+tempfile = "3"

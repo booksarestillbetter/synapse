@@ -66,6 +66,28 @@ impl TorrentUpdatePointer {
 
         false
     }
+
+    /// Computes the 20-byte DHT target hash for this mutable item pointer.
+    pub fn target_hash(&self) -> [u8; 20] {
+        crate::storage::compute_mutable_target(&self.public_key, self.salt.as_deref())
+    }
+
+    /// Queries a DHT node for updates to this torrent pointer using BEP 44 `get`.
+    /// Returns true if a newer revision was received and applied.
+    pub async fn poll_node(
+        &mut self,
+        dht: &crate::node::DhtHandle,
+        addr: std::net::SocketAddrV4,
+    ) -> Result<bool, crate::node::DhtError> {
+        let target = self.target_hash();
+        let (_token, item_opt) = dht.get(addr, target, Some(self.latest_seq)).await?;
+        if let Some(item) = item_opt {
+            if let Some(seq) = item.seq {
+                return Ok(self.process_update(seq, &item.v));
+            }
+        }
+        Ok(false)
+    }
 }
 
 #[cfg(test)]

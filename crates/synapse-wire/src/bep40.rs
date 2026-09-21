@@ -39,8 +39,14 @@ pub fn canonical_peer_priority(local: SocketAddr, remote: SocketAddr) -> Orderin
         Ordering::Equal => {
             // Tie-break lexicographically by IP and Port
             match (local.ip(), remote.ip()) {
-                (IpAddr::V4(l), IpAddr::V4(r)) => l.octets().cmp(&r.octets()).then(local.port().cmp(&remote.port())),
-                (IpAddr::V6(l), IpAddr::V6(r)) => l.octets().cmp(&r.octets()).then(local.port().cmp(&remote.port())),
+                (IpAddr::V4(l), IpAddr::V4(r)) => l
+                    .octets()
+                    .cmp(&r.octets())
+                    .then(local.port().cmp(&remote.port())),
+                (IpAddr::V6(l), IpAddr::V6(r)) => l
+                    .octets()
+                    .cmp(&r.octets())
+                    .then(local.port().cmp(&remote.port())),
                 (IpAddr::V4(_), IpAddr::V6(_)) => Ordering::Less,
                 (IpAddr::V6(_), IpAddr::V4(_)) => Ordering::Greater,
             }
@@ -85,7 +91,10 @@ mod tests {
     #[test]
     fn test_canonical_peer_priority_ipv6() {
         let addr1 = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 6881);
-        let addr2 = SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)), 6882);
+        let addr2 = SocketAddr::new(
+            IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+            6882,
+        );
 
         let ord1 = canonical_peer_priority(addr1, addr2);
         let ord2 = canonical_peer_priority(addr2, addr1);

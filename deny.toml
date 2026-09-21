@@ -1,0 +1,41 @@
+# Cargo Deny Configuration for Synapse 2.0 (Phase 6 Assurance)
+# See https://embarkstudios.github.io/cargo-deny/
+
+[advisories]
+# cargo-deny >= 0.16 (what EmbarkStudios/cargo-deny-action@v2 runs) always denies known
+# vulnerabilities and no longer accepts the old `vulnerability`, `unlicensed` and `notice`
+# keys, so only the remaining options are set here.
+yanked = "deny"
+ignore = []
+
+[bans]
+multiple-versions = "warn"
+wildcards = "allow"
+highlight = "all"
+deny = []
+skip = []
+skip-tree = []
+
+[licenses]
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "CC0-1.0",
+    "ISC",
+    "MIT",
+    "MPL-2.0",
+    "OpenSSL",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+]
+confidence-threshold = 0.8
+exceptions = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

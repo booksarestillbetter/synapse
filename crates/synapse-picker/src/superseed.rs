@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 
 pub struct SuperSeeder {
     total_pieces: u32,
-    assigned_pieces: HashMap<u32, u32>, // peer_id_num -> assigned_piece
+    assigned_pieces: HashMap<u64, u32>, // peer_id -> assigned_piece
     confirmed_distributed: HashSet<u32>,
     next_piece_cursor: u32,
 }
@@ -24,13 +24,13 @@ impl SuperSeeder {
     }
 
     /// Selects the next unique piece to offer to a peer.
-    pub fn assign_piece_to_peer(&mut self, peer_id_num: u32) -> Option<u32> {
+    pub fn assign_piece_to_peer(&mut self, peer_id: u64) -> Option<u32> {
         if self.confirmed_distributed.len() == self.total_pieces as usize {
             // All pieces are distributed to the swarm, normal seeding can resume
             return None;
         }
 
-        if let Some(&already_assigned) = self.assigned_pieces.get(&peer_id_num) {
+        if let Some(&already_assigned) = self.assigned_pieces.get(&peer_id) {
             return Some(already_assigned);
         }
 
@@ -40,7 +40,7 @@ impl SuperSeeder {
             self.next_piece_cursor = (self.next_piece_cursor + 1) % self.total_pieces;
 
             if !self.confirmed_distributed.contains(&candidate) {
-                self.assigned_pieces.insert(peer_id_num, candidate);
+                self.assigned_pieces.insert(peer_id, candidate);
                 return Some(candidate);
             }
         }
@@ -49,19 +49,29 @@ impl SuperSeeder {
     }
 
     /// Records when a peer advertises that it has `piece_idx`.
-    pub fn on_peer_have(&mut self, reporting_peer: u32, piece_idx: u32) {
+    ///
+    /// If another peer reports having `piece_idx`, that means the peer previously
+    /// assigned to upload `piece_idx` has successfully propagated it. Returns
+    /// `Some(freed_peer_id)` of the peer that is now eligible for a new piece assignment.
+    pub fn on_peer_have(&mut self, reporting_peer: u64, piece_idx: u32) -> Option<u64> {
         // If someone other than the assigned peer now has the piece, it was successfully distributed
-        if let Some(&assigned_peer) = self.assigned_pieces.iter().find(|(_, &p)| p == piece_idx).map(|(k, _)| k) {
-            if reporting_peer != assigned_peer {
-                self.confirmed_distributed.insert(piece_idx);
-                self.assigned_pieces.remove(&assigned_peer);
-            }
+        let assigned_peer = self
+            .assigned_pieces
+            .iter()
+            .find(|(_, &p)| p == piece_idx)
+            .map(|(&k, _)| k)?;
+        if reporting_peer != assigned_peer {
+            self.confirmed_distributed.insert(piece_idx);
+            self.assigned_pieces.remove(&assigned_peer);
+            Some(assigned_peer)
+        } else {
+            None
         }
     }
 
     /// Removes a disconnected peer from assignments.
-    pub fn on_peer_disconnected(&mut self, peer_id_num: u32) {
-        self.assigned_pieces.remove(&peer_id_num);
+    pub fn on_peer_disconnected(&mut self, peer_id: u64) {
+        self.assigned_pieces.remove(&peer_id);
     }
 
     pub fn is_fully_distributed(&self) -> bool {
@@ -86,7 +96,8 @@ mod tests {
         assert_eq!(p1, 1);
 
         // Peer 2 tells us it got piece 0 from Peer 1!
-        ss.on_peer_have(2, 0);
+        let freed = ss.on_peer_have(2, 0);
+        assert_eq!(freed, Some(1));
         assert!(ss.confirmed_distributed.contains(&0));
 
         // Now Peer 1 can be assigned a new piece (piece 2)

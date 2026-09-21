@@ -124,7 +124,10 @@ mod tests {
 
     #[test]
     fn test_parse_invalid_lsd_packets() {
-        assert_eq!(parse_lsd_announce("GET / HTTP/1.1\r\n"), Err(LsdError::InvalidHeader));
+        assert_eq!(
+            parse_lsd_announce("GET / HTTP/1.1\r\n"),
+            Err(LsdError::InvalidHeader)
+        );
         assert_eq!(
             parse_lsd_announce("BT-SEARCH * HTTP/1.1\r\nPort: 6881\r\n\r\n"),
             Err(LsdError::MissingInfoHash)

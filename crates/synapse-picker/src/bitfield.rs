@@ -86,8 +86,13 @@ impl Bitfield {
 /// For 100% complete seeding swarms, represented as `AllHave { len }` with 0 bytes heap allocation.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RoaringBitfield {
-    AllHave { len: usize },
-    Partial { len: usize, bitmap: roaring::RoaringBitmap },
+    AllHave {
+        len: usize,
+    },
+    Partial {
+        len: usize,
+        bitmap: roaring::RoaringBitmap,
+    },
 }
 
 impl RoaringBitfield {
@@ -351,7 +356,11 @@ mod tests {
                 let last_byte = *full_bf.as_bytes().last().unwrap();
                 let unused_bits = 8 - remainder;
                 let padding_mask = (1u8 << unused_bits) - 1;
-                assert_eq!(last_byte & padding_mask, 0, "trailing bits must be 0 for len={len}");
+                assert_eq!(
+                    last_byte & padding_mask,
+                    0,
+                    "trailing bits must be 0 for len={len}"
+                );
             }
         }
     }

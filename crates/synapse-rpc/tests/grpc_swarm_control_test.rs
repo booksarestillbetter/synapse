@@ -1,6 +1,6 @@
+use diskio::DiskEngine;
 use std::sync::Arc;
 use std::time::Duration;
-use diskio::DiskEngine;
 use synapse_engine::SwarmEngine;
 use synapse_rpc::proto_v2::synapse_control_client::SynapseControlClient;
 use synapse_rpc::proto_v2::synapse_control_server::SynapseControlServer;
@@ -36,7 +36,10 @@ async fn test_grpc_add_and_remove_torrent_with_swarm_engine() {
 
     // 1. Add Torrent via Magnet URI
     let hex_hash = "0123456789abcdef0123456789abcdef01234567";
-    let magnet = format!("magnet:?xt=urn:btih:{}&dn=Test+Movie&tr=http://tracker.example.com:80/announce", hex_hash);
+    let magnet = format!(
+        "magnet:?xt=urn:btih:{}&dn=Test+Movie&tr=http://tracker.example.com:80/announce",
+        hex_hash
+    );
 
     let add_resp = client
         .add_torrent(AddTorrentRequest {
@@ -67,7 +70,10 @@ async fn test_grpc_add_and_remove_torrent_with_swarm_engine() {
         let detail = detail.unwrap();
         assert_eq!(detail.hash, hex_hash);
         assert!(!detail.trackers.is_empty());
-        assert_eq!(detail.trackers[0].url, "http://tracker.example.com/announce");
+        assert_eq!(
+            detail.trackers[0].url,
+            "http://tracker.example.com/announce"
+        );
         assert!(detail.trackers[0].status == "Ready" || detail.trackers[0].status == "Updating");
         assert_eq!(detail.active_peers.len(), 0);
     }
@@ -84,4 +90,136 @@ async fn test_grpc_add_and_remove_torrent_with_swarm_engine() {
 
     assert!(remove_resp.success);
     assert_eq!(swarm.torrent_count(), 0);
+}
+
+#[tokio::test]
+async fn test_grpc_subscribe_alerts() {
+    let disk = Arc::new(DiskEngine::auto().await);
+    let swarm = Arc::new(SwarmEngine::new(disk, [0x02; 20]));
+    let event_bus = Arc::new(EventBus::new(256));
+    let service = SynapseService::new(event_bus.clone()).with_swarm_engine(swarm.clone());
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(SynapseControlServer::new(service))
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .unwrap();
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut client = SynapseControlClient::connect(format!("http://{}", addr))
+        .await
+        .unwrap();
+
+    let hex_hash = "abcdef0123456789abcdef0123456789abcdef01";
+    let mut alerts_stream = client
+        .subscribe_alerts(SubscribeAlertsRequest {
+            info_hash: Some(hex_hash.to_string()),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+
+    // Trigger an alert by adding a torrent
+    let magnet = format!("magnet:?xt=urn:btih:{}&dn=Alert+Test", hex_hash);
+    let add_resp = client
+        .add_torrent(AddTorrentRequest {
+            source: Some(add_torrent_request::Source::MagnetUri(magnet)),
+            download_dir: Some("/tmp/downloads".into()),
+            start_paused: Some(false),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(add_resp.success);
+
+    // Verify received alert event
+    let event = tokio::time::timeout(Duration::from_secs(2), alerts_stream.next())
+        .await
+        .expect("Timed out waiting for alert")
+        .expect("Stream closed unexpectedly")
+        .expect("Alert error");
+
+    assert_eq!(event.event_type, "TorrentAdded");
+    assert_eq!(event.info_hash.as_deref(), Some(hex_hash));
+}
+
+#[tokio::test]
+async fn session_settings_expose_dht_read_only_zeroconf_and_announce_ip() {
+    let disk = Arc::new(DiskEngine::auto().await);
+    let swarm = Arc::new(SwarmEngine::new(disk, [0x02; 20]));
+    let service = SynapseService::new(Arc::new(EventBus::new(16))).with_swarm_engine(swarm);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(SynapseControlServer::new(service))
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let mut client = SynapseControlClient::connect(format!("http://{addr}"))
+        .await
+        .unwrap();
+
+    let before = client
+        .get_session_settings(SessionSettingsRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!before.dht_read_only && !before.zeroconf_enabled && before.announce_ip.is_empty());
+
+    let update = UpdateSessionSettingsRequest {
+        dht_read_only: Some(true),
+        zeroconf_enabled: Some(true),
+        announce_ip: Some("203.0.113.5".into()),
+        ..Default::default()
+    };
+    let resp = client
+        .update_session_settings(update)
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(resp.success, "{resp:?}");
+    let after = client
+        .get_session_settings(SessionSettingsRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(after.dht_read_only && after.zeroconf_enabled);
+    assert_eq!(after.announce_ip, "203.0.113.5");
+
+    // An invalid address is reported and leaves the setting alone; an empty string clears it.
+    let bad = client
+        .update_session_settings(UpdateSessionSettingsRequest {
+            announce_ip: Some("not-an-ip".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(
+        bad.warnings.iter().any(|w| w.contains("not an IP")),
+        "{bad:?}"
+    );
+    let cleared = client
+        .update_session_settings(UpdateSessionSettingsRequest {
+            announce_ip: Some(String::new()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let _ = cleared;
+    let final_settings = client
+        .get_session_settings(SessionSettingsRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(final_settings.announce_ip.is_empty());
 }

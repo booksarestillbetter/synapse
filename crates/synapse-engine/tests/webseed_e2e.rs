@@ -12,11 +12,16 @@ use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
 
 use diskio::DiskEngine;
-use synapse_engine::{PeerEvent, SwarmState, SwarmStats, SwarmTier, TokenBucket, Torrent, TorrentConfig};
+use synapse_engine::{
+    PeerEvent, SwarmState, SwarmStats, SwarmTier, TokenBucket, Torrent, TorrentConfig,
+};
 use synapse_meta::Info;
 use synapse_picker::Mode;
 
-fn fresh_stats(info: &Info, download_dir: &std::path::Path) -> Arc<parking_lot::RwLock<SwarmStats>> {
+fn fresh_stats(
+    info: &Info,
+    download_dir: &std::path::Path,
+) -> Arc<parking_lot::RwLock<SwarmStats>> {
     Arc::new(parking_lot::RwLock::new(SwarmStats {
         info_hash: info.hash,
         name: info.name.clone(),
@@ -42,7 +47,12 @@ fn fresh_stats(info: &Info, download_dir: &std::path::Path) -> Arc<parking_lot::
     }))
 }
 
-fn build_single_file_info_with_webseed(file_data: &[u8], piece_len: u32, name: &str, webseed_url: &str) -> Info {
+fn build_single_file_info_with_webseed(
+    file_data: &[u8],
+    piece_len: u32,
+    name: &str,
+    webseed_url: &str,
+) -> Info {
     let mut pieces = Vec::new();
     for chunk in file_data.chunks(piece_len as usize) {
         let hash: [u8; 20] = Sha1::digest(chunk).into();
@@ -50,16 +60,27 @@ fn build_single_file_info_with_webseed(file_data: &[u8], piece_len: u32, name: &
     }
 
     let mut info_dict = std::collections::BTreeMap::new();
-    info_dict.insert(b"name".to_vec(), synapse_bencode::BEncode::String(name.as_bytes().to_vec()));
-    info_dict.insert(b"piece length".to_vec(), synapse_bencode::BEncode::Int(piece_len as i64));
+    info_dict.insert(
+        b"name".to_vec(),
+        synapse_bencode::BEncode::String(name.as_bytes().to_vec()),
+    );
+    info_dict.insert(
+        b"piece length".to_vec(),
+        synapse_bencode::BEncode::Int(piece_len as i64),
+    );
     info_dict.insert(b"pieces".to_vec(), synapse_bencode::BEncode::String(pieces));
-    info_dict.insert(b"length".to_vec(), synapse_bencode::BEncode::Int(file_data.len() as i64));
+    info_dict.insert(
+        b"length".to_vec(),
+        synapse_bencode::BEncode::Int(file_data.len() as i64),
+    );
 
     let mut torrent_dict = std::collections::BTreeMap::new();
     torrent_dict.insert(b"info".to_vec(), synapse_bencode::BEncode::Dict(info_dict));
     torrent_dict.insert(
         b"url-list".to_vec(),
-        synapse_bencode::BEncode::List(vec![synapse_bencode::BEncode::String(webseed_url.as_bytes().to_vec())]),
+        synapse_bencode::BEncode::List(vec![synapse_bencode::BEncode::String(
+            webseed_url.as_bytes().to_vec(),
+        )]),
     );
 
     Info::from_bencode(synapse_bencode::BEncode::Dict(torrent_dict)).expect("valid test torrent")
@@ -85,7 +106,9 @@ async fn serve_one_http_request(listener: TcpListener, body: Vec<u8>) {
         }
 
         let response = format!(
-            "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-{}/{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len() - 1,
+            body.len(),
             body.len()
         );
         let _ = stream.write_all(response.as_bytes()).await;
@@ -94,8 +117,16 @@ async fn serve_one_http_request(listener: TcpListener, body: Vec<u8>) {
     }
 }
 
-#[tokio::test]
-async fn torrent_with_no_peers_fetches_its_only_piece_from_a_webseed() {
+/// Runs a peerless torrent against a loopback web seed. Returns the receiver that fires on
+/// completion, plus the download dir and payload for assertions.
+async fn run_webseed_torrent(
+    allow_local_web_seeds: bool,
+) -> (
+    oneshot::Receiver<()>,
+    tempfile::TempDir,
+    Vec<u8>,
+    mpsc::Sender<PeerEvent>,
+) {
     let file_data = b"webseed round-trip test payload, byte-for-byte".to_vec();
     let piece_len = file_data.len() as u32; // single piece
 
@@ -103,7 +134,12 @@ async fn torrent_with_no_peers_fetches_its_only_piece_from_a_webseed() {
     let addr = listener.local_addr().unwrap();
     let webseed_url = format!("http://{addr}/testfile.bin");
 
-    let info = Arc::new(build_single_file_info_with_webseed(&file_data, piece_len, "testfile.bin", &webseed_url));
+    let info = Arc::new(build_single_file_info_with_webseed(
+        &file_data,
+        piece_len,
+        "testfile.bin",
+        &webseed_url,
+    ));
 
     tokio::spawn(serve_one_http_request(listener, file_data.clone()));
 
@@ -134,25 +170,51 @@ async fn torrent_with_no_peers_fetches_its_only_piece_from_a_webseed() {
             idle_timeout: None,
             live_peers: Arc::new(parking_lot::RwLock::new(Vec::new())),
             piece_availability: Arc::new(parking_lot::RwLock::new(vec![0; info.pieces() as usize])),
-            settings: Arc::new(parking_lot::RwLock::new(Default::default())),
+            settings: Arc::new(parking_lot::RwLock::new(
+                synapse_engine::settings::DynamicSessionSettings {
+                    allow_local_web_seeds,
+                    ..Default::default()
+                },
+            )),
             on_peers_discovered: None,
-            http_client: reqwest::Client::new(),
             on_metadata_resolved: None,
+            ban_list: Default::default(),
+            ip_filter: Default::default(),
+            super_seeding: false,
+            local_webseed_resolver: None,
+            alert_sender: None,
         },
         None,
     );
     let (done_tx, done_rx) = oneshot::channel();
     torrent.notify_on_complete(done_tx);
-
-    // Keep `peer_tx` alive so `events.recv()` doesn't close the actor loop while we wait.
-    let _peer_tx = peer_tx;
     tokio::spawn(torrent.run(peer_rx, cmd_rx));
+    (done_rx, download_dir, file_data, peer_tx)
+}
+
+#[tokio::test]
+async fn torrent_with_no_peers_fetches_its_only_piece_from_a_webseed() {
+    // Keep `peer_tx` alive so `events.recv()` doesn't close the actor loop while we wait.
+    let (done_rx, download_dir, file_data, _peer_tx) = run_webseed_torrent(true).await;
 
     tokio::time::timeout(Duration::from_secs(10), done_rx)
         .await
         .expect("torrent did not complete via webseed within timeout")
         .expect("completion channel dropped");
 
-    let on_disk = tokio::fs::read(download_dir.path().join("testfile.bin")).await.unwrap();
+    let on_disk = tokio::fs::read(download_dir.path().join("testfile.bin"))
+        .await
+        .unwrap();
     assert_eq!(on_disk, file_data, "webseed-fetched file content mismatch");
+}
+
+#[tokio::test]
+async fn a_loopback_webseed_is_refused_unless_explicitly_allowed() {
+    let (done_rx, download_dir, _file_data, _peer_tx) = run_webseed_torrent(false).await;
+    let outcome = tokio::time::timeout(Duration::from_secs(2), done_rx).await;
+    assert!(
+        outcome.is_err(),
+        "a torrent must not be able to point the daemon at a local address"
+    );
+    assert!(!download_dir.path().join("testfile.bin").exists());
 }

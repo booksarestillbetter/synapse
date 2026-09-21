@@ -8,7 +8,7 @@ This document details verified benchmark results, scaling formulas, throughput m
 
 ## 1. Executive Benchmark Summary
 
-All numbers below were measured on Apple Silicon M-series (12-core CPU, NVMe SSD) and verified against high-concurrency Linux kernel runners (`io_uring` + `SO_REUSEPORT`):
+All numbers below were measured on Apple Silicon M-series (12-core CPU, NVMe SSD) and verified against high-concurrency Linux kernel runners (`io_uring` + `SO_REUSEPORT`). The "Competitor / Baseline" column reflects profiled measurements of standard libtorrent-rasterbar 2.0.9 and Transmission 4.0 daemon reference installations configured under identical swarm counts, loopback network topologies, and storage backends.
 
 | Subsystem | Metric | Measured Value | Competitor / Baseline | Notes |
 | :--- | :--- | :--- | :--- | :--- |

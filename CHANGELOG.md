@@ -3,6 +3,106 @@
 All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [2.2.5] - 2026-09-18
+
+Adds the remaining BitTorrent Enhancement Proposals and the missing pieces of a complete client (proxy support, torrent creation, signed torrents, RSS, search), and hardens the daemon against hostile peers, `.torrent` files and feeds. `docs/BEP_SUPPORT_MATRIX.md` records what each BEP does today and how it was verified.
+
+### Added
+
+**Protocols**
+- **BEP 52 (BitTorrent v2) and hybrid torrents.** Pure-v2 torrents are keyed by the SHA-256 truncated to 20 bytes (magnets included, whose metadata is verified against it). Merkle roots and piece layers follow the spec (a short final block is hashed as it is, not padded). `hash request` / `hashes` / `hash reject` use the specified wire layout. A v2 magnet fetches each file's piece layer from peers in chunks of up to 512 hashes, each proven against the file root with its uncle hashes, and requests no pieces until it has them; hash requests are served with proofs, including block-level (layer 0) hashes for files we hold completely. When a piece fails, block hashes are requested from a peer that did not send it, proven against the root, and only then used to ban the sender of a corrupt block. Multi-file v2-only torrents are supported (files are piece-aligned with synthesized padding that is never written to disk), and multi-file hybrid torrents load with the v1 file list as their layout.
+- **BEP 30 (Merkle tree torrents).** `root hash` torrents: the SHA-1 tree over piece hashes with breadth-first node numbers, `Tr_hashpiece` messages carrying the hash list with each piece's first block, verification against the root hash, and a seeder that serves only data that reproduces the root.
+- **BEP 35 (signed torrents).** The `signatures` dictionary with X.509 certificates and RSA signatures (PKCS#1 v1.5, SHA-256 or SHA-1) over the info dictionary plus the signature's own `info`, trusted by anchor certificate or named root from `signing.trusted_signers_dir`. `signing.require_trusted_signature` refuses every other torrent (magnets included) on all add paths; `GET /api/v1/torrents/{hash}/signatures` and the inspector report each signature as trusted, untrusted or invalid. Tested with OpenSSL-made certificates and signatures.
+- **BEP 18 (search engines).** `.btsearch` OpenSearch descriptions loaded from files or URLs (`[search] engines`, `/api/v1/search/engines`); `GET /api/v1/search?q=` queries them with the terms percent-encoded into the URL template and returns their RSS results (`scope=local` searches this daemon's own torrents).
+- **BEP 26 (Zeroconf peer discovery).** mDNS/DNS-SD: `<peer-id>._bittorrent._tcp.local` with a `_<info-hash>._sub` subtype per public torrent, browsed for the torrents we share. Off by default (`network.enable_zeroconf`); LAN sources only, rate limited, a host may only vouch for its own address, private torrents never involved.
+- **BEP 34 (DNS SRV tracker preferences).** UDP tracker URLs without a port are resolved through the system nameservers (never a built-in public resolver), with forged answers ignored, TCP fallback, caching, RFC 2782 ordering and failover across targets that must be public addresses.
+- **BEP 36 (torrent RSS feeds).** RSS 2.0 and Atom read with an XML parser (entities, CDATA, Atom links, the `torrent:` namespace); scheduled polling, title filter, persisted handled-item state, retry of failed items and a per-poll cap; `[rss]` configuration and `/api/v1/rss/*`.
+- **BEP 39 (update feeds).** `update-url` and `originator` are read; `updates.enabled` polls each feed with our `info_hash`. An update signed by the torrent's originator is added automatically, others wait for `POST /api/v1/updates/{hash}/apply`; `GET /api/v1/updates`, `POST /api/v1/updates/check`.
+- **BEP 41 and BEP 7.** The `URLData` option carries a UDP tracker URL's path and query; `&ip=`, `&ipv4=` and `&ipv6=` are sent from `network.announce_ip`, and IPv6 peers (`peers6`, and 18-byte UDP-over-IPv6 entries) are read.
+- **BEP 24, BEP 3 tracker fields.** `external ip`, `tracker id` (sent back on later announces), `min interval` and `warning message` are read from HTTP tracker responses; intervals, ports and peer counts are bounded.
+- **BEP 53 (`so=`).** Select-only file indices in magnet links (bounded) set the initial file priorities, and survive metadata resolution.
+- **BEP 54 (`lt_donthave`).** Sent when a recheck finds an advertised piece corrupt; a peer's revocation lowers availability only for pieces it really had.
+- **BEP 29 (uTP) and LEDBAT.** A socket multiplexer with delay-based congestion control, RFC 6298 RTT/RTO with backoff, SACK and fast retransmit, a send queue, bounded receive and reorder buffers, a SYN flood guard, and outbound uTP-then-TCP dialing; `enable_utp` is a live setting.
+- **BEP 8 (MSE / RC4).** 768-bit Diffie-Hellman with RC4 drop1024, plaintext or RC4 negotiation, initial payload buffering, policy enforcement (`plaintext_only`, `prefer_encrypted`, `forced_encrypted`), fallback for legacy peers, and the encrypted flag in peer snapshots.
+- **BEP 32, 33, 43, 44, 46, 51 (DHT).** A dual-stack node (one port, IPv4 and IPv6 sockets) with a 160-bucket IPv6 routing table, `want` negotiation, compact `nodes6`/`peers6`; `get`/`put` with Ed25519 signatures, sequence and CAS rules; `sample_infohashes`; Bloom-filter scrapes matching the official vectors; mutable torrent updates; read-only mode (`network.dht_read_only`, `--dht-read-only`, `SYNAPSE_DHT_READ_ONLY`, switchable while running). The node id is derived from the external address once enough nodes agree on it (BEP 42 `ip_voter`), the id and known nodes persist across restarts, and IPv6 bootstrap routers are used.
+- **BEP 14/22 (LSD)** over IPv6 as well as IPv4.
+- **BEP 47, 17, 19, 38, 55, 16, 21, 40, 48.** Padding files are never written and are synthesized as zeroes when serving, rechecking and web seeding; Hoffman-style web seed URLs with fallback and local mirror lookup; `ut_holepunch` relaying; super-seeding; `upload_only` partial seeds; canonical peer priority for connection races and dial ordering; HTTP and UDP tracker scrapes.
+- **Port mapping** through PCP (RFC 6887), NAT-PMP (RFC 6886) on the real default gateway, then UPnP-IGD (SSDP, SOAP). Replies from anything but the gateway are ignored, mappings are renewed, rediscovered on failure and released on shutdown; the mapped port is used in tracker and DHT announces and exposed as `synapse_nat_mapped_port` (`network.enable_nat`).
+
+**Networking and privacy**
+- **Proxy support** (`[proxy]`): SOCKS5 (with username/password) or HTTP CONNECT for peer connections and for HTTP requests to trackers, web seeds, feeds, search engines and update feeds, with host names left to the proxy. uTP and UDP trackers are not used for traffic a proxy carries, and `force_proxy` starts no listener, DHT, LSD, zeroconf, uTP or port mapping, so nothing can bypass the proxy.
+- `network.announce_ip` for VPN and NAT setups (with `dht_read_only` and `zeroconf_enabled`, also readable and changeable at runtime through the gRPC and REST session settings), and `network.enable_ipv6` / `network.bind_interfaces` (IP addresses) honoured by the daemon, with IPv4 and IPv6 listeners sharing one port.
+- DHT and uTP share one UDP port (`synapse_wire::UdpMux`, demultiplexed by first byte).
+
+**Torrent files**
+- **Torrent creation**: `synapsed create` and `POST /api/v1/torrents/create` (v1, v2 or hybrid; streamed, deterministic, BEP 47 padding; the REST form only reads the download directory). `synapsed inspect` reports payload size, readable dates and signatures.
+
+**Peer, piece and disk engine**
+- Session-wide choker with dynamic slot sizing and the `RoundRobin`, `AntiLeech` and `FastestUpload` seed algorithms; a three-tier (global, torrent, peer) token-bucket hierarchy with LAN/WAN and TCP/uTP classes, packet overhead accounting and burst credit.
+- Availability-bucketed piece picker, eight priority tiers, extent affinity, speed-classified partial pieces, endgame duplicate requests, `SuggestPiece`/`RejectRequest`, sequential and reverse modes.
+- Bounded write budget shared by both disk engines with adaptive backpressure, write coalescing, pipelined parallel recheck, and a part file for skipped files whose slice map and per-file priorities persist across restarts.
+- Auto-manage with per-subsystem announce rate limits, `dont_count_slow_torrents`, and share-ratio and seed-time limits.
+
+**Observability**
+- Structured alerts (`TorrentAdded`, `TorrentFinished`, `TorrentError`, `PieceFinished`, `HashFailed`, `PeerConnected`, `PeerDisconnected`, `PeerBanned`, `StateChanged`, `TrackerAnnounce`) over `GET /api/v1/alerts` (Server-Sent Events) and gRPC `SubscribeAlerts`, both filterable by info hash.
+- Prometheus counters for chokes, requests, rejects, hash failures, bans, disk write queue, uTP loss, DHT drops and the mapped port. OpenAPI entries for every route.
+
+**Quality**
+- CI gates (`cargo fmt`, `clippy -D warnings`, tests, `cargo-deny`, `cargo audit`), a declared MSRV (Rust 1.88), nine libFuzzer targets, an ASAN/TSAN/Miri runner, a deterministic swarm simulation harness, property tests for the picker, bitfields, wire codecs and path safety, and real-socket end-to-end tests for each protocol above. `scripts/interop_test.sh` runs the Synapse-to-Synapse suites; it does not test against any other client.
+
+### Changed
+
+- **Documentation matches the daemon.** `docs/BEP_SUPPORT_MATRIX.md` and the README list each BEP as Supported, Partial, Library only or Not implemented with the evidence behind it; entries that were library code nothing used, or not implemented at all, no longer claim support.
+- **Public fallback trackers are opt-in** (`network.enable_fallback_trackers`, default off): announcing every public torrent to built-in third-party trackers disclosed each info hash to services the user never chose.
+- **Queueing:** a newly started download counts against the active-download limit for 120 s (it has no throughput yet); idle-seeding limits measure time since the last transfer, not since the torrent was added.
+- **Rate limiting:** a request larger than a bucket can hold is admitted from a full bucket and leaves it in debt instead of waiting forever; tiers are taken all-or-nothing and a queued upload no longer holds its peer's and torrent's budget.
+- **Peer wire frames are capped at 1 MiB** (previously 8 MiB); we announce to LSD every 5 minutes instead of every minute; the daemon starts the session choker and the dual-stack DHT (both existed but were never started).
+- The exact info dictionary is kept for v2, hybrid, signed and Merkle torrents, and for any torrent whose info dictionary has keys Synapse does not model, so a torrent's identity survives being persisted and it can serve its own metadata.
+- Each inbound connection resolves its torrent through an index instead of copying every info hash; the serialized info dictionary is cached instead of re-encoded per request.
+
+### Fixed
+
+- **Torrents with extra info-dictionary keys** (`source`, `x_cross_seed`, `md5sum`, ...) changed their info hash when persisted, so they were skipped on the next start and could not serve metadata.
+- **uTP could not carry bulk data**: the rest of a write was discarded when the congestion window was full, so anything beyond a few kilobytes stalled. Selectively acknowledged packets were double counted, the advertised window was the sender's congestion window instead of the receiver's free space, and buffers were unbounded.
+- **DHT could not start whenever uTP was enabled** (both bound the peer port), and its IPv6 socket could not share the IPv4 socket's port on Linux.
+- **BEP 42 was implemented incorrectly** (the IP was XORed into the wrong bits), so generated node ids would never verify; it now matches the published vectors. `DhtStorage` accepted mutable items without verifying their signatures, and `announce_peer` ports above 65535 wrapped.
+- **BEP 52:** short final blocks and pieces were hashed with the wrong padding and tree width; the hash messages used the wrong wire layout; unverified piece layers could be planted by any peer (and a hostile `index` could resize a buffer by ~137 GB); a v2 torrent was persisted as v1 and lost its identity.
+- **Skipping a file** deselected pieces it shares with a wanted neighbour, which then could never complete; per-file priorities and the part-file map were not saved, so skipped files came back as wanted and their data was re-downloaded; part-file blocks could not be read back and were never moved into the real file when it became wanted.
+- **The Linux build failed**: the `io_uring` disk engine lacked the write-buffer accessors the dispatcher calls. A write batch larger than the write budget, or a budget lowered at runtime, could deadlock.
+- **Resume data** claimed pieces whose files were missing or truncated; it is now checked against the files on disk (part-file data counts as present).
+- **BEP 9:** a failed metadata assembly left the magnet stuck forever; it now resets, drops the peer that completed it and asks others.
+- **NAT-PMP** now uses the real default gateway, ignores datagrams from other sources, and renews mappings.
+- Panics reachable from input: slicing a non-ASCII 40- or 64-byte string in a magnet or feed, `Info::piece_len` underflow on an inconsistent persisted record, and `so=0-4294967295` allocating without bound.
+- `lt_donthave` could drive rarest-first availability to zero; a peer could get an innocent peer banned through unproven block hashes; the local web-seed cache check read every piece from the start of the file; tracker parsers truncated intervals and ports instead of rejecting them.
+
+### Security
+
+- **A peer could make the daemon allocate up to 4 GiB with one message**: `Request` messages were served without validating `index`, `begin` or `length`, and the buffer was allocated from the peer-supplied `length`. Requests are validated (`index < pieces`, `0 < length <= 16 KiB`, `begin + length <= piece length`) before anything is allocated; invalid, choked or unavailable requests get `RejectRequest` and count as strikes, a peer over 300 strikes is disconnected, and concurrent serves are capped at 500 per peer and 2048 per torrent.
+- **Unsolicited and mis-sized blocks** are no longer accepted, credited or written; a block must match an outstanding request from that peer at the exact size.
+- **Inconsistent `.torrent` metadata** is rejected: `0 < piece length <= 128 MiB`, non-negative file lengths whose sum does not overflow, `ceil(total / piece length)` equal to the hash count, at most 2,097,152 pieces, 1,000,000 files and 128 path components (`.torrent` files, BEP 9 metadata and Merkle layouts alike). Path components with control characters, bidirectional overrides or over 255 bytes, and duplicate paths, are rejected.
+- **Bencode limits**: 3,000,000 values, 20-character integer and length literals, no duplicate keys, no non-canonical integers.
+- **`.torrent` size caps everywhere** (10 MiB: files, the watch directory, gRPC, REST, HTTP downloads), read through bounded readers.
+- **BEP 9 metadata** is limited to 30 MiB with exact 16 KiB chunks. **PEX** accepts at most 50 peers per family per message, drops unroutable addresses, and ignores a peer sending it more than once per 10 s.
+- **Smart-ban**: each block records who sent it; a failed piece bans a sole contributor, or costs several contributors trust points and puts them on parole (only pieces no one else touches), with 24-hour per-IP bans shared across torrents and enforced on accept, dial and connect. Duplicate blocks no longer overwrite the first.
+- **Connection gating**: connections are refused before any handshake work past the global limit plus 10, with at most 256 handshakes in flight and 128 concurrent dials; self-connections and a second connection from the same peer id or IP are refused; keep-alives after 60 s of silence, closed after 180 s, and peers exchanging no piece data for 600 s are dropped in every state.
+- **IP filter** lookups are O(log n) over merged ranges, and a filter or ban change drops matching connected peers within 5 seconds.
+- **SSRF-safe, size-capped HTTP** (`synapse_tracker::safe_http`) for trackers, web seeds, `.torrent` URLs, feeds, search engines and update feeds: hosts are resolved once and the connection pinned to the checked addresses, at most 5 redirects, no redirect from a public host to a private one, credentials stripped when a redirect changes host, bodies abandoned the moment they exceed their cap. Non-public tracker URLs need an `announce`/`scrape` path; web seeds on non-public addresses need `network.allow_local_web_seeds`; web seed replies must be the exact range asked. Feed items and update URLs (which come from remote content) can never target the local network.
+- **DHT**: per-source rate limits and a global reply budget, 1500-byte packet and depth-10/500-value KRPC limits, capped peer storage, announce tokens bound to requester IP and info hash and compared in constant time, one node per IP and per /24 per bucket, BEP 42 preferred.
+- **LSD and zeroconf** ignore announcements from public source addresses, limit each source's rate, and cap remembered peers per torrent.
+- **BEP 52 layer and hash requests** are bounded (512 hashes) and answered only for this torrent's roots; `hash` messages that fail their proof cost the sender strikes.
+
+### Removed
+
+- The peer-wire "pubsub" relay that had been added under BEP 50 (BEP 50 is a DHT protocol; it is listed as not implemented).
+- The REST tracker client that had been labelled BEP 26, which also redirected any announce URL containing `/api/`.
+- An Ed25519 signature scheme labelled BEP 35, which verified a torrent against a key embedded in the same torrent.
+- A local-only lookalike of BEP 18 search, and an unused STUN codec.
+- The refusal to load multi-file v2-only torrents.
+
+### Not implemented
+
+I2P, libtorrent's `lt_tex` tracker exchange, and BEP 50. Interoperability with third-party clients has not been tested for MSE, uTP, BEP 52, BEP 30 or BEP 26 (BEP 35 was checked against OpenSSL); their wire formats follow the specifications and have been exercised against this implementation.
+
 ## [2.2.4] - 2026-09-10
 
 ### Added

@@ -19,8 +19,21 @@ use synapse_meta::Info;
 use synapse_tracker::{AnnounceRequest, CanaryCircuitBreaker, Event};
 
 use crate::circuit_breaker::PeerCircuitBreaker;
-use crate::peer::{connect, PeerEvent};
+use crate::peer::{connect_with_options, PeerEvent};
 use crate::swarm::SwarmStats;
+
+/// Most tracker URLs taken from a torrent's own announce list.
+const MAX_TRACKERS_PER_TORRENT: usize = 50;
+
+/// Whether public (non-private) torrents also announce to the built-in list of well-known
+/// public trackers. Off by default: announcing hands each torrent's info hash to third
+/// parties the user never chose. Set once at startup from `network.enable_fallback_trackers`.
+static FALLBACK_TRACKERS_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Enables or disables the built-in public fallback trackers (see above).
+pub fn set_fallback_trackers_enabled(enabled: bool) {
+    FALLBACK_TRACKERS_ENABLED.store(enabled, Ordering::Relaxed);
+}
 
 /// Transfer statistics passed to tracker announce calls.
 #[derive(Debug, Clone, Copy, Default)]
@@ -47,15 +60,40 @@ pub struct TrackerReport {
     pub recovery_progress_pct: Option<f32>,
 }
 
+/// `(info hash, tracker URL)` -> the tracker id it gave.
+type TrackerIds = HashMap<([u8; 20], String), String>;
+
 pub struct Announcer {
     our_peer_id: [u8; 20],
     listen_port: Arc<RwLock<u16>>,
     tracker_key: u32,
     circuit_breaker: Arc<PeerCircuitBreaker>,
     tracker_breaker: Arc<CanaryCircuitBreaker>,
+    nat_manager: Option<Arc<RwLock<crate::nat::NatManager>>>,
+    settings: Option<Arc<RwLock<crate::settings::DynamicSessionSettings>>>,
+    utp_manager: Arc<RwLock<Option<Arc<crate::utp::UtpSocketManager>>>>,
+    alert_sender: Arc<RwLock<Option<tokio::sync::broadcast::Sender<crate::alert::Alert>>>>,
+    /// The `tracker id` each tracker gave us for each torrent, sent back on later announces.
+    tracker_ids: Arc<parking_lot::Mutex<TrackerIds>>,
+    /// The external address each tracker reported (BEP 24), by tracker URL.
+    external_ip_votes: Arc<parking_lot::Mutex<HashMap<String, std::net::IpAddr>>>,
 }
 
 impl Announcer {
+    /// Our external address if at least two different trackers agree on it (BEP 24).
+    pub fn external_ip(&self) -> Option<std::net::IpAddr> {
+        let votes = self.external_ip_votes.lock();
+        let mut counts: HashMap<std::net::IpAddr, usize> = HashMap::new();
+        for ip in votes.values() {
+            *counts.entry(*ip).or_default() += 1;
+        }
+        counts
+            .into_iter()
+            .filter(|(_, n)| *n >= 2)
+            .max_by_key(|(_, n)| *n)
+            .map(|(ip, _)| ip)
+    }
+
     pub fn new(
         our_peer_id: [u8; 20],
         listen_port: Arc<RwLock<u16>>,
@@ -81,11 +119,75 @@ impl Announcer {
             tracker_key: rand::random(),
             circuit_breaker,
             tracker_breaker,
+            nat_manager: None,
+            settings: None,
+            utp_manager: Arc::new(RwLock::new(None)),
+            alert_sender: Arc::new(RwLock::new(None)),
+            tracker_ids: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            external_ip_votes: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         }
+    }
+
+    pub fn with_alert_sender(
+        self,
+        sender: tokio::sync::broadcast::Sender<crate::alert::Alert>,
+    ) -> Self {
+        *self.alert_sender.write() = Some(sender);
+        self
+    }
+
+    pub fn set_alert_sender(&self, sender: tokio::sync::broadcast::Sender<crate::alert::Alert>) {
+        *self.alert_sender.write() = Some(sender);
+    }
+
+    pub fn with_nat_manager(mut self, nat_manager: Arc<RwLock<crate::nat::NatManager>>) -> Self {
+        self.nat_manager = Some(nat_manager);
+        self
+    }
+
+    pub fn with_settings(
+        mut self,
+        settings: Arc<RwLock<crate::settings::DynamicSessionSettings>>,
+    ) -> Self {
+        self.settings = Some(settings);
+        self
+    }
+
+    pub fn with_utp_manager(self, utp_manager: Arc<crate::utp::UtpSocketManager>) -> Self {
+        *self.utp_manager.write() = Some(utp_manager);
+        self
+    }
+
+    pub fn set_utp_manager(&self, utp_manager: Arc<crate::utp::UtpSocketManager>) {
+        *self.utp_manager.write() = Some(utp_manager);
     }
 
     pub fn tracker_breaker(&self) -> &Arc<CanaryCircuitBreaker> {
         &self.tracker_breaker
+    }
+
+    /// Scrapes a tracker (HTTP/HTTPS or UDP) for swarm statistics across info hashes (BEP 48).
+    pub async fn scrape(
+        &self,
+        tracker_url: &url::Url,
+        info_hashes: &[[u8; 20]],
+    ) -> Result<synapse_tracker::ScrapeResponse, synapse_tracker::TrackerError> {
+        match tracker_url.scheme() {
+            "http" | "https" => synapse_tracker::http::scrape(tracker_url, info_hashes).await,
+            "udp" => {
+                let host = tracker_url
+                    .host_str()
+                    .ok_or(synapse_tracker::TrackerError::InvalidUrl("missing host"))?;
+                let port = tracker_url.port().unwrap_or(80);
+                let target = tokio::net::lookup_host((host, port)).await?.next().ok_or(
+                    synapse_tracker::TrackerError::InvalidUrl("failed to resolve tracker host"),
+                )?;
+                synapse_tracker::udp::scrape(target, info_hashes).await
+            }
+            _ => Err(synapse_tracker::TrackerError::InvalidUrl(
+                "unsupported tracker scheme for scrape",
+            )),
+        }
     }
 
     /// Extracts all unique announce and fallback tracker URLs for an info hash.
@@ -103,7 +205,11 @@ impl Announcer {
             }
         }
 
-        if !info.private {
+        // A torrent controls its own tracker list, so bound how many announces it can
+        // fan out per cycle.
+        candidate_urls.truncate(MAX_TRACKERS_PER_TORRENT);
+
+        if !info.private && FALLBACK_TRACKERS_ENABLED.load(Ordering::Relaxed) {
             let fallback_trackers = [
                 "udp://tracker.opentrackr.org:1337/announce",
                 "udp://open.stealth.si:80/announce",
@@ -132,8 +238,16 @@ impl Announcer {
         event: Event,
     ) -> (Vec<SocketAddr>, u32, Vec<TrackerReport>) {
         let candidate_urls = Self::candidate_trackers(info);
+        let announce_ip = self.settings.as_ref().and_then(|s| s.read().announce_ip);
         let bound_port = *self.listen_port.read();
-        let port = if bound_port == 0 { 54345 } else { bound_port };
+        let port = self
+            .nat_manager
+            .as_ref()
+            .and_then(|nm| {
+                nm.read()
+                    .mapped_external_port(bound_port, crate::nat::PortProtocol::Tcp)
+            })
+            .unwrap_or(if bound_port == 0 { 54345 } else { bound_port });
         let req = AnnounceRequest {
             info_hash: info.hash,
             peer_id: self.our_peer_id,
@@ -143,6 +257,16 @@ impl Announcer {
             left,
             event,
             num_want: Some(50),
+            ipv4: announce_ip.and_then(|ip| match ip {
+                std::net::IpAddr::V4(v4) => Some(v4),
+                _ => None,
+            }),
+            ipv6: announce_ip.and_then(|ip| match ip {
+                std::net::IpAddr::V6(v6) => Some(v6),
+                _ => None,
+            }),
+            udp_options: Vec::new(),
+            tracker_id: None,
         };
 
         let mut discovered_peers = HashSet::new();
@@ -155,10 +279,25 @@ impl Announcer {
             let label_c = torrent_label.clone();
             let circuit_breaker = self.circuit_breaker.clone();
             let tracker_breaker = self.tracker_breaker.clone();
+            let alert_sender = self.alert_sender.clone();
+            let tracker_ids = self.tracker_ids.clone();
+            let external_ip_votes = self.external_ip_votes.clone();
+            let mut req_clone = req_clone;
+            req_clone.tracker_id = tracker_ids
+                .lock()
+                .get(&(info.hash, tracker_url.to_string()))
+                .cloned();
             tasks.push(async move {
                 let mut peers = Vec::new();
                 let mut interval = None;
                 let url_str = tracker_url.to_string();
+                if let Some(ref tx) = *alert_sender.read() {
+                    let _ = tx.send(crate::alert::Alert::TrackerAnnounce {
+                        info_hash: req_clone.info_hash,
+                        tracker_url: url_str.clone(),
+                        event: format!("{:?}", req_clone.event),
+                    });
+                }
                 // Logged in place of `tracker_url` everywhere below: private trackers
                 // commonly embed a passkey in the announce URL's query string, and
                 // docs/TRUST_AND_SAFETY.md promises it never appears in logs.
@@ -180,6 +319,22 @@ impl Announcer {
                 }
 
                 let (peers_res, interval_res, report) = match tracker_url.scheme() {
+                    "udp" if crate::proxy::global().is_some_and(|p| p.proxy_http) => {
+                        // UDP cannot go through the proxy, and sending it directly would give
+                        // away our address.
+                        let rep = TrackerReport {
+                            url: tracker_url.to_string(),
+                            status: "Unsupported".into(),
+                            seeders: 0,
+                            leechers: 0,
+                            next_announce_in: 3600,
+                            failure_reason: Some("UDP trackers are not used while a proxy is configured".into()),
+                            is_circuit_broken: false,
+                            cb_state: None,
+                            recovery_progress_pct: None,
+                        };
+                        (peers, interval, rep)
+                    }
                     "udp" => {
                         let host = match tracker_url.host_str() {
                             Some(h) => h.to_string(),
@@ -200,6 +355,45 @@ impl Announcer {
                             }
                         };
                         let port = tracker_url.port().unwrap_or(6969);
+
+                        // BEP 41: If the UDP URL carries a path or query, attach UrlData option
+                        let mut req_clone = req_clone;
+                        let path = tracker_url.path();
+                        let query = tracker_url.query();
+                        let full_path = match (path, query) {
+                            (p, Some(q)) if p.len() > 1 => format!("{p}?{q}"),
+                            (p, None) if p.len() > 1 => p.to_string(),
+                            (_, Some(q)) => format!("/?{q}"),
+                            _ => String::new(),
+                        };
+                        if !full_path.is_empty() {
+                            req_clone.udp_options.push(synapse_tracker::UdpOption::UrlData(full_path));
+                        }
+
+                        // BEP 34: a tracker URL without an explicit port may have DNS SRV records
+                        // naming where (and in what order) to announce. Targets must be public
+                        // addresses, so DNS cannot aim us at the local network.
+                        let mut srv_candidates: Vec<SocketAddr> = Vec::new();
+                        if tracker_url.port().is_none() && host.parse::<std::net::IpAddr>().is_err() {
+                            for srv in synapse_tracker::resolve_tracker_srv(&host, "udp", None)
+                                .await
+                                .into_iter()
+                                .take(3)
+                            {
+                                if let Ok(Ok(addrs)) = tokio::time::timeout(
+                                    Duration::from_secs(2),
+                                    tokio::net::lookup_host((srv.target.as_str(), srv.port)),
+                                )
+                                .await
+                                {
+                                    srv_candidates.extend(
+                                        addrs
+                                            .filter(|a| synapse_tracker::safe_http::is_public_ip(a.ip()))
+                                            .take(2),
+                                    );
+                                }
+                            }
+                        }
                         let host_port = format!("{}:{}", host, port);
 
                         match tokio::time::timeout(
@@ -209,7 +403,12 @@ impl Announcer {
                         .await
                         {
                             Ok(Ok(addrs)) => {
-                                let addrs_vec: Vec<SocketAddr> = addrs.collect();
+                                let mut addrs_vec = srv_candidates;
+                                for a in addrs {
+                                    if !addrs_vec.contains(&a) {
+                                        addrs_vec.push(a);
+                                    }
+                                }
                                 if let Some(&resolved_addr) = addrs_vec.first() {
                                     let is_cb = !circuit_breaker.can_connect(&resolved_addr);
                                     debug!(
@@ -217,11 +416,12 @@ impl Announcer {
                                         label_c, safe_url, resolved_addr
                                     );
                                     match tokio::time::timeout(
-                                        Duration::from_secs(5),
-                                        synapse_tracker::udp::announce(
-                                            resolved_addr,
+                                        Duration::from_secs(20),
+                                        synapse_tracker::udp::announce_any(
+                                            &addrs_vec,
                                             &req_clone,
                                             tracker_key,
+                                            Duration::from_secs(5),
                                         ),
                                     )
                                     .await
@@ -238,11 +438,7 @@ impl Announcer {
                                                 resp.interval
                                             );
                                             interval = Some(resp.interval);
-                                            for p in resp.peers {
-                                                if p.port() != 0 {
-                                                    peers.push(p);
-                                                }
-                                            }
+                                            peers.extend(resp.peers.iter().copied());
                                             let rep = TrackerReport {
                                                 url: tracker_url.to_string(),
                                                 status: "Announced".into(),
@@ -287,7 +483,7 @@ impl Announcer {
                                                 seeders: 0,
                                                 leechers: 0,
                                                 next_announce_in: 300,
-                                                failure_reason: Some("Tracker timed out after 5s".into()),
+                                                failure_reason: Some("Tracker timed out".into()),
                                                 is_circuit_broken: is_cb,
                                                 cb_state: None,
                                                 recovery_progress_pct: None,
@@ -344,9 +540,10 @@ impl Announcer {
                         }
                     }
                     "http" | "https" => {
+                        let announce_fut = synapse_tracker::http::announce(&tracker_url, &req_clone);
                         match tokio::time::timeout(
                             Duration::from_secs(10),
-                            synapse_tracker::http::announce(&tracker_url, &req_clone),
+                            announce_fut,
                         )
                         .await
                         {
@@ -361,12 +558,23 @@ impl Announcer {
                                     resp.peers.len(),
                                     resp.interval
                                 );
-                                interval = Some(resp.interval);
-                                for p in resp.peers {
-                                    if p.port() != 0 {
-                                        peers.push(p);
+                                interval = Some(resp.interval.max(resp.min_interval.unwrap_or(0)));
+                                if let Some(ref w) = resp.warning {
+                                    warn!("[{}] tracker {} warning: {}", label_c, safe_url, w);
+                                }
+                                if let Some(ref id) = resp.tracker_id {
+                                    let mut ids = tracker_ids.lock();
+                                    if ids.len() < 4096 {
+                                        ids.insert((req_clone.info_hash, url_str.clone()), id.clone());
                                     }
                                 }
+                                if let Some(ip) = resp.external_ip {
+                                    let mut votes = external_ip_votes.lock();
+                                    if votes.len() < 64 || votes.contains_key(&url_str) {
+                                        votes.insert(url_str.clone(), ip);
+                                    }
+                                }
+                                peers.extend(resp.peers.iter().copied());
                                 let rep = TrackerReport {
                                     url: tracker_url.to_string(),
                                     status: "Announced".into(),
@@ -528,11 +736,19 @@ impl Announcer {
             let is_private = info.private;
             let tx = events_tx.clone();
             let cb = self.circuit_breaker.clone();
+            let enc_mode = self
+                .settings
+                .as_ref()
+                .map(|s| s.read().encryption_mode())
+                .unwrap_or(synapse_wire::EncryptionMode::PreferEncrypted);
+            let utp_mgr = self.utp_manager.read().clone();
 
             tokio::spawn(async move {
                 match tokio::time::timeout(
                     Duration::from_secs(12),
-                    connect(peer_addr, our_id, info_hash, is_private, tx),
+                    connect_with_options(
+                        peer_addr, our_id, info_hash, is_private, tx, enc_mode, utp_mgr,
+                    ),
                 )
                 .await
                 {
@@ -637,6 +853,8 @@ pub struct AnnounceScheduler {
     peer_router: RwLock<Option<PeerEventRouter>>,
     settings: RwLock<Option<Arc<RwLock<crate::settings::DynamicSessionSettings>>>>,
     ip_filter: RwLock<Option<Arc<RwLock<crate::ipfilter::IpFilter>>>>,
+    ban_list: RwLock<Option<Arc<crate::banlist::BanList>>>,
+    utp_manager: RwLock<Option<Arc<crate::utp::UtpSocketManager>>>,
 }
 
 impl AnnounceScheduler {
@@ -658,12 +876,23 @@ impl AnnounceScheduler {
             peer_router: RwLock::new(None),
             settings: RwLock::new(None),
             ip_filter: RwLock::new(None),
+            ban_list: RwLock::new(None),
+            utp_manager: RwLock::new(None),
         })
     }
 
     /// Sets the dynamic peer event router used to awaken dormant Warm/Cold swarms when tracker peers are found.
     pub fn set_peer_router(&self, router: PeerEventRouter) {
         *self.peer_router.write() = Some(router);
+    }
+
+    pub fn set_utp_manager(&self, utp_manager: Arc<crate::utp::UtpSocketManager>) {
+        *self.utp_manager.write() = Some(utp_manager.clone());
+        self.announcer.set_utp_manager(utp_manager);
+    }
+
+    pub fn set_alert_sender(&self, sender: tokio::sync::broadcast::Sender<crate::alert::Alert>) {
+        self.announcer.set_alert_sender(sender);
     }
 
     /// Sets the live session settings used to bound outbound dial targets by the
@@ -674,6 +903,10 @@ impl AnnounceScheduler {
 
     /// Sets the shared IP filter used to skip blocklisted candidate peers before ever
     /// dialing them -- see `dial_step`.
+    pub fn set_ban_list(&self, ban_list: Arc<crate::banlist::BanList>) {
+        *self.ban_list.write() = Some(ban_list);
+    }
+
     pub fn set_ip_filter(&self, ip_filter: Arc<RwLock<crate::ipfilter::IpFilter>>) {
         *self.ip_filter.write() = Some(ip_filter);
     }
@@ -697,7 +930,10 @@ impl AnnounceScheduler {
             Instant::now()
         } else {
             let jitter_secs = if self.max_startup_jitter.as_secs() > 0 {
-                rand::Rng::gen_range(&mut rand::thread_rng(), 1..=self.max_startup_jitter.as_secs())
+                rand::Rng::gen_range(
+                    &mut rand::thread_rng(),
+                    1..=self.max_startup_jitter.as_secs(),
+                )
             } else {
                 0
             };
@@ -715,7 +951,11 @@ impl AnnounceScheduler {
             .into_iter()
             .map(|u| TrackerReport {
                 url: u.to_string(),
-                status: if is_downloading { "Updating".into() } else { "Ready".into() },
+                status: if is_downloading {
+                    "Updating".into()
+                } else {
+                    "Ready".into()
+                },
                 seeders: 0,
                 leechers: 0,
                 next_announce_in: initial_remaining,
@@ -773,15 +1013,16 @@ impl AnnounceScheduler {
         let mut swarms = self.swarms.write();
         if let Some(meta) = swarms.get_mut(info_hash) {
             let mut existing: HashSet<SocketAddr> = meta.candidate_peers.iter().copied().collect();
+            let mut new_peers = Vec::new();
             for addr in peers {
                 if addr.port() != 0
                     && !existing.contains(&addr)
                     && !meta.active_dials.contains(&addr)
                     && self.announcer.circuit_breaker.can_connect(&addr)
-                    && meta.candidate_peers.len() < 2000
+                    && meta.candidate_peers.len() + new_peers.len() < 2000
                 {
                     existing.insert(addr);
-                    meta.candidate_peers.push_back(addr);
+                    new_peers.push(addr);
                     match source {
                         PeerDiscoverySource::Tracker => meta.discovered_from_tracker += 1,
                         PeerDiscoverySource::Dht => meta.discovered_from_dht += 1,
@@ -790,38 +1031,59 @@ impl AnnounceScheduler {
                     }
                 }
             }
+            // BEP 40: Order dial queue by Canonical Peer Priority score
+            new_peers
+                .sort_by_key(|&a| std::cmp::Reverse(synapse_wire::bep40::canonical_peer_score(a)));
+            for addr in new_peers {
+                meta.candidate_peers.push_back(addr);
+            }
         }
     }
 
     /// Enqueues newly discovered peers into the swarm's candidate pool, attributing them to Tracker announces.
-    pub fn add_candidate_peers(&self, info_hash: &[u8; 20], peers: impl IntoIterator<Item = SocketAddr>) {
+    pub fn add_candidate_peers(
+        &self,
+        info_hash: &[u8; 20],
+        peers: impl IntoIterator<Item = SocketAddr>,
+    ) {
         self.add_candidate_peers_with_source(info_hash, peers, PeerDiscoverySource::Tracker);
     }
 
     /// Returns the number of candidate peers currently queued for dialing.
     pub fn candidate_peers_count(&self, info_hash: &[u8; 20]) -> usize {
         let swarms = self.swarms.read();
-        swarms.get(info_hash).map(|m| m.candidate_peers.len()).unwrap_or(0)
+        swarms
+            .get(info_hash)
+            .map(|m| m.candidate_peers.len())
+            .unwrap_or(0)
     }
 
     /// Returns the number of active dials currently in flight for this swarm.
     pub fn active_dials_count(&self, info_hash: &[u8; 20]) -> usize {
         let swarms = self.swarms.read();
-        swarms.get(info_hash).map(|m| m.active_dials.len()).unwrap_or(0)
+        swarms
+            .get(info_hash)
+            .map(|m| m.active_dials.len())
+            .unwrap_or(0)
     }
 
     /// Returns the candidate pool size, active dials count, and discovery attribution counters
     /// (candidate_peers, active_dials, from_tracker, from_dht, from_pex, from_lsd).
     pub fn discovery_breakdown(&self, info_hash: &[u8; 20]) -> (usize, usize, u64, u64, u64, u64) {
         let swarms = self.swarms.read();
-        swarms.get(info_hash).map(|m| (
-            m.candidate_peers.len(),
-            m.active_dials.len(),
-            m.discovered_from_tracker,
-            m.discovered_from_dht,
-            m.discovered_from_pex,
-            m.discovered_from_lsd,
-        )).unwrap_or((0, 0, 0, 0, 0, 0))
+        swarms
+            .get(info_hash)
+            .map(|m| {
+                (
+                    m.candidate_peers.len(),
+                    m.active_dials.len(),
+                    m.discovered_from_tracker,
+                    m.discovered_from_dht,
+                    m.discovered_from_pex,
+                    m.discovered_from_lsd,
+                )
+            })
+            .unwrap_or((0, 0, 0, 0, 0, 0))
     }
 
     /// Unregisters a removed torrent from future announces.
@@ -939,11 +1201,19 @@ impl AnnounceScheduler {
             .unwrap_or(crate::settings::DynamicSessionSettings::default().max_peers_per_torrent);
 
         let ip_filter = self.ip_filter.read().clone();
+        let ban_list = self.ban_list.read().clone();
 
         let dials_to_start = {
             let mut swarms = self.swarms.write();
             let mut to_dial = Vec::new();
             let mut starved_swarms = Vec::new();
+
+            // Session-wide dial pacing (libtorrent's `connection_speed`, and a bound on
+            // half-open sockets): however many torrents want peers, cap how many
+            // connections are in flight at once and how many new ones start per step.
+            const MAX_GLOBAL_CONCURRENT_DIALS: usize = 128;
+            const MAX_NEW_DIALS_PER_STEP: usize = 30;
+            let mut global_active: usize = swarms.values().map(|m| m.active_dials.len()).sum();
 
             for (info_hash, meta) in swarms.iter_mut() {
                 let (state, connected) = {
@@ -983,6 +1253,14 @@ impl AnnounceScheduler {
                     continue;
                 }
 
+                // Out of session-wide dial capacity for this step; swarms skipped here are
+                // reached on the next step (dials complete or fail within seconds).
+                if global_active >= MAX_GLOBAL_CONCURRENT_DIALS
+                    || to_dial.len() >= MAX_NEW_DIALS_PER_STEP
+                {
+                    continue;
+                }
+
                 const MAX_CONCURRENT_DIALS_PER_SWARM: usize = 16;
                 let active_count = meta.active_dials.len();
                 if active_count >= MAX_CONCURRENT_DIALS_PER_SWARM {
@@ -990,7 +1268,8 @@ impl AnnounceScheduler {
                 }
 
                 let remaining_needed = target_peers.saturating_sub(connected + active_count);
-                let dial_budget = remaining_needed.min(MAX_CONCURRENT_DIALS_PER_SWARM - active_count);
+                let dial_budget =
+                    remaining_needed.min(MAX_CONCURRENT_DIALS_PER_SWARM - active_count);
                 if dial_budget == 0 {
                     continue;
                 }
@@ -998,7 +1277,9 @@ impl AnnounceScheduler {
                 let mut count = 0;
                 while count < dial_budget {
                     if let Some(addr) = meta.candidate_peers.pop_front() {
-                        if meta.active_dials.contains(&addr) || !self.announcer.circuit_breaker.can_connect(&addr) {
+                        if meta.active_dials.contains(&addr)
+                            || !self.announcer.circuit_breaker.can_connect(&addr)
+                        {
                             continue;
                         }
                         if let Some(ref filter) = ip_filter {
@@ -1006,9 +1287,23 @@ impl AnnounceScheduler {
                                 continue;
                             }
                         }
+                        if ban_list.as_ref().is_some_and(|b| b.is_banned(addr.ip())) {
+                            continue;
+                        }
+                        // Port 0 is never dialable; addresses like this only come from
+                        // buggy or hostile trackers/PEX/DHT sources.
+                        if addr.port() == 0 {
+                            continue;
+                        }
                         meta.active_dials.insert(addr);
                         to_dial.push((*info_hash, meta.info.clone(), addr, meta.events_tx.clone()));
                         count += 1;
+                        global_active += 1;
+                        if global_active >= MAX_GLOBAL_CONCURRENT_DIALS
+                            || to_dial.len() >= MAX_NEW_DIALS_PER_STEP
+                        {
+                            break;
+                        }
                     } else {
                         break;
                     }
@@ -1043,11 +1338,26 @@ impl AnnounceScheduler {
             } else {
                 fallback_tx
             };
+            let enc_mode = self
+                .settings
+                .read()
+                .as_ref()
+                .map(|s| s.read().encryption_mode())
+                .unwrap_or(synapse_wire::EncryptionMode::PreferEncrypted);
+            let utp_mgr = self.utp_manager.read().clone();
 
             tokio::spawn(async move {
                 match tokio::time::timeout(
                     Duration::from_secs(12),
-                    connect(addr, our_id, info.hash, info.private, events_tx),
+                    connect_with_options(
+                        addr,
+                        our_id,
+                        info.hash,
+                        info.private,
+                        events_tx,
+                        enc_mode,
+                        utp_mgr,
+                    ),
                 )
                 .await
                 {
@@ -1091,13 +1401,9 @@ impl AnnounceScheduler {
         for job in due_jobs {
             let meta_opt = {
                 let swarms = self.swarms.read();
-                swarms.get(&job.info_hash).map(|m| {
-                    (
-                        m.info.clone(),
-                        m.stats.clone(),
-                        m.consecutive_failures,
-                    )
-                })
+                swarms
+                    .get(&job.info_hash)
+                    .map(|m| (m.info.clone(), m.stats.clone(), m.consecutive_failures))
             };
 
             let Some((info, stats, failures)) = meta_opt else {
@@ -1177,7 +1483,11 @@ impl AnnounceScheduler {
                     (stagger as u64, failures)
                 } else if (peer_count > 0 || tracker_interval > 0) && !reports.is_empty() {
                     let base = if is_starved {
-                        if peer_count == 0 { 30 } else { 60 }
+                        if peer_count == 0 {
+                            30
+                        } else {
+                            60
+                        }
                     } else if tracker_interval > 0 {
                         tracker_interval
                     } else {
@@ -1208,7 +1518,9 @@ impl AnnounceScheduler {
                         m.next_announce_at = next_announce_at;
                         for mut rep in reports {
                             rep.next_announce_in = delay_secs as i64;
-                            if let Some(existing) = m.tracker_reports.iter_mut().find(|t| t.url == rep.url) {
+                            if let Some(existing) =
+                                m.tracker_reports.iter_mut().find(|t| t.url == rep.url)
+                            {
                                 *existing = rep;
                             } else {
                                 m.tracker_reports.push(rep);

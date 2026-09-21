@@ -27,11 +27,25 @@ fn create_synthetic_info(index: usize) -> Info {
         file_offsets: Vec::new(),
         url_list: Vec::new(),
         web_seeds: Vec::new(),
+        meta_version: 1,
+        info_hash_v2: None,
+        piece_layers: std::collections::BTreeMap::new(),
+        file_roots: Vec::new(),
+        raw_info: None,
+        v2_aligned: false,
+        select_only: None,
+        signatures: Vec::new(),
+        root_hash_v1: None,
+        update_url: None,
+        originator: None,
     }
 }
 
 pub async fn run_swarm_benchmark(count: usize) {
-    info!("🧪 Starting Swarm Engine Scalability Benchmark (Count: {} swarms)", count);
+    info!(
+        "🧪 Starting Swarm Engine Scalability Benchmark (Count: {} swarms)",
+        count
+    );
 
     let tmp = tempdir().expect("Failed to create tempdir");
     let disk = Arc::new(DiskEngine::auto().await);
@@ -48,7 +62,12 @@ pub async fn run_swarm_benchmark(count: usize) {
     }
     let add_duration = start_add.elapsed();
     let add_rate = (count as f64) / add_duration.as_secs_f64();
-    info!("✅ Ingested {} swarms in {:.3}s ({:.1} swarms/sec)", count, add_duration.as_secs_f64(), add_rate);
+    info!(
+        "✅ Ingested {} swarms in {:.3}s ({:.1} swarms/sec)",
+        count,
+        add_duration.as_secs_f64(),
+        add_rate
+    );
 
     let active_after_ingest = engine.active_swarm_count();
 
@@ -81,7 +100,12 @@ pub async fn run_swarm_benchmark(count: usize) {
     let demote_duration = start_demote.elapsed();
     let demote_rate = (count as f64) / demote_duration.as_secs_f64();
     let active_after_cold = engine.active_swarm_count();
-    info!("✅ Demoted {} swarms to Cold Tier in {:.3}s ({:.1} transitions/sec)", count, demote_duration.as_secs_f64(), demote_rate);
+    info!(
+        "✅ Demoted {} swarms to Cold Tier in {:.3}s ({:.1} transitions/sec)",
+        count,
+        demote_duration.as_secs_f64(),
+        demote_rate
+    );
 
     // Promote all to Hot Tier
     let start_promote = Instant::now();
@@ -91,26 +115,66 @@ pub async fn run_swarm_benchmark(count: usize) {
     let promote_duration = start_promote.elapsed();
     let promote_rate = (count as f64) / promote_duration.as_secs_f64();
     let active_after_hot = engine.active_swarm_count();
-    info!("✅ Promoted {} swarms to Hot Tier in {:.3}s ({:.1} transitions/sec)", count, promote_duration.as_secs_f64(), promote_rate);
+    info!(
+        "✅ Promoted {} swarms to Hot Tier in {:.3}s ({:.1} transitions/sec)",
+        count,
+        promote_duration.as_secs_f64(),
+        promote_rate
+    );
 
     // List all
     let start_list = Instant::now();
     let listed = engine.list_torrents();
     let list_duration = start_list.elapsed();
     assert_eq!(listed.len(), count);
-    info!("✅ Listed {} full swarm summaries in {:.3}ms", listed.len(), list_duration.as_secs_f64() * 1000.0);
+    info!(
+        "✅ Listed {} full swarm summaries in {:.3}ms",
+        listed.len(),
+        list_duration.as_secs_f64() * 1000.0
+    );
 
     println!("\n===============================================================================");
-    println!("📊 SYNAPSE 2.0 50K SWARM SCALABILITY BENCHMARK RESULTS (N = {})", count);
+    println!(
+        "📊 SYNAPSE 2.0 50K SWARM SCALABILITY BENCHMARK RESULTS (N = {})",
+        count
+    );
     println!("===============================================================================");
-    println!("  • Ingestion Throughput:         {:>10.1} swarms/sec", add_rate);
-    println!("  • Cold Tier Demotion:           {:>10.1} ops/sec", demote_rate);
-    println!("  • Hot Tier Promotion:            {:>10.1} ops/sec", promote_rate);
-    println!("  • Active Swarm Actors (Cold):   {:>10} active", active_after_cold);
-    println!("  • Active Swarm Actors (Hot):    {:>10} active", active_after_hot);
-    println!("  • Active Swarm Actors (Queued): {:>10} active", active_after_ingest);
-    println!("  • Global O(1) Metrics Query:    {:>10.2} ns/query", metrics_avg_ns);
-    println!("  • Paginated List (50 items):    {:>10.2} µs/page", paged_avg_us);
-    println!("  • Full Scan List ({} items): {:>10.3} ms", count, list_duration.as_secs_f64() * 1000.0);
+    println!(
+        "  • Ingestion Throughput:         {:>10.1} swarms/sec",
+        add_rate
+    );
+    println!(
+        "  • Cold Tier Demotion:           {:>10.1} ops/sec",
+        demote_rate
+    );
+    println!(
+        "  • Hot Tier Promotion:            {:>10.1} ops/sec",
+        promote_rate
+    );
+    println!(
+        "  • Active Swarm Actors (Cold):   {:>10} active",
+        active_after_cold
+    );
+    println!(
+        "  • Active Swarm Actors (Hot):    {:>10} active",
+        active_after_hot
+    );
+    println!(
+        "  • Active Swarm Actors (Queued): {:>10} active",
+        active_after_ingest
+    );
+    println!(
+        "  • Global O(1) Metrics Query:    {:>10.2} ns/query",
+        metrics_avg_ns
+    );
+    println!(
+        "  • Paginated List (50 items):    {:>10.2} µs/page",
+        paged_avg_us
+    );
+    println!(
+        "  • Full Scan List ({} items): {:>10.3} ms",
+        count,
+        list_duration.as_secs_f64() * 1000.0
+    );
     println!("===============================================================================\n");
 }

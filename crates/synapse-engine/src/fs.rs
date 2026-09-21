@@ -63,7 +63,10 @@ mod tests {
     fn test_get_available_disk_space() {
         let space = get_available_disk_space(Path::new("."));
         #[cfg(unix)]
-        assert!(space > 0, "Current directory should report > 0 bytes available");
+        assert!(
+            space > 0,
+            "Current directory should report > 0 bytes available"
+        );
     }
 
     #[test]
@@ -71,6 +74,9 @@ mod tests {
         let nonexistent = Path::new("./some/deeply/nested/nonexistent/dir");
         let space = get_available_disk_space(nonexistent);
         #[cfg(unix)]
-        assert!(space > 0, "Non-existent path should resolve to existing parent and report > 0 bytes");
+        assert!(
+            space > 0,
+            "Non-existent path should resolve to existing parent and report > 0 bytes"
+        );
     }
 }

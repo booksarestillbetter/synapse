@@ -11,8 +11,12 @@ bytes = { workspace = true }
 synapse-bencode = { path = "../synapse-bencode", version = "2.0.0" }
 thiserror = { workspace = true }
 hex = "0.4"
-tokio = { workspace = true, features = ["io-util"] }
+tokio = { workspace = true, features = ["io-util", "net", "sync"] }
 tokio-util = { version = "0.7", features = ["codec"] }
+num-bigint = "0.4"
+sha1 = "0.10"
+rand = "0.8"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt"] }
+proptest = { workspace = true }

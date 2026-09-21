@@ -1,8 +1,8 @@
+use bytes::Bytes;
+use sha1::{Digest, Sha1};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use tempfile::TempDir;
-use bytes::Bytes;
-use sha1::{Digest, Sha1};
 
 use diskio::DiskEngine;
 use synapse_bencode::BEncode;
@@ -11,9 +11,12 @@ use synapse_wire::{ExtensionHandshake, UtMetadataMessage, UT_METADATA_PIECE_LEN}
 
 fn build_large_test_info_dict() -> (Vec<u8>, [u8; 20]) {
     let mut info_dict = BTreeMap::new();
-    info_dict.insert(b"name".to_vec(), BEncode::String(b"ubuntu-22.04.iso".to_vec()));
+    info_dict.insert(
+        b"name".to_vec(),
+        BEncode::String(b"ubuntu-22.04.iso".to_vec()),
+    );
     info_dict.insert(b"piece length".to_vec(), BEncode::Int(262144));
-    
+
     // Create 40KB of fake piece hashes (2000 pieces) so metadata spans multiple 16KB ut_metadata chunks
     let fake_hashes = vec![0x37u8; 40000];
     info_dict.insert(b"pieces".to_vec(), BEncode::String(fake_hashes));
@@ -44,7 +47,10 @@ async fn test_ut_metadata_multi_chunk_exchange_and_magnet_flow() {
     // 2. Leecher initializes MetadataFetcher
     let mut fetcher = MetadataFetcher::new(info_hash);
     fetcher.set_metadata_size(remote_metadata_size);
-    assert_eq!(fetcher.total_pieces, (total_size as usize).div_ceil(UT_METADATA_PIECE_LEN));
+    assert_eq!(
+        fetcher.total_pieces,
+        (total_size as usize).div_ceil(UT_METADATA_PIECE_LEN)
+    );
 
     // 3. Leecher requests each missing piece
     let missing = fetcher.missing_pieces();
@@ -97,7 +103,9 @@ async fn test_ut_metadata_multi_chunk_exchange_and_magnet_flow() {
     let hex_hash = hex::encode(info_hash);
     let magnet_uri = format!("magnet:?xt=urn:btih:{}&dn=ubuntu-22.04.iso", hex_hash);
 
-    let handle = swarm.add_magnet(&magnet_uri, dir.path().to_path_buf()).unwrap();
+    let handle = swarm
+        .add_magnet(&magnet_uri, dir.path().to_path_buf())
+        .unwrap();
     assert_eq!(handle.info.hash, info_hash);
     assert_eq!(handle.info.name, "ubuntu-22.04.iso");
     assert_eq!(swarm.torrent_count(), 1);

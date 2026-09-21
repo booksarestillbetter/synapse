@@ -18,10 +18,16 @@ pub const DEFAULT_WEBTORRENT_URLS: &[&str] = &[
 fn resolve_preset_or_url(input: &str) -> String {
     let lower = input.to_lowercase();
     match lower.as_str() {
-        "bunny" | "big-buck-bunny" => "https://webtorrent.io/torrents/big-buck-bunny.torrent".to_string(),
-        "cosmos" | "cosmos-laundromat" => "https://webtorrent.io/torrents/cosmos-laundromat.torrent".to_string(),
+        "bunny" | "big-buck-bunny" => {
+            "https://webtorrent.io/torrents/big-buck-bunny.torrent".to_string()
+        }
+        "cosmos" | "cosmos-laundromat" => {
+            "https://webtorrent.io/torrents/cosmos-laundromat.torrent".to_string()
+        }
         "sintel" => "https://webtorrent.io/torrents/sintel.torrent".to_string(),
-        "tears" | "tears-of-steel" => "https://webtorrent.io/torrents/tears-of-steel.torrent".to_string(),
+        "tears" | "tears-of-steel" => {
+            "https://webtorrent.io/torrents/tears-of-steel.torrent".to_string()
+        }
         "wired" | "wired-cd" => "https://webtorrent.io/torrents/wired-cd.torrent".to_string(),
         _ => {
             if input.starts_with("~/") || input == "~" {
@@ -65,7 +71,11 @@ pub async fn run_live_download_monitor(
     let swarm = Arc::new(SwarmEngine::new(disk, peer_id));
     swarm.set_queue_config(QueueConfig {
         download_queue_enabled: true,
-        max_active_downloads: if single_target.is_some() { 1 } else { max_active_downloads },
+        max_active_downloads: if single_target.is_some() {
+            1
+        } else {
+            max_active_downloads
+        },
         seed_queue_enabled: true,
         max_active_seeds: 10,
         max_active_torrents: 20,
@@ -75,12 +85,16 @@ pub async fn run_live_download_monitor(
         share_ratio_limit: None,
         idle_seeding_limit_enabled: false,
         seed_time_limit_secs: None,
+        ..Default::default()
     });
 
     let target_urls: Vec<String> = if let Some(ref target) = single_target {
         vec![resolve_preset_or_url(target)]
     } else {
-        DEFAULT_WEBTORRENT_URLS.iter().map(|s| s.to_string()).collect()
+        DEFAULT_WEBTORRENT_URLS
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
     };
 
     println!("🔄 Ingesting torrent(s)...");
@@ -154,18 +168,48 @@ pub async fn run_live_download_monitor(
             println!("  Name:             {}", handle.info.name);
             println!("  Info Hash:        {}", hex::encode(handle.info.hash));
             println!("  Files Count:      {}", handle.info.files.len());
-            println!("  Total Size:       {:.2} MB", (handle.info.total_len as f64) / (1024.0 * 1024.0));
+            println!(
+                "  Total Size:       {:.2} MB",
+                (handle.info.total_len as f64) / (1024.0 * 1024.0)
+            );
             println!("  Download Dir:     {}", download_dir.display());
             println!("------------------------------------------------------------------------------------------");
             println!("  Status:           {}", state_str);
             println!("  Progress:         {} {:>6.2}%", bar, percent);
-            println!("  Pieces:           {} / {} pieces", have_pieces, total_pieces);
-            println!("  Downloaded:       {:.2} MB / {:.2} MB", (s.downloaded_bytes as f64) / (1024.0 * 1024.0), (s.total_size as f64) / (1024.0 * 1024.0));
-            println!("  Uploaded:         {:.2} MB", (s.uploaded_bytes as f64) / (1024.0 * 1024.0));
-            println!("  Download Speed:   {:.2} KB/s ({:.2} Mbps)", (s.download_rate as f64) / 1024.0, ((s.download_rate * 8) as f64) / (1024.0 * 1024.0));
-            println!("  Upload Speed:     {:.2} KB/s", (s.upload_rate as f64) / 1024.0);
-            println!("  Connected Peers:  {} (Sending: {})", s.peers_connected, s.peers_sending);
-            println!("  ETA:              {}s", if s.eta_seconds > 0 { s.eta_seconds.to_string() } else { "N/A".to_string() });
+            println!(
+                "  Pieces:           {} / {} pieces",
+                have_pieces, total_pieces
+            );
+            println!(
+                "  Downloaded:       {:.2} MB / {:.2} MB",
+                (s.downloaded_bytes as f64) / (1024.0 * 1024.0),
+                (s.total_size as f64) / (1024.0 * 1024.0)
+            );
+            println!(
+                "  Uploaded:         {:.2} MB",
+                (s.uploaded_bytes as f64) / (1024.0 * 1024.0)
+            );
+            println!(
+                "  Download Speed:   {:.2} KB/s ({:.2} Mbps)",
+                (s.download_rate as f64) / 1024.0,
+                ((s.download_rate * 8) as f64) / (1024.0 * 1024.0)
+            );
+            println!(
+                "  Upload Speed:     {:.2} KB/s",
+                (s.upload_rate as f64) / 1024.0
+            );
+            println!(
+                "  Connected Peers:  {} (Sending: {})",
+                s.peers_connected, s.peers_sending
+            );
+            println!(
+                "  ETA:              {}s",
+                if s.eta_seconds > 0 {
+                    s.eta_seconds.to_string()
+                } else {
+                    "N/A".to_string()
+                }
+            );
             println!("  Elapsed Time:     {:.1}s", elapsed);
             println!("==========================================================================================");
             println!("  (Press Ctrl+C to stop)");

@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use diskio::DiskEngine;
+use std::sync::Arc;
 use synapse_engine::{SessionSettingsUpdate, SwarmEngine};
 
 #[tokio::test]
@@ -19,7 +19,7 @@ async fn test_dynamic_session_settings_and_turtle_mode() {
         download_limit_enabled: Some(true),
         download_limit_bytes: Some(2_000_000), // 2 MB/s
         upload_limit_enabled: Some(true),
-        upload_limit_bytes: Some(1_000_000),   // 1 MB/s
+        upload_limit_bytes: Some(1_000_000), // 1 MB/s
         ..Default::default()
     });
     assert!(warnings.is_empty());

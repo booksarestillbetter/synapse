@@ -7,7 +7,10 @@ use tempfile::tempdir;
 use tracing::info;
 
 pub async fn run_transfer_benchmark(size_mb: usize) {
-    info!("🧪 Starting P2P Wire Transfer Benchmark (Data Size: {} MB)", size_mb);
+    info!(
+        "🧪 Starting P2P Wire Transfer Benchmark (Data Size: {} MB)",
+        size_mb
+    );
 
     let tmp_seeder = tempdir().expect("tempdir seeder");
     let tmp_leecher = tempdir().expect("tempdir leecher");
@@ -18,7 +21,9 @@ pub async fn run_transfer_benchmark(size_mb: usize) {
 
     let payload = vec![0x55u8; total_len as usize];
     let payload_file = tmp_seeder.path().join("payload.dat");
-    tokio::fs::write(&payload_file, &payload).await.expect("Write seeder payload");
+    tokio::fs::write(&payload_file, &payload)
+        .await
+        .expect("Write seeder payload");
 
     let magnet = format!(
         "magnet:?xt=urn:btih:1111222233334444555566667777888899990000&dn=payload.dat&xl={}",
@@ -50,12 +55,18 @@ pub async fn run_transfer_benchmark(size_mb: usize) {
     let throughput_mbs = (size_mb as f64) / elapsed.as_secs_f64().max(0.0001);
 
     println!("\n========================================================");
-    println!("📊 SYNAPSE 2.0 P2P DATA TRANSFER BENCHMARK (Size: {} MB)", size_mb);
+    println!(
+        "📊 SYNAPSE 2.0 P2P DATA TRANSFER BENCHMARK (Size: {} MB)",
+        size_mb
+    );
     println!("========================================================");
     println!("  • Piece Size:            {:>10} KB", piece_len / 1024);
     println!("  • Total Pieces:          {:>10}", num_pieces);
     println!("  • Transferred Bytes:     {:>10} bytes", transferred_bytes);
-    println!("  • Pipeline Elapsed:      {:>10.3} ms", elapsed.as_secs_f64() * 1000.0);
+    println!(
+        "  • Pipeline Elapsed:      {:>10.3} ms",
+        elapsed.as_secs_f64() * 1000.0
+    );
     println!("  • Equivalent Bandwidth:  {:>10.1} MB/s", throughput_mbs);
     println!("========================================================\n");
 }

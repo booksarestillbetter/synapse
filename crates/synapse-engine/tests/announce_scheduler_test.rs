@@ -1,12 +1,13 @@
+use parking_lot::RwLock;
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::tempdir;
 use tokio::sync::mpsc;
-use parking_lot::RwLock;
 
 use diskio::DiskEngine;
 use synapse_engine::{
-    AnnounceScheduler, Announcer, PeerCircuitBreaker, SwarmEngine, SwarmState, SwarmTier, SwarmStats,
+    AnnounceScheduler, Announcer, PeerCircuitBreaker, SwarmEngine, SwarmState, SwarmStats,
+    SwarmTier,
 };
 use synapse_meta::Info;
 use synapse_picker::Bitfield;
@@ -39,10 +40,7 @@ fn build_dummy_torrent(name: &str) -> Info {
     );
 
     let mut torrent_dict = std::collections::BTreeMap::new();
-    torrent_dict.insert(
-        b"info".to_vec(),
-        synapse_bencode::BEncode::Dict(info_dict),
-    );
+    torrent_dict.insert(b"info".to_vec(), synapse_bencode::BEncode::Dict(info_dict));
 
     Info::from_bencode(synapse_bencode::BEncode::Dict(torrent_dict))
         .expect("valid synthetic torrent")
@@ -246,4 +244,3 @@ async fn test_candidate_peer_queue_and_dialing() {
     scheduler.shutdown();
     let _ = tokio::time::timeout(Duration::from_millis(500), handle).await;
 }
-

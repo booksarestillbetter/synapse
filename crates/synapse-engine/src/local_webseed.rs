@@ -35,6 +35,9 @@ mod tests {
     fn test_bep38_local_resolver() {
         let resolver = LocalWebSeedResolver::new(vec![PathBuf::from("/tmp")]);
         // Path resolution doesn't crash on non-existent file
-        assert_eq!(resolver.find_local_file(Path::new("non_existent_file.iso")), None);
+        assert_eq!(
+            resolver.find_local_file(Path::new("non_existent_file.iso")),
+            None
+        );
     }
 }

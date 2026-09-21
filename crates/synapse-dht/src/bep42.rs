@@ -43,23 +43,36 @@ pub fn verify_secure_node_id(node_id: &[u8; 20], ip: IpAddr) -> bool {
         && (node_id[2] & 0xf8) == expected_b2_masked
 }
 
+/// CRC32c of the masked IP with `r` (3 bits) folded into the top bits, exactly as BEP 42
+/// specifies: `crc32c((ip & mask) | (r << 29))` for IPv4 (big-endian 4 bytes) and
+/// `crc32c((ip[..8] & mask) | (r << 61))` for IPv6 (big-endian 8 bytes).
 fn compute_ip_crc(ip: IpAddr, r: u8) -> u32 {
-    let mut data = Vec::with_capacity(8);
+    let r = u32::from(r & 7);
     match ip {
         IpAddr::V4(v4) => {
-            let ip_int = u32::from_be_bytes(v4.octets()) & V4_MASK;
-            let combined = (ip_int & 0xffffff00) | ((ip_int & 0xff) ^ u32::from(r));
-            data.extend_from_slice(&combined.to_be_bytes());
+            let masked = (u32::from_be_bytes(v4.octets()) & V4_MASK) | (r << 29);
+            crc32c_hash(&masked.to_be_bytes())
         }
         IpAddr::V6(v6) => {
-            let octets = v6.octets();
-            let first_8 = u64::from_be_bytes(octets[0..8].try_into().unwrap()) & V6_MASK;
-            let combined = (first_8 & 0xffffffffffffff00) | ((first_8 & 0xff) ^ u64::from(r));
-            data.extend_from_slice(&combined.to_be_bytes());
+            let first_8 = u64::from_be_bytes(v6.octets()[0..8].try_into().expect("8 bytes"));
+            let masked = (first_8 & V6_MASK) | (u64::from(r) << 61);
+            crc32c_hash(&masked.to_be_bytes())
         }
     }
+}
 
-    crc32c_hash(&data)
+/// Whether BEP 42 exempts `ip` from having a derived node id: private, loopback and
+/// link-local addresses cannot be forged from the outside, and LAN swarms would otherwise
+/// be unusable.
+pub fn is_exempt_from_node_id_check(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_private() || v4.is_loopback() || v4.is_link_local(),
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || (v6.segments()[0] & 0xffc0) == 0xfe80
+                || (v6.segments()[0] & 0xfe00) == 0xfc00
+        }
+    }
 }
 
 fn crc32c_hash(data: &[u8]) -> u32 {
@@ -81,6 +94,86 @@ fn crc32c_hash(data: &[u8]) -> u32 {
 mod tests {
     use super::*;
     use std::net::{Ipv4Addr, Ipv6Addr};
+
+    /// The example table from BEP 42: (ip, rand, node id).
+    const BEP42_VECTORS: [([u8; 4], u8, &str); 5] = [
+        (
+            [124, 31, 75, 21],
+            1,
+            "5fbfbff10c5d6a4ec8a88e4c6ab4c28b95eee401",
+        ),
+        (
+            [21, 75, 31, 124],
+            86,
+            "5a3ce9c14e7a08645677bbd1cfe7d8f956d53256",
+        ),
+        (
+            [65, 23, 51, 170],
+            22,
+            "a5d43220bc8f112a3d426c84764f8c2a1150e616",
+        ),
+        (
+            [84, 124, 73, 14],
+            65,
+            "1b0321dd1bb1fe518101ceef99462b947a01ff41",
+        ),
+        (
+            [43, 213, 53, 83],
+            90,
+            "e56f6cbf5b7c4be0237986d5243b87aa6d51305a",
+        ),
+    ];
+
+    fn unhex(s: &str) -> [u8; 20] {
+        let mut out = [0u8; 20];
+        for (i, b) in out.iter_mut().enumerate() {
+            *b = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).unwrap();
+        }
+        out
+    }
+
+    #[test]
+    fn matches_the_published_bep42_test_vectors() {
+        for (octets, rand, id_hex) in BEP42_VECTORS {
+            let ip = IpAddr::V4(Ipv4Addr::from(octets));
+            let id = unhex(id_hex);
+            assert_eq!(id[19], rand, "vector sanity");
+            assert!(
+                verify_secure_node_id(&id, ip),
+                "spec vector for {ip} must verify"
+            );
+            // A generated id for the same ip/rand shares the crc-derived 21-bit prefix.
+            let gen = generate_secure_node_id(ip, rand);
+            assert_eq!(gen[0], id[0]);
+            assert_eq!(gen[1], id[1]);
+            assert_eq!(gen[2] & 0xf8, id[2] & 0xf8);
+        }
+    }
+
+    #[test]
+    fn local_addresses_are_exempt_and_public_ones_are_not() {
+        for local in [
+            "10.1.2.3",
+            "192.168.0.9",
+            "172.16.5.5",
+            "127.0.0.1",
+            "169.254.1.1",
+            "::1",
+            "fd00::1",
+            "fe80::2",
+        ] {
+            assert!(
+                is_exempt_from_node_id_check(local.parse().unwrap()),
+                "{local}"
+            );
+        }
+        for public in ["8.8.8.8", "124.31.75.21", "2001:4860::1"] {
+            assert!(
+                !is_exempt_from_node_id_check(public.parse().unwrap()),
+                "{public}"
+            );
+        }
+    }
 
     #[test]
     fn test_bep42_node_id_generation_and_verification_v4() {

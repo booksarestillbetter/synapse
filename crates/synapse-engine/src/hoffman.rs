@@ -13,12 +13,23 @@ impl HoffmanWebSeed {
     }
 
     /// Formats a BEP 17 HTTP seeding request URL for a specific piece and optional byte range.
-    pub fn format_request_url(&self, info_hash: &[u8; 20], piece_idx: u32, range: Option<(u32, u32)>) -> String {
+    pub fn format_request_url(
+        &self,
+        info_hash: &[u8; 20],
+        piece_idx: u32,
+        range: Option<(u32, u32)>,
+    ) -> String {
         let hex_hash = hex::encode(info_hash);
         let mut url = if self.base_url.contains('?') {
-            format!("{}&info_hash={}&piece={}", self.base_url, hex_hash, piece_idx)
+            format!(
+                "{}&info_hash={}&piece={}",
+                self.base_url, hex_hash, piece_idx
+            )
         } else {
-            format!("{}?info_hash={}&piece={}", self.base_url, hex_hash, piece_idx)
+            format!(
+                "{}?info_hash={}&piece={}",
+                self.base_url, hex_hash, piece_idx
+            )
         };
 
         if let Some((start, end)) = range {

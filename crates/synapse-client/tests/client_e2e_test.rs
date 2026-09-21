@@ -58,10 +58,7 @@ async fn test_synapse_client_crud_and_settings() {
     assert!(!settings.alt_speed_enabled);
 
     // 4. In-Flight Setting Updates: Turtle Mode & Concurrency
-    let warnings = client
-        .set_turtle_mode(true)
-        .await
-        .expect("set turtle mode");
+    let warnings = client.set_turtle_mode(true).await.expect("set turtle mode");
     assert!(warnings.is_empty());
 
     let updated_settings = client

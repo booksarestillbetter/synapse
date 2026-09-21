@@ -7,6 +7,7 @@
 //! runtime-verified outside a real Linux machine.
 
 mod blocking;
+mod budget;
 mod cache;
 #[cfg(target_os = "linux")]
 mod uring;
@@ -17,6 +18,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 
 pub use blocking::{BlockingDiskEngine, BlockingDiskEngineConfig};
+pub use budget::{WriteBudget, WriteReservation};
 #[cfg(target_os = "linux")]
 pub use uring::{IoUringDiskEngine, IoUringDiskEngineConfig};
 
@@ -70,6 +72,14 @@ impl DiskEngine {
         Self::auto_with_max_open_files(500).await
     }
 
+    /// Creates a BlockingDiskEngine with a custom max write buffer limit.
+    pub fn new_blocking(max_write_buffer_bytes: usize) -> DiskEngine {
+        DiskEngine::Blocking(BlockingDiskEngine::new(BlockingDiskEngineConfig {
+            max_write_buffer_bytes,
+            ..Default::default()
+        }))
+    }
+
     /// Picks the best backend available with a configured maximum open files limit for
     /// LRU file descriptor caching.
     pub async fn auto_with_max_open_files(max_open_files: usize) -> DiskEngine {
@@ -89,8 +99,10 @@ impl DiskEngine {
                 }
             }
         }
-        tracing::info!("disk engine: blocking thread pool (max_open_files={})", max_open_files);
-        DiskEngine::Blocking(BlockingDiskEngine::new(BlockingDiskEngineConfig { max_open_files }))
+        DiskEngine::Blocking(BlockingDiskEngine::new(BlockingDiskEngineConfig {
+            max_open_files,
+            ..Default::default()
+        }))
     }
 
     /// Submits a batch of writes (e.g. every file location one piece touches, when a
@@ -125,4 +137,56 @@ impl DiskEngine {
             DiskEngine::IoUring(e) => e.sync(path).await,
         }
     }
+
+    /// Number of bytes currently queued in in-flight disk writes.
+    pub fn in_flight_write_bytes(&self) -> usize {
+        match self {
+            DiskEngine::Blocking(e) => e.in_flight_write_bytes(),
+            #[cfg(target_os = "linux")]
+            DiskEngine::IoUring(e) => e.in_flight_write_bytes(),
+        }
+    }
+
+    /// Configured maximum disk write buffer bytes before backpressure is asserted.
+    pub fn max_write_buffer_bytes(&self) -> usize {
+        match self {
+            DiskEngine::Blocking(e) => e.max_write_buffer_bytes(),
+            #[cfg(target_os = "linux")]
+            DiskEngine::IoUring(e) => e.max_write_buffer_bytes(),
+        }
+    }
+
+    /// Sets the maximum disk write buffer size.
+    pub fn set_max_write_buffer_bytes(&self, bytes: usize) {
+        match self {
+            DiskEngine::Blocking(e) => e.set_max_write_buffer_bytes(bytes),
+            #[cfg(target_os = "linux")]
+            DiskEngine::IoUring(e) => e.set_max_write_buffer_bytes(bytes),
+        }
+    }
+}
+
+/// Coalesces contiguous block writes into unified OS disk writes.
+pub fn coalesce_write_jobs(mut jobs: Vec<WriteJob>) -> Vec<WriteJob> {
+    if jobs.len() <= 1 {
+        return jobs;
+    }
+    jobs.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.offset.cmp(&b.offset)));
+
+    let mut coalesced: Vec<WriteJob> = Vec::with_capacity(jobs.len());
+    for job in jobs {
+        if let Some(last) = coalesced.last_mut() {
+            let last_end = last.offset + last.data.len() as u64;
+            if last.path == job.path && last_end == job.offset {
+                let mut merged = bytes::BytesMut::with_capacity(last.data.len() + job.data.len());
+                merged.extend_from_slice(&last.data);
+                merged.extend_from_slice(&job.data);
+                last.data = merged.freeze();
+                last.file_len = last.file_len.max(job.file_len);
+                continue;
+            }
+        }
+        coalesced.push(job);
+    }
+    coalesced
 }

@@ -12,14 +12,15 @@
 //! (generate it once randomly per daemon instance and reuse it - see `udp::announce`'s
 //! doc-comment) rather than hardcoded.
 
-pub mod bep26;
 pub mod breaker;
 pub mod http;
+pub mod safe_http;
+pub mod srv;
 pub mod udp;
 pub mod udp_ext;
 
-pub use bep26::RestTrackerClient;
 pub use breaker::{CanaryCircuitBreaker, CircuitState, HostCircuitInfo};
+pub use srv::{resolve_tracker_srv, SrvRecord};
 pub use udp_ext::{decode_udp_options, encode_udp_options, UdpOption};
 
 use std::net::SocketAddr;
@@ -43,6 +44,13 @@ pub struct AnnounceRequest {
     pub event: Event,
     /// `None` lets the tracker pick a default.
     pub num_want: Option<i32>,
+    /// BEP 7 cross-family address overrides.
+    pub ipv4: Option<std::net::Ipv4Addr>,
+    pub ipv6: Option<std::net::Ipv6Addr>,
+    /// BEP 41 UDP tracker extensions.
+    pub udp_options: Vec<crate::udp_ext::UdpOption>,
+    /// The `tracker id` an earlier response gave, sent back as `trackerid` (BEP 3).
+    pub tracker_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,7 +59,21 @@ pub struct AnnounceResponse {
     pub leechers: u32,
     pub seeders: u32,
     pub peers: Vec<SocketAddr>,
+    /// BEP 3 `min interval`: the tracker asks not to be announced to more often than this.
+    pub min_interval: Option<u32>,
+    /// BEP 3 `tracker id`, to be sent back on later announces.
+    pub tracker_id: Option<String>,
+    /// BEP 3 `warning message`.
+    pub warning: Option<String>,
+    /// BEP 24 `external ip`: the address the tracker sees us at.
+    pub external_ip: Option<std::net::IpAddr>,
 }
+
+/// Announces we accept at most this many peers from one tracker response.
+pub const MAX_PEERS_PER_RESPONSE: usize = 2000;
+/// Longest and shortest re-announce interval honoured, in seconds.
+pub const MIN_ANNOUNCE_INTERVAL: u32 = 60;
+pub const MAX_ANNOUNCE_INTERVAL: u32 = 86_400;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScrapeStats {
@@ -119,7 +141,10 @@ mod privacy_tests {
 
     #[test]
     fn test_sanitize_tracker_url_masks_passkeys() {
-        let u = Url::parse("http://tracker.private-site.org/announce?passkey=secret1234567890abcdef&info_hash=123").unwrap();
+        let u = Url::parse(
+            "http://tracker.private-site.org/announce?passkey=secret1234567890abcdef&info_hash=123",
+        )
+        .unwrap();
         let sanitized = sanitize_tracker_url(&u);
         assert!(!sanitized.contains("secret1234567890abcdef"));
         assert!(sanitized.contains("passkey=[REDACTED]"));

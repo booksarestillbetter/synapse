@@ -50,7 +50,9 @@ impl EventBus {
         let event = TorrentListEvent {
             sequence_id: seq,
             timestamp_ms: now_ms,
-            event: Some(crate::proto::v2::torrent_list_event::Event::RemovedHash(hash.clone())),
+            event: Some(crate::proto::v2::torrent_list_event::Event::RemovedHash(
+                hash.clone(),
+            )),
         };
         self.pending_deltas.remove(&hash);
         let _ = self.sender.send(event);

@@ -130,8 +130,14 @@ impl ConduitInstructionsPlugin {
         }
     }
 
-    async fn classify(&self, event: &TorrentCompletedEvent) -> Result<ClassifyResponse, reqwest::Error> {
-        let url = format!("{}/api/sync/classify", self.config.url.trim_end_matches('/'));
+    async fn classify(
+        &self,
+        event: &TorrentCompletedEvent,
+    ) -> Result<ClassifyResponse, reqwest::Error> {
+        let url = format!(
+            "{}/api/sync/classify",
+            self.config.url.trim_end_matches('/')
+        );
         let body = ClassifyRequest {
             name: &event.name,
             hash: &event.info_hash_hex,
@@ -142,11 +148,24 @@ impl ConduitInstructionsPlugin {
             total_bytes: event.total_bytes,
         };
         let req = self.authed(self.http.post(&url).json(&body));
-        req.send().await?.error_for_status()?.json::<ClassifyResponse>().await
+        req.send()
+            .await?
+            .error_for_status()?
+            .json::<ClassifyResponse>()
+            .await
     }
 
-    async fn notify(&self, event: &TorrentCompletedEvent, queue: &str, target_dir: &str, final_path: &str) {
-        let url = format!("{}/api/sync/notify-download", self.config.url.trim_end_matches('/'));
+    async fn notify(
+        &self,
+        event: &TorrentCompletedEvent,
+        queue: &str,
+        target_dir: &str,
+        final_path: &str,
+    ) {
+        let url = format!(
+            "{}/api/sync/notify-download",
+            self.config.url.trim_end_matches('/')
+        );
         let body = NotifyRequest {
             hash: &event.info_hash_hex,
             name: &event.name,
@@ -159,13 +178,21 @@ impl ConduitInstructionsPlugin {
         if let Err(e) = req.send().await {
             // Non-fatal: file placement already happened by the time this runs, this is just
             // telling conduit about it for its own event log / notifications.
-            warn!("conduit_instructions: notify-download failed (file already placed): {}", e);
+            warn!(
+                "conduit_instructions: notify-download failed (file already placed): {}",
+                e
+            );
         }
     }
 
     /// Places every file in `event.files` (or the whole torrent, for a single-file one) into
     /// `target_dir`, using `op` for each. Returns the destination root.
-    fn place_files(&self, event: &TorrentCompletedEvent, target_dir: &Path, op: FileOp) -> std::io::Result<PathBuf> {
+    fn place_files(
+        &self,
+        event: &TorrentCompletedEvent,
+        target_dir: &Path,
+        op: FileOp,
+    ) -> std::io::Result<PathBuf> {
         std::fs::create_dir_all(target_dir)?;
         let dest_root = target_dir.join(&event.name);
 
@@ -191,7 +218,10 @@ impl LifecyclePlugin for ConduitInstructionsPlugin {
         "conduit_instructions"
     }
 
-    async fn on_torrent_completed(&self, event: &TorrentCompletedEvent) -> Result<(), LifecycleError> {
+    async fn on_torrent_completed(
+        &self,
+        event: &TorrentCompletedEvent,
+    ) -> Result<(), LifecycleError> {
         match self.classify(event).await {
             Ok(resp) if !resp.target_dir.is_empty() => {
                 let op = FileOp::from_post_cmd(&resp.post_cmd);
@@ -201,30 +231,52 @@ impl LifecyclePlugin for ConduitInstructionsPlugin {
                             "conduit_instructions: placed '{}' into {} (queue={}, op={:?})",
                             event.name, resp.target_dir, resp.queue, op
                         );
-                        self.notify(event, &resp.queue, &resp.target_dir, &final_path.to_string_lossy()).await;
+                        self.notify(
+                            event,
+                            &resp.queue,
+                            &resp.target_dir,
+                            &final_path.to_string_lossy(),
+                        )
+                        .await;
                     }
                     Err(e) => {
-                        error!("conduit_instructions: failed to place '{}' into {}: {}", event.name, resp.target_dir, e);
+                        error!(
+                            "conduit_instructions: failed to place '{}' into {}: {}",
+                            event.name, resp.target_dir, e
+                        );
                         return Err(LifecycleError::Staging(e.to_string()));
                     }
                 }
             }
             Ok(_) => {
-                debug!("conduit_instructions: classify returned no target_dir for '{}', leaving at {}", event.name, event.download_dir);
+                debug!(
+                    "conduit_instructions: classify returned no target_dir for '{}', leaving at {}",
+                    event.name, event.download_dir
+                );
             }
-            Err(e) => {
-                match &self.config.fallback_dir {
-                    Some(fallback) => {
-                        warn!("conduit_instructions: {} unreachable ({}), falling back to {}", self.config.url, e, fallback.display());
-                        if let Err(e) = self.place_files(event, fallback, FileOp::Hardlink) {
-                            error!("conduit_instructions: fallback placement into {} also failed: {}", fallback.display(), e);
-                        }
-                    }
-                    None => {
-                        warn!("conduit_instructions: {} unreachable ({}), leaving '{}' at {}", self.config.url, e, event.name, event.download_dir);
+            Err(e) => match &self.config.fallback_dir {
+                Some(fallback) => {
+                    warn!(
+                        "conduit_instructions: {} unreachable ({}), falling back to {}",
+                        self.config.url,
+                        e,
+                        fallback.display()
+                    );
+                    if let Err(e) = self.place_files(event, fallback, FileOp::Hardlink) {
+                        error!(
+                            "conduit_instructions: fallback placement into {} also failed: {}",
+                            fallback.display(),
+                            e
+                        );
                     }
                 }
-            }
+                None => {
+                    warn!(
+                        "conduit_instructions: {} unreachable ({}), leaving '{}' at {}",
+                        self.config.url, e, event.name, event.download_dir
+                    );
+                }
+            },
         }
         Ok(())
     }

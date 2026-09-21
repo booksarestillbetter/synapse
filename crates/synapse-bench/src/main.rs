@@ -1,8 +1,8 @@
 use clap::{Parser, Subcommand};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-mod disk_bench;
 mod dht_bench;
+mod disk_bench;
 mod live_bench;
 mod rpc_bench;
 mod swarm_bench;
@@ -81,7 +81,9 @@ async fn main() {
     });
 
     tracing_subscriber::registry()
-        .with(tracing_subscriber::EnvFilter::new("debug,synapse_tracker=debug,synapse_engine=debug"))
+        .with(tracing_subscriber::EnvFilter::new(
+            "debug,synapse_tracker=debug,synapse_engine=debug",
+        ))
         .with(file_layer)
         .init();
 
@@ -91,7 +93,10 @@ async fn main() {
         Commands::Swarm { count } => {
             swarm_bench::run_swarm_benchmark(count).await;
         }
-        Commands::Disk { size_mb, block_size_kb } => {
+        Commands::Disk {
+            size_mb,
+            block_size_kb,
+        } => {
             disk_bench::run_disk_benchmark(size_mb, block_size_kb).await;
         }
         Commands::Dht { iterations } => {
@@ -100,11 +105,25 @@ async fn main() {
         Commands::Transfer { size_mb } => {
             transfer_bench::run_transfer_benchmark(size_mb).await;
         }
-        Commands::Rpc { concurrency, requests_per_worker } => {
+        Commands::Rpc {
+            concurrency,
+            requests_per_worker,
+        } => {
             rpc_bench::run_rpc_benchmark(concurrency, requests_per_worker).await;
         }
-        Commands::LiveDownload { torrent, duration_secs, max_downloads, download_dir } => {
-            live_bench::run_live_download_monitor(duration_secs, max_downloads, download_dir, torrent).await;
+        Commands::LiveDownload {
+            torrent,
+            duration_secs,
+            max_downloads,
+            download_dir,
+        } => {
+            live_bench::run_live_download_monitor(
+                duration_secs,
+                max_downloads,
+                download_dir,
+                torrent,
+            )
+            .await;
         }
         Commands::All => {
             println!("🚀 RUNNING FULL SYNAPSE 2.0 BENCHMARK & SIMULATION SUITE\n");

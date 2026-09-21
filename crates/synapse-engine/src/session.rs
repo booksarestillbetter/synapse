@@ -4,10 +4,10 @@
 //! and statistics) so swarms can resume instantly across daemon restarts without re-checking
 //! or re-downloading existing verified pieces.
 
+use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
 use synapse_picker::Bitfield;
@@ -30,6 +30,10 @@ pub struct TorrentSessionState {
     pub magnet_uri: Option<String>,
     #[serde(default)]
     pub raw_bencode_hex: Option<String>,
+    /// Per-file priorities (0 = skip). Empty means "all default", which is also what sessions
+    /// written before priorities were persisted deserialize to.
+    #[serde(default)]
+    pub file_priorities: Vec<u8>,
 }
 
 impl TorrentSessionState {
@@ -95,9 +99,12 @@ fn decrypt(cipher: &ChaCha20Poly1305, payload: &[u8]) -> std::io::Result<Vec<u8>
     }
     let (nonce_bytes, ciphertext) = payload.split_at(12);
     let nonce = Nonce::from_slice(nonce_bytes);
-    cipher
-        .decrypt(nonce, ciphertext)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("AEAD decrypt failed: {e}")))
+    cipher.decrypt(nonce, ciphertext).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("AEAD decrypt failed: {e}"),
+        )
+    })
 }
 
 #[derive(Clone)]
@@ -114,10 +121,16 @@ impl SessionStore {
 
         let key = if let Ok(env_key) = std::env::var("SYNAPSE_SESSION_KEY") {
             let bytes = hex::decode(env_key.trim()).map_err(|e| {
-                std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("Invalid SYNAPSE_SESSION_KEY hex: {e}"))
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("Invalid SYNAPSE_SESSION_KEY hex: {e}"),
+                )
             })?;
             if bytes.len() != 32 {
-                return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "SYNAPSE_SESSION_KEY must be 32 bytes (64 hex characters)"));
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "SYNAPSE_SESSION_KEY must be 32 bytes (64 hex characters)",
+                ));
             }
             let mut arr = [0u8; 32];
             arr.copy_from_slice(&bytes);
@@ -182,7 +195,10 @@ impl SessionStore {
     /// Atomically persists encrypted torrent session state to the embedded database.
     pub fn save_torrent(&self, state: &TorrentSessionState) -> std::io::Result<()> {
         let hash = state.info_hash().ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid info_hash_hex in session state")
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid info_hash_hex in session state",
+            )
         })?;
 
         // If the state being saved does not carry raw_bencode_hex, check whether an existing
@@ -211,15 +227,23 @@ impl SessionStore {
         let write_tx = self.db.begin_write().map_err(to_io_err)?;
         {
             let mut table = write_tx.open_table(TORRENTS_TABLE).map_err(to_io_err)?;
-            table.insert(&hash, encrypted.as_slice()).map_err(to_io_err)?;
+            table
+                .insert(&hash, encrypted.as_slice())
+                .map_err(to_io_err)?;
         }
         write_tx.commit().map_err(to_io_err)?;
-        debug!("Persisted encrypted session state for {}", state.info_hash_hex);
+        debug!(
+            "Persisted encrypted session state for {}",
+            state.info_hash_hex
+        );
         Ok(())
     }
 
     /// Loads a single persisted torrent session state by info hash hex.
-    pub fn load_torrent(&self, info_hash_hex: &str) -> std::io::Result<Option<TorrentSessionState>> {
+    pub fn load_torrent(
+        &self,
+        info_hash_hex: &str,
+    ) -> std::io::Result<Option<TorrentSessionState>> {
         let bytes = hex::decode(info_hash_hex)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
         if bytes.len() != 20 {
@@ -258,17 +282,18 @@ impl SessionStore {
         for item in iter {
             let (_key, value) = item.map_err(to_io_err)?;
             match decrypt(&self.cipher, value.value()) {
-                Ok(decrypted) => {
-                    match serde_json::from_slice::<TorrentSessionState>(&decrypted) {
-                        Ok(state) => states.push(state),
-                        Err(e) => warn!("Failed to deserialize encrypted session payload: {e}"),
-                    }
-                }
+                Ok(decrypted) => match serde_json::from_slice::<TorrentSessionState>(&decrypted) {
+                    Ok(state) => states.push(state),
+                    Err(e) => warn!("Failed to deserialize encrypted session payload: {e}"),
+                },
                 Err(e) => warn!("Failed to decrypt session record: {e}"),
             }
         }
 
-        info!("Loaded {} encrypted torrent session states from database", states.len());
+        info!(
+            "Loaded {} encrypted torrent session states from database",
+            states.len()
+        );
         Ok(states)
     }
 
@@ -312,10 +337,12 @@ impl SessionStore {
         }
 
         if migrated_count > 0 {
-            info!("Migrated {} legacy .json session files to encrypted session.db", migrated_count);
+            info!(
+                "Migrated {} legacy .json session files to encrypted session.db",
+                migrated_count
+            );
             let migrated_dir = session_dir.join("torrents.migrated");
             let _ = fs::rename(&torrents_dir, &migrated_dir);
         }
     }
 }
-

@@ -4,8 +4,8 @@
 //! filtering them out of user-facing file trees while preserving piece offsets.
 //! Also supports whole-file SHA-1 checksum verification.
 
-use std::path::Path;
 use crate::File;
+use std::path::Path;
 
 /// Checks whether a given file entry represents a BEP 47 padding file.
 pub fn is_padding_file(path: &Path, attr: Option<&str>) -> bool {
@@ -18,7 +18,10 @@ pub fn is_padding_file(path: &Path, attr: Option<&str>) -> bool {
 
     // Check path components
     let path_str = path.to_string_lossy();
-    if path_str.starts_with(".pad") || path_str.contains("/.pad") || path_str.contains("_____padding_file_") {
+    if path_str.starts_with(".pad")
+        || path_str.contains("/.pad")
+        || path_str.contains("_____padding_file_")
+    {
         return true;
     }
 
@@ -50,7 +53,10 @@ mod tests {
     fn test_bep47_padding_file_detection() {
         assert!(is_padding_file(Path::new(".pad/16384"), None));
         assert!(is_padding_file(Path::new("video/.pad/65536"), None));
-        assert!(is_padding_file(Path::new("video/_____padding_file_0_____"), None));
+        assert!(is_padding_file(
+            Path::new("video/_____padding_file_0_____"),
+            None
+        ));
         assert!(is_padding_file(Path::new("video/movie.mp4"), Some("p")));
         assert!(!is_padding_file(Path::new("video/movie.mp4"), None));
     }
@@ -58,9 +64,18 @@ mod tests {
     #[test]
     fn test_separate_padding_files() {
         let files = vec![
-            File { path: PathBuf::from("video/movie.mp4"), length: 1_000_000 },
-            File { path: PathBuf::from(".pad/24576"), length: 24576 },
-            File { path: PathBuf::from("subs/movie.srt"), length: 50_000 },
+            File {
+                path: PathBuf::from("video/movie.mp4"),
+                length: 1_000_000,
+            },
+            File {
+                path: PathBuf::from(".pad/24576"),
+                length: 24576,
+            },
+            File {
+                path: PathBuf::from("subs/movie.srt"),
+                length: 50_000,
+            },
         ];
 
         let (payload, padding) = separate_padding_files(&files);

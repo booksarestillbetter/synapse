@@ -3,8 +3,8 @@
 //! Provides binary serialization, deserialization, and header parsing for uTP
 //! over UDP with LEDBAT congestion control metadata and Selective ACK (SACK) extensions.
 
-use bytes::{Buf, BufMut, Bytes, BytesMut};
 use crate::WireError;
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 pub const UTP_VERSION: u8 = 1;
 pub const UTP_HEADER_LEN: usize = 20;
@@ -90,7 +90,9 @@ impl UtpHeader {
 
     pub fn decode(src: &mut Bytes) -> Result<Self, WireError> {
         if src.len() < UTP_HEADER_LEN {
-            return Err(WireError::Protocol("uTP packet too short for 20-byte header"));
+            return Err(WireError::Protocol(
+                "uTP packet too short for 20-byte header",
+            ));
         }
 
         let type_and_ver = src.get_u8();
@@ -101,8 +103,8 @@ impl UtpHeader {
             return Err(WireError::Protocol("unsupported uTP version"));
         }
 
-        let ptype = UtpType::from_u8(ptype_raw)
-            .ok_or(WireError::Protocol("unknown uTP packet type"))?;
+        let ptype =
+            UtpType::from_u8(ptype_raw).ok_or(WireError::Protocol("unknown uTP packet type"))?;
 
         let extension = src.get_u8();
         let connection_id = src.get_u16();
@@ -151,7 +153,9 @@ impl UtpPacket {
 
     pub fn encode(&self) -> Bytes {
         let mut buf = BytesMut::with_capacity(
-            UTP_HEADER_LEN + self.sack_bitmask.as_ref().map(|s| 2 + s.len()).unwrap_or(0) + self.payload.len()
+            UTP_HEADER_LEN
+                + self.sack_bitmask.as_ref().map(|s| 2 + s.len()).unwrap_or(0)
+                + self.payload.len(),
         );
 
         self.header.encode(&mut buf);
@@ -197,6 +201,69 @@ impl UtpPacket {
             payload: raw,
         })
     }
+}
+
+/// Builds a BEP 29 Selective ACK (SACK) bitmask.
+///
+/// The bitmask length is at least 4 bytes and padded to a multiple of 4 bytes.
+/// Bit 0 of byte 0 corresponds to `ack_nr + 2`. Bit `i` corresponds to `ack_nr + 2 + i`.
+pub fn build_sack_bitmask(ack_nr: u16, received_seqs: &[u16]) -> Option<Vec<u8>> {
+    if received_seqs.is_empty() {
+        return None;
+    }
+
+    // Find highest received sequence beyond ack_nr + 1
+    let mut max_offset: i32 = -1;
+    for &seq in received_seqs {
+        let diff = (seq.wrapping_sub(ack_nr) as i16) as i32;
+        if diff >= 2 {
+            let offset = diff - 2;
+            if offset > max_offset && offset < 256 {
+                max_offset = offset;
+            }
+        }
+    }
+
+    if max_offset < 0 {
+        return None;
+    }
+
+    let num_bytes = ((max_offset as usize / 8) + 1).max(4);
+    // Pad to multiple of 4
+    let num_bytes = (num_bytes + 3) & !3;
+    let mut bitmask = vec![0u8; num_bytes];
+
+    for &seq in received_seqs {
+        let diff = (seq.wrapping_sub(ack_nr) as i16) as i32;
+        if diff >= 2 {
+            let offset = (diff - 2) as usize;
+            let byte_idx = offset / 8;
+            let bit_idx = offset % 8;
+            if byte_idx < bitmask.len() {
+                bitmask[byte_idx] |= 1 << bit_idx;
+            }
+        }
+    }
+
+    Some(bitmask)
+}
+
+/// Parses a BEP 29 Selective ACK (SACK) bitmask into a list of acknowledged sequence numbers.
+pub fn parse_sack_bitmask(ack_nr: u16, bitmask: &[u8]) -> Vec<u16> {
+    let mut acked = Vec::new();
+    for (byte_idx, &byte) in bitmask.iter().enumerate() {
+        if byte == 0 {
+            continue;
+        }
+        for bit_idx in 0..8 {
+            if (byte & (1 << bit_idx)) != 0 {
+                let offset = (byte_idx * 8 + bit_idx) as u16;
+                let seq = ack_nr.wrapping_add(2).wrapping_add(offset);
+                acked.push(seq);
+            }
+        }
+    }
+    acked
 }
 
 #[cfg(test)]
@@ -252,5 +319,18 @@ mod tests {
         assert_eq!(decoded.header.ack_nr, 41);
         assert_eq!(decoded.sack_bitmask, Some(sack));
         assert_eq!(decoded.payload, payload);
+    }
+
+    #[test]
+    fn test_sack_build_and_parse_roundtrip() {
+        let ack_nr = 100;
+        // ack_nr + 2 = 102, ack_nr + 4 = 104, ack_nr + 12 = 112
+        let received = vec![102, 104, 112];
+        let bitmask = build_sack_bitmask(ack_nr, &received).unwrap();
+        assert!(bitmask.len() >= 4);
+        assert_eq!(bitmask.len() % 4, 0);
+
+        let parsed = parse_sack_bitmask(ack_nr, &bitmask);
+        assert_eq!(parsed, received);
     }
 }

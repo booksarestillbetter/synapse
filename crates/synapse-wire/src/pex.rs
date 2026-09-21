@@ -6,11 +6,11 @@
 //! STRICT SECURITY / PRIVACY NOTE:
 //! Per BEP 27, `ut_pex` MUST NEVER be enabled or sent on private torrents (`info.private == true`).
 
+use crate::WireError;
 use bytes::Bytes;
 use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 use synapse_bencode::{decode_buf_first, BEncode};
-use crate::WireError;
 
 /// Peer flags advertised in `added.f` / `added6.f`.
 pub const PEX_FLAG_ENCRYPTION_PREFERRED: u8 = 0x01;
@@ -44,7 +44,10 @@ impl UtPexMessage {
             dict.insert(b"added".to_vec(), BEncode::String(added));
 
             if !self.added_v4_flags.is_empty() {
-                dict.insert(b"added.f".to_vec(), BEncode::String(self.added_v4_flags.clone()));
+                dict.insert(
+                    b"added.f".to_vec(),
+                    BEncode::String(self.added_v4_flags.clone()),
+                );
             }
         }
 
@@ -66,7 +69,10 @@ impl UtPexMessage {
             dict.insert(b"added6".to_vec(), BEncode::String(added6));
 
             if !self.added_v6_flags.is_empty() {
-                dict.insert(b"added6.f".to_vec(), BEncode::String(self.added_v6_flags.clone()));
+                dict.insert(
+                    b"added6.f".to_vec(),
+                    BEncode::String(self.added_v6_flags.clone()),
+                );
             }
         }
 
@@ -88,7 +94,8 @@ impl UtPexMessage {
         let bencode = decode_buf_first(payload)
             .map_err(|_| WireError::Protocol("malformed ut_pex message bencode"))?;
 
-        let mut dict = bencode.into_dict()
+        let mut dict = bencode
+            .into_dict()
             .ok_or(WireError::Protocol("ut_pex message must be a dictionary"))?;
 
         let mut added_v4 = Vec::new();
@@ -106,11 +113,17 @@ impl UtPexMessage {
             }
         }
 
-        if let Some(flags) = dict.remove(b"added.f".as_ref()).and_then(|v| v.into_bytes()) {
+        if let Some(flags) = dict
+            .remove(b"added.f".as_ref())
+            .and_then(|v| v.into_bytes())
+        {
             added_v4_flags = flags;
         }
 
-        if let Some(dropped) = dict.remove(b"dropped".as_ref()).and_then(|v| v.into_bytes()) {
+        if let Some(dropped) = dict
+            .remove(b"dropped".as_ref())
+            .and_then(|v| v.into_bytes())
+        {
             for chunk in dropped.as_chunks::<6>().0 {
                 let ip = Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3]);
                 let port = u16::from_be_bytes([chunk[4], chunk[5]]);
@@ -127,11 +140,17 @@ impl UtPexMessage {
             }
         }
 
-        if let Some(flags6) = dict.remove(b"added6.f".as_ref()).and_then(|v| v.into_bytes()) {
+        if let Some(flags6) = dict
+            .remove(b"added6.f".as_ref())
+            .and_then(|v| v.into_bytes())
+        {
             added_v6_flags = flags6;
         }
 
-        if let Some(dropped6) = dict.remove(b"dropped6".as_ref()).and_then(|v| v.into_bytes()) {
+        if let Some(dropped6) = dict
+            .remove(b"dropped6".as_ref())
+            .and_then(|v| v.into_bytes())
+        {
             for chunk in dropped6.as_chunks::<18>().0 {
                 let ip_bytes: [u8; 16] = chunk[0..16].try_into().unwrap();
                 let ip = Ipv6Addr::from(ip_bytes);
@@ -176,7 +195,10 @@ mod tests {
         assert_eq!(decoded.added_v4.len(), 2);
         assert_eq!(decoded.added_v4[0], v4_1);
         assert_eq!(decoded.added_v4[1], v4_2);
-        assert_eq!(decoded.added_v4_flags, vec![PEX_FLAG_SEEDER, PEX_FLAG_ENCRYPTION_PREFERRED]);
+        assert_eq!(
+            decoded.added_v4_flags,
+            vec![PEX_FLAG_SEEDER, PEX_FLAG_ENCRYPTION_PREFERRED]
+        );
         assert_eq!(decoded.dropped_v4.len(), 1);
         assert_eq!(decoded.added_v6.len(), 1);
         assert_eq!(decoded.added_v6[0], v6_1);

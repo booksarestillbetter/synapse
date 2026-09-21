@@ -8,10 +8,7 @@ pub enum SynapseClientError {
     Transport(#[from] tonic::transport::Error),
 
     #[error("gRPC error ({code:?}): {message}")]
-    Rpc {
-        code: tonic::Code,
-        message: String,
-    },
+    Rpc { code: tonic::Code, message: String },
 
     #[error("delta stream unexpectedly closed by server")]
     StreamClosed,

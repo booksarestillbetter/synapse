@@ -20,6 +20,24 @@ pub struct QueueConfig {
     pub share_ratio_limit: Option<f64>,
     pub idle_seeding_limit_enabled: bool,
     pub seed_time_limit_secs: Option<u64>,
+    /// Libtorrent parity: when true, torrents downloading/uploading below threshold or stalled
+    /// do not count toward active download/seed limits.
+    #[serde(default = "default_true")]
+    pub dont_count_slow_torrents: bool,
+    /// Threshold (bytes/sec) below which a downloading torrent is considered slow (default 2048).
+    #[serde(default = "default_slow_threshold")]
+    pub slow_torrent_download_rate_threshold: u64,
+    /// Threshold (bytes/sec) below which a seeding torrent is considered slow (default 2048).
+    #[serde(default = "default_slow_threshold")]
+    pub slow_torrent_upload_rate_threshold: u64,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_slow_threshold() -> u64 {
+    2048
 }
 
 impl Default for QueueConfig {
@@ -36,6 +54,9 @@ impl Default for QueueConfig {
             share_ratio_limit: Some(2.0),
             idle_seeding_limit_enabled: false,
             seed_time_limit_secs: Some(1800), // 30 mins
+            dont_count_slow_torrents: true,
+            slow_torrent_download_rate_threshold: 2048,
+            slow_torrent_upload_rate_threshold: 2048,
         }
     }
 }
@@ -101,14 +122,27 @@ impl QueueManager {
         time_since_last_activity >= stall_threshold && (peers_connected == 0 || download_rate == 0)
     }
 
+    /// Returns true if `dont_count_slow_torrents` is active and the download rate is below threshold.
+    pub fn is_slow_downloader(&self, download_rate: u64) -> bool {
+        self.config.dont_count_slow_torrents
+            && download_rate < self.config.slow_torrent_download_rate_threshold
+    }
+
+    /// Returns true if `dont_count_slow_torrents` is active and the upload rate is below threshold.
+    pub fn is_slow_seeder(&self, upload_rate: u64) -> bool {
+        self.config.dont_count_slow_torrents
+            && upload_rate < self.config.slow_torrent_upload_rate_threshold
+    }
+
     /// Evaluates if a downloading torrent should proceed or be queued.
-    /// In Transmission's model, `active_non_stalled_downloads` excludes stalled torrents so they don't block the queue.
+    /// In Transmission and libtorrent's model, `active_non_stalled_downloads` excludes stalled/slow torrents so they don't block the queue.
     pub fn evaluate_downloader(
         &self,
         active_non_stalled_downloads: usize,
         active_total: usize,
     ) -> QueueAction {
-        if (self.config.download_queue_enabled && active_non_stalled_downloads >= self.config.max_active_downloads)
+        if (self.config.download_queue_enabled
+            && active_non_stalled_downloads >= self.config.max_active_downloads)
             || active_total >= self.config.max_active_torrents
         {
             QueueAction::Queue
@@ -169,6 +203,7 @@ mod tests {
             share_ratio_limit: Some(2.0),
             idle_seeding_limit_enabled: true,
             seed_time_limit_secs: Some(3600),
+            ..Default::default()
         };
         let qm = QueueManager::new(config);
 
@@ -183,7 +218,13 @@ mod tests {
 
         // Seeder evaluations
         assert_eq!(qm.evaluate_seeder(1, 2, 1.5, 1000), QueueAction::Allow);
-        assert_eq!(qm.evaluate_seeder(1, 2, 2.1, 1000), QueueAction::AutoStopRatioReached);
-        assert_eq!(qm.evaluate_seeder(1, 2, 0.5, 4000), QueueAction::AutoStopSeedTimeReached);
+        assert_eq!(
+            qm.evaluate_seeder(1, 2, 2.1, 1000),
+            QueueAction::AutoStopRatioReached
+        );
+        assert_eq!(
+            qm.evaluate_seeder(1, 2, 0.5, 4000),
+            QueueAction::AutoStopSeedTimeReached
+        );
     }
 }

@@ -4,29 +4,53 @@
 //! with chunked transfer encoding and HTTP keep-alive.
 
 use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::OnceLock;
 use std::time::Duration;
 
 use synapse_bencode::BEncode;
 use url::Url;
 
-use crate::{AnnounceRequest, AnnounceResponse, Event, TrackerError};
+use crate::safe_http::{self, FetchError, FetchOptions, LocalPolicy};
+use crate::{
+    AnnounceRequest, AnnounceResponse, Event, TrackerError, MAX_ANNOUNCE_INTERVAL,
+    MAX_PEERS_PER_RESPONSE, MIN_ANNOUNCE_INTERVAL,
+};
 
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
-/// A compact tracker-announce peer list is 6 bytes/peer; this bounds how much
-/// a tracker response can buffer.
-const MAX_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+/// Largest tracker response we will buffer (libtorrent's `tracker_maximum_response_length`).
+/// A compact peer list is 6 bytes per peer, so this is generous.
+const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 
-static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+/// Path segments a tracker URL must contain when it points at a non-public address, so a
+/// torrent's announce URL cannot be aimed at an arbitrary local service.
+const TRACKER_PATH_SEGMENTS: &[&str] = &["announce", "scrape"];
 
-fn get_client() -> &'static reqwest::Client {
-    HTTP_CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
-            .timeout(CONNECT_TIMEOUT)
-            .user_agent("Synapse/2.0.0")
-            .build()
-            .unwrap_or_default()
-    })
+/// GETs `url` through the SSRF-checked, size-capped client and returns the body of a 200.
+pub(crate) async fn fetch_tracker_body(url: reqwest::Url) -> Result<Vec<u8>, TrackerError> {
+    let opts = FetchOptions {
+        timeout: REQUEST_TIMEOUT,
+        max_body: MAX_RESPONSE_BYTES,
+        user_agent: concat!("Synapse/", env!("CARGO_PKG_VERSION")),
+        local: LocalPolicy::AllowPathSegments(TRACKER_PATH_SEGMENTS),
+        range: None,
+    };
+    let fetched = safe_http::fetch(&url, &opts)
+        .await
+        .map_err(map_fetch_error)?;
+    if fetched.status != 200 {
+        return Err(TrackerError::Malformed("tracker did not return HTTP 200"));
+    }
+    Ok(fetched.body)
+}
+
+fn map_fetch_error(e: FetchError) -> TrackerError {
+    match e {
+        FetchError::Http(err) => map_reqwest_error(err),
+        FetchError::TooLarge(_) => TrackerError::Malformed("tracker response too large"),
+        FetchError::Blocked(why) => TrackerError::InvalidUrl(why),
+        FetchError::InvalidUrl(why) => TrackerError::InvalidUrl(why),
+        FetchError::TooManyRedirects => TrackerError::Malformed("too many redirects"),
+        FetchError::Resolve => TrackerError::Network("could not resolve tracker host".into()),
+    }
 }
 
 pub async fn announce(url: &Url, req: &AnnounceRequest) -> Result<AnnounceResponse, TrackerError> {
@@ -38,26 +62,15 @@ pub async fn announce(url: &Url, req: &AnnounceRequest) -> Result<AnnounceRespon
     }
 
     let target_url = build_announce_url(url, req)?;
-    let client = get_client();
-    let resp = client
-        .get(target_url)
-        .send()
-        .await
-        .map_err(map_reqwest_error)?;
-
-    if !resp.status().is_success() {
-        return Err(TrackerError::Malformed("tracker did not return HTTP 200"));
-    }
-
-    let bytes = resp.bytes().await.map_err(map_reqwest_error)?;
-    if bytes.len() > MAX_RESPONSE_BYTES {
-        return Err(TrackerError::Malformed("tracker response too large"));
-    }
+    let bytes = fetch_tracker_body(target_url).await?;
 
     parse_response(&bytes)
 }
 
-pub async fn scrape(url: &Url, info_hashes: &[[u8; 20]]) -> Result<crate::ScrapeResponse, TrackerError> {
+pub async fn scrape(
+    url: &Url,
+    info_hashes: &[[u8; 20]],
+) -> Result<crate::ScrapeResponse, TrackerError> {
     let scheme = url.scheme();
     if scheme != "http" && scheme != "https" {
         return Err(TrackerError::InvalidUrl(
@@ -66,21 +79,7 @@ pub async fn scrape(url: &Url, info_hashes: &[[u8; 20]]) -> Result<crate::Scrape
     }
 
     let target_url = build_scrape_url(url, info_hashes)?;
-    let client = get_client();
-    let resp = client
-        .get(target_url)
-        .send()
-        .await
-        .map_err(map_reqwest_error)?;
-
-    if !resp.status().is_success() {
-        return Err(TrackerError::Malformed("tracker did not return HTTP 200"));
-    }
-
-    let bytes = resp.bytes().await.map_err(map_reqwest_error)?;
-    if bytes.len() > MAX_RESPONSE_BYTES {
-        return Err(TrackerError::Malformed("tracker response too large"));
-    }
+    let bytes = fetch_tracker_body(target_url).await?;
 
     parse_scrape_response(&bytes)
 }
@@ -104,6 +103,19 @@ fn build_announce_url(url: &Url, req: &AnnounceRequest) -> Result<reqwest::Url, 
     if let Some(num_want) = req.num_want {
         query.push_str(&format!("&numwant={num_want}"));
     }
+    if let Some(ref v6) = req.ipv6 {
+        query.push_str(&format!(
+            "&ipv6={}",
+            percent_encode(v6.to_string().as_bytes())
+        ));
+    }
+    if let Some(ref v4) = req.ipv4 {
+        // `ip` is the classic BEP 3 parameter most trackers honour; `ipv4` is BEP 7's.
+        query.push_str(&format!("&ip={v4}&ipv4={v4}"));
+    }
+    if let Some(ref id) = req.tracker_id {
+        query.push_str(&format!("&trackerid={}", percent_encode(id.as_bytes())));
+    }
 
     let url_str = url.as_str();
     let base_no_frag = match url_str.split_once('#') {
@@ -117,7 +129,8 @@ fn build_announce_url(url: &Url, req: &AnnounceRequest) -> Result<reqwest::Url, 
         format!("{base_no_frag}?{query}")
     };
 
-    reqwest::Url::parse(&full).map_err(|_| TrackerError::InvalidUrl("failed to construct tracker request URL"))
+    reqwest::Url::parse(&full)
+        .map_err(|_| TrackerError::InvalidUrl("failed to construct tracker request URL"))
 }
 
 fn build_scrape_url(url: &Url, info_hashes: &[[u8; 20]]) -> Result<reqwest::Url, TrackerError> {
@@ -147,7 +160,8 @@ fn build_scrape_url(url: &Url, info_hashes: &[[u8; 20]]) -> Result<reqwest::Url,
         format!("{scrape_base}?{query}")
     };
 
-    reqwest::Url::parse(&full).map_err(|_| TrackerError::InvalidUrl("failed to construct tracker scrape URL"))
+    reqwest::Url::parse(&full)
+        .map_err(|_| TrackerError::InvalidUrl("failed to construct tracker scrape URL"))
 }
 
 fn map_reqwest_error(e: reqwest::Error) -> TrackerError {
@@ -158,15 +172,24 @@ fn map_reqwest_error(e: reqwest::Error) -> TrackerError {
     }
 }
 
-fn parse_scrape_response(body: &[u8]) -> Result<crate::ScrapeResponse, TrackerError> {
-    let bencode = synapse_bencode::decode_buf(body).map_err(|_| TrackerError::Malformed("not valid bencode"))?;
-    let mut dict = bencode.into_dict().ok_or(TrackerError::Malformed("scrape response must be a dictionary"))?;
+pub fn parse_scrape_response(body: &[u8]) -> Result<crate::ScrapeResponse, TrackerError> {
+    let bencode = synapse_bencode::decode_buf(body)
+        .map_err(|_| TrackerError::Malformed("not valid bencode"))?;
+    let mut dict = bencode.into_dict().ok_or(TrackerError::Malformed(
+        "scrape response must be a dictionary",
+    ))?;
 
-    if let Some(reason) = dict.remove(b"failure reason".as_ref()).and_then(BEncode::into_string) {
+    if let Some(reason) = dict
+        .remove(b"failure reason".as_ref())
+        .and_then(BEncode::into_string)
+    {
         return Err(TrackerError::TrackerReported(reason));
     }
 
-    let files_dict = dict.remove(b"files".as_ref()).and_then(BEncode::into_dict).ok_or(TrackerError::Malformed("missing files dict in scrape"))?;
+    let files_dict = dict
+        .remove(b"files".as_ref())
+        .and_then(BEncode::into_dict)
+        .ok_or(TrackerError::Malformed("missing files dict in scrape"))?;
     let mut files = std::collections::HashMap::new();
 
     for (hash_bytes, val) in files_dict {
@@ -177,17 +200,31 @@ fn parse_scrape_response(body: &[u8]) -> Result<crate::ScrapeResponse, TrackerEr
         hash.copy_from_slice(&hash_bytes);
 
         if let Some(mut file_info) = val.into_dict() {
-            let complete = file_info.remove(b"complete".as_ref()).and_then(BEncode::into_int).unwrap_or(0) as u32;
-            let downloaded = file_info.remove(b"downloaded".as_ref()).and_then(BEncode::into_int).unwrap_or(0) as u32;
-            let incomplete = file_info.remove(b"incomplete".as_ref()).and_then(BEncode::into_int).unwrap_or(0) as u32;
-            let name = file_info.remove(b"name".as_ref()).and_then(BEncode::into_string);
+            let complete = file_info
+                .remove(b"complete".as_ref())
+                .and_then(BEncode::into_int)
+                .unwrap_or(0) as u32;
+            let downloaded = file_info
+                .remove(b"downloaded".as_ref())
+                .and_then(BEncode::into_int)
+                .unwrap_or(0) as u32;
+            let incomplete = file_info
+                .remove(b"incomplete".as_ref())
+                .and_then(BEncode::into_int)
+                .unwrap_or(0) as u32;
+            let name = file_info
+                .remove(b"name".as_ref())
+                .and_then(BEncode::into_string);
 
-            files.insert(hash, crate::ScrapeStats {
-                seeders: complete,
-                completed: downloaded,
-                leechers: incomplete,
-                name,
-            });
+            files.insert(
+                hash,
+                crate::ScrapeStats {
+                    seeders: complete,
+                    completed: downloaded,
+                    leechers: incomplete,
+                    name,
+                },
+            );
         }
     }
 
@@ -209,7 +246,7 @@ fn percent_encode(bytes: &[u8]) -> String {
     s
 }
 
-fn parse_response(data: &[u8]) -> Result<AnnounceResponse, TrackerError> {
+pub fn parse_response(data: &[u8]) -> Result<AnnounceResponse, TrackerError> {
     let value = synapse_bencode::decode_buf(data)
         .map_err(|_| TrackerError::Malformed("tracker response is not valid bencode"))?;
     let mut dict = value
@@ -223,20 +260,45 @@ fn parse_response(data: &[u8]) -> Result<AnnounceResponse, TrackerError> {
         return Err(TrackerError::TrackerReported(reason));
     }
 
+    // Intervals are attacker-influenced numbers: bound them so a tracker cannot make us hammer it
+    // (0) or go silent for years (huge), and reject negative values instead of wrapping.
+    let bounded = |v: i64| {
+        (v.clamp(0, i64::from(u32::MAX)) as u32).clamp(MIN_ANNOUNCE_INTERVAL, MAX_ANNOUNCE_INTERVAL)
+    };
     let interval = dict
         .remove(b"interval".as_ref())
         .and_then(BEncode::into_int)
-        .unwrap_or(1800) as u32;
-    let leechers = dict
-        .remove(b"incomplete".as_ref())
+        .map(bounded)
+        .unwrap_or(1800);
+    let min_interval = dict
+        .remove(b"min interval".as_ref())
         .and_then(BEncode::into_int)
-        .unwrap_or(0) as u32;
-    let seeders = dict
-        .remove(b"complete".as_ref())
-        .and_then(BEncode::into_int)
-        .unwrap_or(0) as u32;
+        .map(bounded);
+    let count = |v: Option<BEncode>| {
+        v.and_then(BEncode::into_int)
+            .map(|n| n.clamp(0, i64::from(u32::MAX)) as u32)
+            .unwrap_or(0)
+    };
+    let leechers = count(dict.remove(b"incomplete".as_ref()));
+    let seeders = count(dict.remove(b"complete".as_ref()));
+    let tracker_id = dict
+        .remove(b"tracker id".as_ref())
+        .and_then(BEncode::into_string)
+        .filter(|id| id.len() <= 256);
+    let warning = dict
+        .remove(b"warning message".as_ref())
+        .and_then(BEncode::into_string);
+    // BEP 24: our address as the tracker sees it, 4 or 16 raw bytes (some send it as text).
+    let external_ip = dict
+        .remove(b"external ip".as_ref())
+        .and_then(BEncode::into_bytes)
+        .and_then(|b| match b.len() {
+            4 => Some(std::net::IpAddr::from(<[u8; 4]>::try_from(&b[..]).ok()?)),
+            16 => Some(std::net::IpAddr::from(<[u8; 16]>::try_from(&b[..]).ok()?)),
+            _ => std::str::from_utf8(&b).ok()?.parse().ok(),
+        });
 
-    let peers = match dict.remove(b"peers".as_ref()) {
+    let mut peers: Vec<SocketAddr> = match dict.remove(b"peers".as_ref()) {
         // Compact format (BEP23): 6 bytes/peer, 4-byte IPv4 + 2-byte port.
         Some(BEncode::String(bytes)) => bytes
             .as_chunks::<6>()
@@ -253,18 +315,36 @@ fn parse_response(data: &[u8]) -> Result<AnnounceResponse, TrackerError> {
             .filter_map(|p| {
                 let mut d = p.into_dict()?;
                 let ip = d.remove(b"ip".as_ref())?.into_string()?;
-                let port = d.remove(b"port".as_ref())?.into_int()? as u16;
-                format!("{ip}:{port}").parse().ok()
+                let port = u16::try_from(d.remove(b"port".as_ref())?.into_int()?).ok()?;
+                let ip: std::net::IpAddr = ip.parse().ok()?;
+                Some(SocketAddr::new(ip, port))
             })
             .collect(),
         _ => Vec::new(),
     };
+    // BEP 7: IPv6 peers, 18 bytes each (16-byte address + 2-byte port).
+    if let Some(BEncode::String(bytes)) = dict.remove(b"peers6".as_ref()) {
+        peers.extend(bytes.as_chunks::<18>().0.iter().map(|c| {
+            let mut ip = [0u8; 16];
+            ip.copy_from_slice(&c[..16]);
+            SocketAddr::from((
+                std::net::Ipv6Addr::from(ip),
+                u16::from_be_bytes([c[16], c[17]]),
+            ))
+        }));
+    }
+    peers.retain(|p| p.port() != 0);
+    peers.truncate(MAX_PEERS_PER_RESPONSE);
 
     Ok(AnnounceResponse {
         interval,
         leechers,
         seeders,
         peers,
+        min_interval,
+        tracker_id,
+        warning,
+        external_ip,
     })
 }
 
@@ -285,17 +365,28 @@ mod tests {
             left: 30,
             event: Event::Started,
             num_want: Some(50),
+            ipv4: None,
+            ipv6: None,
+            udp_options: Vec::new(),
+            tracker_id: None,
         }
     }
 
-    fn compact_response_body(interval: u32, seeders: u32, leechers: u32, peers: &[SocketAddr]) -> Vec<u8> {
+    fn compact_response_body(
+        interval: u32,
+        seeders: u32,
+        leechers: u32,
+        peers: &[SocketAddr],
+    ) -> Vec<u8> {
         let mut dict = BTreeMap::new();
         dict.insert(b"interval".to_vec(), BEncode::Int(interval as i64));
         dict.insert(b"complete".to_vec(), BEncode::Int(seeders as i64));
         dict.insert(b"incomplete".to_vec(), BEncode::Int(leechers as i64));
         let mut compact = Vec::new();
         for p in peers {
-            let SocketAddr::V4(v4) = p else { panic!("v4 only in test") };
+            let SocketAddr::V4(v4) = p else {
+                panic!("v4 only in test")
+            };
             compact.extend_from_slice(&v4.ip().octets());
             compact.extend_from_slice(&v4.port().to_be_bytes());
         }
@@ -413,5 +504,101 @@ mod tests {
     fn percent_encode_matches_bittorrent_convention() {
         assert_eq!(percent_encode(b"abcABC012-_.~"), "abcABC012-_.~");
         assert_eq!(percent_encode(&[0x00, 0xFF, 0x20]), "%00%FF%20");
+    }
+
+    fn bencode(entries: Vec<(&str, BEncode)>) -> Vec<u8> {
+        let dict = entries
+            .into_iter()
+            .map(|(k, v)| (k.as_bytes().to_vec(), v))
+            .collect();
+        let mut out = Vec::new();
+        BEncode::Dict(dict).encode(&mut out).unwrap();
+        out
+    }
+
+    #[test]
+    fn response_carries_ipv6_peers_external_ip_tracker_id_and_min_interval() {
+        let mut v4 = vec![10, 0, 0, 1, 0x1A, 0xE1]; // 10.0.0.1:6881
+        v4.extend_from_slice(&[10, 0, 0, 2, 0, 0]); // port 0: dropped
+        let mut v6 = Vec::new();
+        v6.extend_from_slice(
+            &"2001:db8::7"
+                .parse::<std::net::Ipv6Addr>()
+                .unwrap()
+                .octets(),
+        );
+        v6.extend_from_slice(&6882u16.to_be_bytes());
+        let body = bencode(vec![
+            ("interval", BEncode::Int(1800)),
+            ("min interval", BEncode::Int(900)),
+            ("complete", BEncode::Int(5)),
+            ("incomplete", BEncode::Int(-3)),
+            ("peers", BEncode::String(v4)),
+            ("peers6", BEncode::String(v6)),
+            ("external ip", BEncode::String(vec![203, 0, 113, 9])),
+            ("tracker id", BEncode::String(b"abc".to_vec())),
+            ("warning message", BEncode::String(b"slow down".to_vec())),
+        ]);
+        let r = parse_response(&body).unwrap();
+        assert_eq!(r.interval, 1800);
+        assert_eq!(r.min_interval, Some(900));
+        assert_eq!(r.seeders, 5);
+        assert_eq!(r.leechers, 0, "a negative count must not wrap");
+        assert_eq!(
+            r.peers,
+            vec![
+                "10.0.0.1:6881".parse::<SocketAddr>().unwrap(),
+                "[2001:db8::7]:6882".parse::<SocketAddr>().unwrap()
+            ]
+        );
+        assert_eq!(r.external_ip, Some("203.0.113.9".parse().unwrap()));
+        assert_eq!(r.tracker_id.as_deref(), Some("abc"));
+        assert_eq!(r.warning.as_deref(), Some("slow down"));
+    }
+
+    #[test]
+    fn hostile_intervals_and_ports_are_bounded() {
+        let zero = parse_response(&bencode(vec![("interval", BEncode::Int(0))])).unwrap();
+        assert_eq!(zero.interval, MIN_ANNOUNCE_INTERVAL);
+        let huge = parse_response(&bencode(vec![("interval", BEncode::Int(i64::MAX))])).unwrap();
+        assert_eq!(huge.interval, MAX_ANNOUNCE_INTERVAL);
+        let neg = parse_response(&bencode(vec![("interval", BEncode::Int(-5))])).unwrap();
+        assert_eq!(neg.interval, MIN_ANNOUNCE_INTERVAL);
+        // Dictionary-model peer with an out-of-range port is skipped, not truncated.
+        let peer = |ip: &str, port: i64| {
+            BEncode::Dict(
+                [
+                    (b"ip".to_vec(), BEncode::String(ip.as_bytes().to_vec())),
+                    (b"port".to_vec(), BEncode::Int(port)),
+                ]
+                .into_iter()
+                .collect(),
+            )
+        };
+        let r = parse_response(&bencode(vec![(
+            "peers",
+            BEncode::List(vec![peer("1.2.3.4", 65536 + 80), peer("::1", 7000)]),
+        )]))
+        .unwrap();
+        assert_eq!(r.peers, vec!["[::1]:7000".parse::<SocketAddr>().unwrap()]);
+        // A flood of peers is capped.
+        let many = vec![1u8; 6 * (MAX_PEERS_PER_RESPONSE + 500)];
+        let r = parse_response(&bencode(vec![("peers", BEncode::String(many))])).unwrap();
+        assert_eq!(r.peers.len(), MAX_PEERS_PER_RESPONSE);
+    }
+
+    #[test]
+    fn a_configured_announce_address_is_sent_as_ip_ipv4_and_ipv6() {
+        let url = Url::parse("http://tracker.example/announce").unwrap();
+        let mut req = test_request();
+        req.ipv4 = Some("203.0.113.5".parse().unwrap());
+        req.ipv6 = Some("2001:db8::5".parse().unwrap());
+        let built = build_announce_url(&url, &req).unwrap();
+        let q = built.query().unwrap();
+        assert!(q.contains("&ip=203.0.113.5&ipv4=203.0.113.5"), "{q}");
+        assert!(
+            q.contains("&ipv6=2001%3Adb8%3A%3A5") || q.contains("&ipv6=2001:db8::5"),
+            "{q}"
+        );
     }
 }

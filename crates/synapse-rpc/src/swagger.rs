@@ -404,6 +404,109 @@ pub const OPENAPI_JSON: &str = r#"{
         }
       }
     },
+    "/api/v1/alerts": {
+      "get": {
+        "summary": "Stream engine alerts (Server-Sent Events)",
+        "description": "A live text/event-stream of alerts: TorrentAdded, TorrentFinished, TorrentError, PieceFinished, HashFailed, PeerConnected, PeerDisconnected, PeerBanned, StateChanged and TrackerAnnounce. Each event's name is the alert type and its data is JSON with `type`, `info_hash` (hex) and `data`. A `lagged` event reports how many alerts a slow client missed.",
+        "parameters": [
+          { "name": "info_hash", "in": "query", "required": false, "schema": { "type": "string" }, "description": "Only alerts for this torrent (40 hex characters)" }
+        ],
+        "responses": {
+          "200": { "description": "Event stream", "content": { "text/event-stream": { "schema": { "type": "string" } } } },
+          "400": { "description": "Invalid info_hash" }
+        }
+      }
+    },
+    "/api/v1/torrents/{info_hash}/signatures": {
+      "get": {
+        "summary": "BEP 35 signature status",
+        "description": "The signatures a torrent carries and whether each verifies against the daemon's trusted signers: `trusted`, `untrusted` (a valid signature whose signer is not trusted) or `invalid`.",
+        "parameters": [
+          { "name": "info_hash", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "Signature status" },
+          "400": { "description": "Invalid info_hash" },
+          "404": { "description": "No such torrent" }
+        }
+      }
+    },
+    "/api/v1/search": {
+      "get": {
+        "summary": "Search (BEP 18)",
+        "description": "Queries the configured BEP 18 search engines (`.btsearch` descriptions) and returns each engine's RSS results, or with `scope=local` searches the torrents this daemon holds.",
+        "parameters": [
+          { "name": "q", "in": "query", "required": false, "schema": { "type": "string" }, "description": "Search terms (required unless scope=local)" },
+          { "name": "engine", "in": "query", "required": false, "schema": { "type": "string" }, "description": "Only this engine, by name" },
+          { "name": "scope", "in": "query", "required": false, "schema": { "type": "string", "enum": ["engines", "local"] } }
+        ],
+        "responses": {
+          "200": { "description": "Results" },
+          "400": { "description": "Missing query" },
+          "404": { "description": "No search engines configured" }
+        }
+      }
+    },
+    "/api/v1/search/engines": {
+      "get": { "summary": "List search engines", "responses": { "200": { "description": "Configured engines" } } },
+      "post": {
+        "summary": "Add a search engine",
+        "description": "Loads a `.btsearch` description from a file path or http(s) URL.",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "properties": { "source": { "type": "string" } }, "required": ["source"] } } } },
+        "responses": { "200": { "description": "Engine added" }, "400": { "description": "Unusable description" } }
+      }
+    },
+    "/api/v1/search/engines/{name}": {
+      "delete": {
+        "summary": "Remove a search engine",
+        "parameters": [ { "name": "name", "in": "path", "required": true, "schema": { "type": "string" } } ],
+        "responses": { "204": { "description": "Removed" }, "404": { "description": "No such engine" } }
+      }
+    },
+    "/api/v1/rss/feeds": {
+      "get": { "summary": "List RSS/Atom feeds (BEP 36)", "responses": { "200": { "description": "Configured feeds and their status" } } },
+      "post": {
+        "summary": "Add or replace a feed",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "properties": { "url": { "type": "string" }, "name": { "type": "string" }, "auto_download": { "type": "boolean" }, "filter": { "type": "string", "description": "Case-insensitive substring the title must contain" } }, "required": ["url"] } } } },
+        "responses": { "200": { "description": "Feed registered" }, "400": { "description": "Empty url" } }
+      },
+      "delete": {
+        "summary": "Remove a feed",
+        "parameters": [ { "name": "url", "in": "query", "required": true, "schema": { "type": "string" } } ],
+        "responses": { "200": { "description": "Removed" }, "404": { "description": "No such feed" } }
+      }
+    },
+    "/api/v1/rss/poll": {
+      "post": {
+        "summary": "Poll feeds now",
+        "parameters": [ { "name": "url", "in": "query", "required": false, "schema": { "type": "string" }, "description": "Only this feed" } ],
+        "responses": { "200": { "description": "Poll result" } }
+      }
+    },
+    "/api/v1/torrents/create": {
+      "post": {
+        "summary": "Create a .torrent",
+        "description": "Hashes a file or directory inside the download directory and returns the torrent as base64 (`torrent_base64`, accepted by POST /api/v1/torrents).",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "properties": {
+          "path": { "type": "string" }, "trackers": { "type": "array", "items": { "type": "string" } }, "same_tier": { "type": "boolean" },
+          "web_seeds": { "type": "array", "items": { "type": "string" } }, "comment": { "type": "string" }, "private": { "type": "boolean" },
+          "source": { "type": "string" }, "piece_size_kib": { "type": "integer" }, "version": { "type": "string", "enum": ["v1", "v2", "hybrid"] } }, "required": ["path"] } } } },
+        "responses": { "200": { "description": "The torrent" }, "400": { "description": "Invalid request" }, "403": { "description": "Path outside the download directory" }, "404": { "description": "No such path" } }
+      }
+    },
+    "/api/v1/updates": {
+      "get": { "summary": "Pending torrent updates (BEP 39)", "description": "Updates found through the `update-url` of torrents we hold that are waiting for approval (an update signed by the torrent's originator is added automatically).", "responses": { "200": { "description": "Pending updates" } } }
+    },
+    "/api/v1/updates/check": {
+      "post": { "summary": "Check update feeds now", "responses": { "200": { "description": "How many updates were found" } } }
+    },
+    "/api/v1/updates/{info_hash}/apply": {
+      "post": {
+        "summary": "Add the update found for a torrent",
+        "parameters": [ { "name": "info_hash", "in": "path", "required": true, "schema": { "type": "string" }, "description": "The old torrent's info hash" } ],
+        "responses": { "204": { "description": "Update added" }, "404": { "description": "No pending update" } }
+      }
+    },
     "/api/v1/circuit-breakers": {
       "get": {
         "summary": "List tracker circuit breakers",

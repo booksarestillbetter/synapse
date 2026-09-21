@@ -39,7 +39,10 @@ pub fn encode_udp_options(options: &[UdpOption]) -> Vec<u8> {
                 out.push(b.len() as u8);
                 out.extend_from_slice(b);
             }
-            UdpOption::Custom { option_type, ref data } => {
+            UdpOption::Custom {
+                option_type,
+                ref data,
+            } => {
                 out.push(*option_type);
                 out.push(data.len() as u8);
                 out.extend_from_slice(data);

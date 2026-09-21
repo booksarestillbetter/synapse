@@ -118,7 +118,10 @@ pub fn parse_transmission_resume(
     });
 
     let mut bitfield = Bitfield::new(total_pieces);
-    if let Some(BEncode::String(bytes)) = dict.get(b"pieces".as_slice()).or_else(|| dict.get(b"bitfield".as_slice())) {
+    if let Some(BEncode::String(bytes)) = dict
+        .get(b"pieces".as_slice())
+        .or_else(|| dict.get(b"bitfield".as_slice()))
+    {
         if let Some(bf) = Bitfield::from_bytes(bytes, total_pieces) {
             bitfield = bf;
         } else {
@@ -134,7 +137,14 @@ pub fn parse_transmission_resume(
         }
     }
 
-    Ok((download_dir, bitfield, uploaded, downloaded, is_paused, added_at))
+    Ok((
+        download_dir,
+        bitfield,
+        uploaded,
+        downloaded,
+        is_paused,
+        added_at,
+    ))
 }
 
 /// Scans the given Transmission directory, parses all torrents and resume states, and migrates them to Synapse.
@@ -177,10 +187,17 @@ pub fn migrate_transmission(
             if path.extension().and_then(|e| e.to_str()) == Some("torrent") {
                 if let Ok(bytes) = std::fs::read(&path) {
                     if let Ok(bencode) = synapse_bencode::decode_buf(&bytes) {
-                        if let Ok(info) = Info::from_bencode(bencode) {
+                        if let Ok(info) = Info::from_persisted_bencode(bencode) {
                             let hash_hex = hex::encode(info.hash);
-                            let stem = path.file_stem().unwrap_or_default().to_string_lossy().to_string();
-                            torrent_files.insert(hash_hex.clone(), (path.clone(), info.clone(), bytes.clone()));
+                            let stem = path
+                                .file_stem()
+                                .unwrap_or_default()
+                                .to_string_lossy()
+                                .to_string();
+                            torrent_files.insert(
+                                hash_hex.clone(),
+                                (path.clone(), info.clone(), bytes.clone()),
+                            );
                             torrent_files.insert(stem, (path, info, bytes));
                         }
                     }
@@ -194,7 +211,11 @@ pub fn migrate_transmission(
         for entry in entries.flatten() {
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) == Some("resume") {
-                let stem = path.file_stem().unwrap_or_default().to_string_lossy().to_string();
+                let stem = path
+                    .file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
                 resume_files.insert(stem, path);
             }
         }
@@ -223,16 +244,23 @@ pub fn migrate_transmission(
             .as_secs() as i64;
 
         // Check if there is a matching .resume file
-        let resume_path = resume_files.get(key)
+        let resume_path = resume_files
+            .get(key)
             .or_else(|| resume_files.get(&hash_hex))
             .or_else(|| {
-                let stem = torrent_path.file_stem().unwrap_or_default().to_string_lossy().to_string();
+                let stem = torrent_path
+                    .file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
                 resume_files.get(&stem)
             });
 
         if let Some(r_path) = resume_path {
             if let Ok(r_bytes) = std::fs::read(r_path) {
-                if let Ok((d_dir, bf, ul, dl, paused, added)) = parse_transmission_resume(&r_bytes, total_pieces) {
+                if let Ok((d_dir, bf, ul, dl, paused, added)) =
+                    parse_transmission_resume(&r_bytes, total_pieces)
+                {
                     download_dir = d_dir;
                     bitfield = bf;
                     uploaded = ul;
@@ -298,12 +326,16 @@ pub fn migrate_transmission(
                 ratio,
                 magnet_uri: None,
                 raw_bencode_hex: Some(hex::encode(&entry.raw_bencode)),
+                file_priorities: Vec::new(),
             };
 
             if let Some(ref s) = store {
                 match s.save_torrent(&session_state) {
                     Ok(()) => migrated_count += 1,
-                    Err(e) => errors.push(format!("Failed to save encrypted state for {}: {e}", entry.name)),
+                    Err(e) => errors.push(format!(
+                        "Failed to save encrypted state for {}: {e}",
+                        entry.name
+                    )),
                 }
             }
         }
@@ -325,7 +357,10 @@ mod tests {
     #[test]
     fn test_parse_transmission_resume_dictionary() {
         let mut dict = BTreeMap::new();
-        dict.insert(b"destination".to_vec(), BEncode::String(b"/Users/test/Downloads".to_vec()));
+        dict.insert(
+            b"destination".to_vec(),
+            BEncode::String(b"/Users/test/Downloads".to_vec()),
+        );
         dict.insert(b"uploaded".to_vec(), BEncode::Int(2048000));
         dict.insert(b"downloaded".to_vec(), BEncode::Int(10485760));
         dict.insert(b"paused".to_vec(), BEncode::Int(1));
@@ -363,7 +398,10 @@ mod tests {
 
         // Create a fake .torrent file
         let mut info_dict = BTreeMap::new();
-        info_dict.insert(b"name".to_vec(), BEncode::String(b"sample_torrent".to_vec()));
+        info_dict.insert(
+            b"name".to_vec(),
+            BEncode::String(b"sample_torrent".to_vec()),
+        );
         info_dict.insert(b"piece length".to_vec(), BEncode::Int(16384));
         info_dict.insert(b"pieces".to_vec(), BEncode::String(vec![0u8; 20])); // 1 piece
         info_dict.insert(b"length".to_vec(), BEncode::Int(16384));
@@ -374,21 +412,35 @@ mod tests {
         let mut torrent_bytes = Vec::new();
         BEncode::Dict(root_dict).encode(&mut torrent_bytes).unwrap();
 
-        let info = Info::from_bencode(synapse_bencode::decode_buf(&torrent_bytes).unwrap()).unwrap();
+        let info =
+            Info::from_bencode(synapse_bencode::decode_buf(&torrent_bytes).unwrap()).unwrap();
         let hash_hex = hex::encode(info.hash);
 
-        std::fs::write(torrents_subdir.join(format!("{hash_hex}.torrent")), &torrent_bytes).unwrap();
+        std::fs::write(
+            torrents_subdir.join(format!("{hash_hex}.torrent")),
+            &torrent_bytes,
+        )
+        .unwrap();
 
         // Create fake .resume file
         let mut resume_dict = BTreeMap::new();
-        resume_dict.insert(b"destination".to_vec(), BEncode::String(b"/media/torrents".to_vec()));
+        resume_dict.insert(
+            b"destination".to_vec(),
+            BEncode::String(b"/media/torrents".to_vec()),
+        );
         resume_dict.insert(b"uploaded".to_vec(), BEncode::Int(5000));
         resume_dict.insert(b"downloaded".to_vec(), BEncode::Int(16384));
         resume_dict.insert(b"pieces".to_vec(), BEncode::String(vec![0x80])); // 1 piece complete
 
         let mut resume_bytes = Vec::new();
-        BEncode::Dict(resume_dict).encode(&mut resume_bytes).unwrap();
-        std::fs::write(resume_subdir.join(format!("{hash_hex}.resume")), &resume_bytes).unwrap();
+        BEncode::Dict(resume_dict)
+            .encode(&mut resume_bytes)
+            .unwrap();
+        std::fs::write(
+            resume_subdir.join(format!("{hash_hex}.resume")),
+            &resume_bytes,
+        )
+        .unwrap();
 
         // Run dry-run migration
         let dry_res = migrate_transmission(trans_dir.path(), synapse_dir.path(), true).unwrap();

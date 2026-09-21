@@ -18,9 +18,10 @@ members = [
 ]
 
 [workspace.package]
-version = "2.2.4"
+version = "2.2.5"
 edition = "2021"
 license = "ISC"
+rust-version = "1.88"
 publish = false
 
 [workspace.dependencies]
@@ -32,6 +33,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 clap = { version = "4", features = ["derive"] }
 roaring = "0.10"
 async-trait = "0.1"
+proptest = "1.5"
 
 [profile.release]
 opt-level = 3

@@ -5,11 +5,14 @@
 //! addressed by SHA-1(public_key + salt) and authenticated via sequence numbers
 //! and Ed25519 cryptographic signatures.
 
+use ed25519_dalek::{Signature, VerifyingKey};
 use sha1::{Digest, Sha1};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 pub const MAX_ITEM_VALUE_LEN: usize = 1000;
+/// Items held at once (libtorrent's `max_dht_items`); the oldest is evicted for a new one.
+pub const MAX_ITEMS: usize = 700;
 pub const MAX_SALT_LEN: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,6 +57,8 @@ pub enum StorageError {
     CasMismatch { expected: u64, actual: u64 },
     #[error("stale sequence number: {new_seq} <= {existing_seq}")]
     StaleSequence { new_seq: u64, existing_seq: u64 },
+    #[error("invalid public key")]
+    InvalidPublicKey,
     #[error("invalid signature")]
     InvalidSignature,
 }
@@ -111,12 +116,9 @@ impl DhtStorage {
         }
 
         let target = compute_immutable_target(&value);
-        let item = DhtItem::Immutable {
-            target,
-            value,
-        };
+        let item = DhtItem::Immutable { target, value };
 
-        self.items.insert(target, (item, Instant::now()));
+        self.insert(target, item);
         Ok(target)
     }
 
@@ -139,9 +141,25 @@ impl DhtStorage {
             }
         }
 
+        // The signature covers salt, sequence number and the bencoded value; an item that
+        // does not verify must never be stored or served (anyone could otherwise overwrite
+        // anyone's mutable item).
+        let verifying_key =
+            VerifyingKey::from_bytes(&public_key).map_err(|_| StorageError::InvalidPublicKey)?;
+        let payload = format_sign_payload(salt.as_deref(), seq, &value);
+        verifying_key
+            .verify_strict(&payload, &Signature::from_bytes(&sig))
+            .map_err(|_| StorageError::InvalidSignature)?;
+
         let target = compute_mutable_target(&public_key, salt.as_deref());
 
-        if let Some((DhtItem::Mutable { seq: existing_seq, .. }, _)) = self.items.get(&target) {
+        if let Some((
+            DhtItem::Mutable {
+                seq: existing_seq, ..
+            },
+            _,
+        )) = self.items.get(&target)
+        {
             if let Some(expected_cas) = cas {
                 if *existing_seq != expected_cas {
                     return Err(StorageError::CasMismatch {
@@ -168,8 +186,37 @@ impl DhtStorage {
             salt,
         };
 
-        self.items.insert(target, (item, Instant::now()));
+        self.insert(target, item);
         Ok(target)
+    }
+
+    fn insert(&mut self, target: [u8; 20], item: DhtItem) {
+        if !self.items.contains_key(&target) && self.items.len() >= MAX_ITEMS {
+            let now = Instant::now();
+            let ttl = self.ttl;
+            self.items
+                .retain(|_, (_, created)| now.duration_since(*created) < ttl);
+            if self.items.len() >= MAX_ITEMS {
+                if let Some(&oldest) = self
+                    .items
+                    .iter()
+                    .min_by_key(|(_, (_, c))| *c)
+                    .map(|(t, _)| t)
+                {
+                    self.items.remove(&oldest);
+                }
+            }
+        }
+        self.items.insert(target, (item, Instant::now()));
+    }
+
+    /// Number of items currently held (including any not yet pruned as expired).
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
     }
 
     /// Retrieves an item by its 20-byte target infohash.
@@ -187,13 +234,15 @@ impl DhtStorage {
     pub fn prune_expired(&mut self) {
         let now = Instant::now();
         let ttl = self.ttl;
-        self.items.retain(|_, (_, created)| now.duration_since(*created) < ttl);
+        self.items
+            .retain(|_, (_, created)| now.duration_since(*created) < ttl);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
 
     #[test]
     fn test_bep44_immutable_item_storage() {
@@ -206,35 +255,117 @@ mod tests {
         assert_eq!(retrieved.value(), val.as_slice());
     }
 
+    /// A deterministic test keypair and a signature over `(salt, seq, v)`.
+    fn signed(seed: u8, salt: Option<&[u8]>, seq: u64, v: &[u8]) -> ([u8; 32], [u8; 64]) {
+        let sk = SigningKey::from_bytes(&[seed; 32]);
+        let sig = sk.sign(&format_sign_payload(salt, seq, v)).to_bytes();
+        (sk.verifying_key().to_bytes(), sig)
+    }
+
     #[test]
     fn test_bep44_mutable_item_storage_and_cas() {
         let mut storage = DhtStorage::default();
-        let pk = [0x42; 32];
-        let sig = [0x99; 64];
-        let val1 = b"5:step1".to_vec();
         let salt = Some(b"mysalt".to_vec());
+        let (pk, sig1) = signed(0x42, salt.as_deref(), 1, b"5:step1");
 
         let target = storage
-            .put_mutable(pk, 1, sig, val1.clone(), salt.clone(), None)
+            .put_mutable(pk, 1, sig1, b"5:step1".to_vec(), salt.clone(), None)
             .unwrap();
 
         // Stale sequence update should fail
-        let stale_res = storage.put_mutable(pk, 1, sig, b"5:stepX".to_vec(), salt.clone(), None);
+        let stale_res = storage.put_mutable(pk, 1, sig1, b"5:step1".to_vec(), salt.clone(), None);
         assert_eq!(
             stale_res,
-            Err(StorageError::StaleSequence { new_seq: 1, existing_seq: 1 })
+            Err(StorageError::StaleSequence {
+                new_seq: 1,
+                existing_seq: 1
+            })
         );
 
         // CAS mismatch should fail
-        let cas_fail = storage.put_mutable(pk, 2, sig, b"5:step2".to_vec(), salt.clone(), Some(99));
+        let (_, sig2) = signed(0x42, salt.as_deref(), 2, b"5:step2");
+        let cas_fail =
+            storage.put_mutable(pk, 2, sig2, b"5:step2".to_vec(), salt.clone(), Some(99));
         assert_eq!(
             cas_fail,
-            Err(StorageError::CasMismatch { expected: 99, actual: 1 })
+            Err(StorageError::CasMismatch {
+                expected: 99,
+                actual: 1
+            })
         );
 
         // Proper CAS update should succeed
-        let ok_res = storage.put_mutable(pk, 2, sig, b"5:step2".to_vec(), salt, Some(1));
+        let ok_res = storage.put_mutable(pk, 2, sig2, b"5:step2".to_vec(), salt, Some(1));
         assert!(ok_res.is_ok());
         assert_eq!(storage.get(&target).unwrap().value(), b"5:step2");
+    }
+
+    #[test]
+    fn mutable_items_with_bad_signatures_or_keys_are_refused() {
+        let mut storage = DhtStorage::default();
+        let (pk, sig) = signed(1, None, 1, b"3:abc");
+        // Signature over different content.
+        assert_eq!(
+            storage.put_mutable(pk, 1, sig, b"3:xyz".to_vec(), None, None),
+            Err(StorageError::InvalidSignature)
+        );
+        // Right content, wrong sequence number (the seq is part of the signed payload).
+        assert_eq!(
+            storage.put_mutable(pk, 2, sig, b"3:abc".to_vec(), None, None),
+            Err(StorageError::InvalidSignature)
+        );
+        // Someone else's key cannot reuse a valid signature.
+        let (other_pk, _) = signed(2, None, 1, b"3:abc");
+        assert_eq!(
+            storage.put_mutable(other_pk, 1, sig, b"3:abc".to_vec(), None, None),
+            Err(StorageError::InvalidSignature)
+        );
+        // All-zero garbage.
+        assert_eq!(
+            storage.put_mutable(pk, 1, [0u8; 64], b"3:abc".to_vec(), None, None),
+            Err(StorageError::InvalidSignature)
+        );
+        assert!(storage.is_empty());
+        assert!(storage
+            .put_mutable(pk, 1, sig, b"3:abc".to_vec(), None, None)
+            .is_ok());
+    }
+
+    #[test]
+    fn item_count_is_capped_by_evicting_the_oldest() {
+        let mut storage = DhtStorage::default();
+        let mut first = None;
+        for i in 0..(MAX_ITEMS as u32 + 50) {
+            let t = storage
+                .put_immutable(format!("i{i}e").into_bytes())
+                .unwrap();
+            first.get_or_insert(t);
+        }
+        assert_eq!(storage.len(), MAX_ITEMS);
+        assert!(
+            storage.get(&first.unwrap()).is_none(),
+            "the oldest item was evicted"
+        );
+    }
+
+    #[test]
+    fn oversized_values_and_salts_are_refused() {
+        let mut storage = DhtStorage::default();
+        assert_eq!(
+            storage.put_immutable(vec![b'x'; MAX_ITEM_VALUE_LEN + 1]),
+            Err(StorageError::ValueTooLarge)
+        );
+        let (pk, sig) = signed(3, None, 1, b"1:a");
+        assert_eq!(
+            storage.put_mutable(
+                pk,
+                1,
+                sig,
+                b"1:a".to_vec(),
+                Some(vec![0; MAX_SALT_LEN + 1]),
+                None
+            ),
+            Err(StorageError::SaltTooLarge)
+        );
     }
 }

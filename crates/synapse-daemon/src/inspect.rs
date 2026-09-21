@@ -5,7 +5,6 @@
 //! directory safety, and character encodings.
 
 use std::path::{Path, PathBuf};
-use std::time::{Duration, UNIX_EPOCH};
 
 use sha1::{Digest, Sha1};
 use synapse_bencode::BEncode;
@@ -30,12 +29,16 @@ pub struct TorrentDiagnostic {
     pub comment: Option<String>,
     pub warnings: Vec<String>,
     pub errors: Vec<String>,
+    pub signatures_count: usize,
+    pub is_signed: bool,
+    pub root_hash_v1_hex: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TorrentFormatType {
     BitTorrentV1SingleFile,
     BitTorrentV1MultiFile,
+    BitTorrentV1Merkle,
     BitTorrentV2,
     HybridV1V2,
     Invalid,
@@ -46,6 +49,7 @@ impl std::fmt::Display for TorrentFormatType {
         match self {
             TorrentFormatType::BitTorrentV1SingleFile => write!(f, "BitTorrent v1 (Single File)"),
             TorrentFormatType::BitTorrentV1MultiFile => write!(f, "BitTorrent v1 (Multi-File)"),
+            TorrentFormatType::BitTorrentV1Merkle => write!(f, "BitTorrent v1 (BEP 30 Merkle)"),
             TorrentFormatType::BitTorrentV2 => write!(f, "BitTorrent v2 (BEP 52 Merkle)"),
             TorrentFormatType::HybridV1V2 => write!(f, "Hybrid (v1 + v2 Merkle)"),
             TorrentFormatType::Invalid => write!(f, "Invalid / Unparseable"),
@@ -63,7 +67,11 @@ pub struct InspectBatchResult {
 }
 
 fn is_potential_torrent(path: &Path) -> bool {
-    let name = path.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
+    let name = path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_lowercase();
     if name.starts_with('.') {
         return false;
     }
@@ -116,15 +124,55 @@ fn collect_recursive(dir: &Path, files: &mut Vec<PathBuf>) {
 }
 
 /// Inspects and validates a single `.torrent` file in-depth.
+static TRUST_STORE: std::sync::OnceLock<synapse_meta::TrustStore> = std::sync::OnceLock::new();
+
+/// Sets the signers `inspect` trusts (BEP 35). Without it every signature reports as untrusted.
+pub fn set_trust_store(store: synapse_meta::TrustStore) {
+    let _ = TRUST_STORE.set(store);
+}
+
+fn trust_store() -> &'static synapse_meta::TrustStore {
+    TRUST_STORE.get_or_init(synapse_meta::TrustStore::new)
+}
+
+/// `seconds` since the epoch as `YYYY-MM-DD HH:MM:SS UTC`.
+fn format_utc(seconds: i64) -> String {
+    let secs = seconds.max(0);
+    let (days, rem) = (secs / 86_400, secs % 86_400);
+    // Civil-from-days (Howard Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02} {:02}:{:02}:{:02} UTC",
+        rem / 3600,
+        rem % 3600 / 60,
+        rem % 60
+    )
+}
+
 pub fn inspect_torrent_file(file_path: &Path) -> TorrentDiagnostic {
     let raw_bytes = match std::fs::read(file_path) {
         Ok(b) => b,
         Err(e) => {
             return TorrentDiagnostic {
                 file_path: file_path.to_path_buf(),
-                name: file_path.file_name().unwrap_or_default().to_string_lossy().to_string(),
+                name: file_path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string(),
                 info_hash_hex: String::new(),
                 format_type: TorrentFormatType::Invalid,
+                root_hash_v1_hex: None,
+                is_signed: false,
+                signatures_count: 0,
                 is_valid: false,
                 piece_length: 0,
                 total_pieces: 0,
@@ -156,9 +204,16 @@ pub fn inspect_torrent_bytes(file_path: &Path, bytes: &[u8]) -> TorrentDiagnosti
             errors.push(format!("BEncode syntax error: {e}"));
             return TorrentDiagnostic {
                 file_path: file_path.to_path_buf(),
-                name: file_path.file_name().unwrap_or_default().to_string_lossy().to_string(),
+                name: file_path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string(),
                 info_hash_hex: String::new(),
                 format_type: TorrentFormatType::Invalid,
+                root_hash_v1_hex: None,
+                is_signed: false,
+                signatures_count: 0,
                 is_valid: false,
                 piece_length: 0,
                 total_pieces: 0,
@@ -182,9 +237,16 @@ pub fn inspect_torrent_bytes(file_path: &Path, bytes: &[u8]) -> TorrentDiagnosti
             errors.push("Root bencode element is not a dictionary".to_string());
             return TorrentDiagnostic {
                 file_path: file_path.to_path_buf(),
-                name: file_path.file_name().unwrap_or_default().to_string_lossy().to_string(),
+                name: file_path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string(),
                 info_hash_hex: String::new(),
                 format_type: TorrentFormatType::Invalid,
+                root_hash_v1_hex: None,
+                is_signed: false,
+                signatures_count: 0,
                 is_valid: false,
                 piece_length: 0,
                 total_pieces: 0,
@@ -203,13 +265,12 @@ pub fn inspect_torrent_bytes(file_path: &Path, bytes: &[u8]) -> TorrentDiagnosti
     };
 
     // Extract creation date
-    let creation_date = root_dict.get(b"creation date".as_slice()).and_then(|v| match v {
-        BEncode::Int(ts) => {
-            let d = UNIX_EPOCH + Duration::from_secs((*ts).max(0) as u64);
-            Some(format!("{:?}", d))
-        }
-        _ => None,
-    });
+    let creation_date = root_dict
+        .get(b"creation date".as_slice())
+        .and_then(|v| match v {
+            BEncode::Int(ts) => Some(format_utc(*ts)),
+            _ => None,
+        });
 
     // Check v2 / hybrid markers
     let has_file_tree = root_dict
@@ -247,7 +308,11 @@ pub fn inspect_torrent_bytes(file_path: &Path, bytes: &[u8]) -> TorrentDiagnosti
 
             return TorrentDiagnostic {
                 file_path: file_path.to_path_buf(),
-                name: file_path.file_name().unwrap_or_default().to_string_lossy().to_string(),
+                name: file_path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string(),
                 info_hash_hex: hash_hex,
                 format_type: TorrentFormatType::Invalid,
                 is_valid: false,
@@ -263,6 +328,9 @@ pub fn inspect_torrent_bytes(file_path: &Path, bytes: &[u8]) -> TorrentDiagnosti
                 comment: None,
                 warnings,
                 errors,
+                signatures_count: 0,
+                is_signed: false,
+                root_hash_v1_hex: None,
             };
         }
     };
@@ -270,11 +338,21 @@ pub fn inspect_torrent_bytes(file_path: &Path, bytes: &[u8]) -> TorrentDiagnosti
     let info_hash_hex = hex::encode(info.hash);
     let total_pieces = info.pieces() as usize;
     let piece_length = info.piece_len;
-    let total_size_bytes = info.total_len;
-    let files_count = info.files.len();
+    // Padding files (BEP 47) are layout, not payload: they count for the piece arithmetic but not
+    // for what the torrent contains.
+    let padded_len = info.total_len;
+    let payload_files: Vec<_> = info
+        .files
+        .iter()
+        .filter(|f| !synapse_meta::is_padding_file(&f.path, None))
+        .collect();
+    let total_size_bytes: u64 = payload_files.iter().map(|f| f.length).sum();
+    let files_count = payload_files.len();
     let is_private = info.private;
 
-    let format_type = if has_file_tree && total_pieces > 0 {
+    let format_type = if info.is_merkle_v1() {
+        TorrentFormatType::BitTorrentV1Merkle
+    } else if has_file_tree && total_pieces > 0 {
         TorrentFormatType::HybridV1V2
     } else if has_file_tree || meta_version == Some(2) {
         TorrentFormatType::BitTorrentV2
@@ -283,6 +361,23 @@ pub fn inspect_torrent_bytes(file_path: &Path, bytes: &[u8]) -> TorrentDiagnosti
     } else {
         TorrentFormatType::BitTorrentV1SingleFile
     };
+
+    // BEP 35: signatures are checked against the trust store set with `set_trust_store`.
+    let signatures_count = info.signatures.len();
+    let is_signed = signatures_count > 0;
+    for (name, status) in info.verify_signatures(trust_store()) {
+        match status {
+            synapse_meta::SignatureStatus::Trusted { .. } => {}
+            synapse_meta::SignatureStatus::Untrusted { reason } => {
+                warnings.push(format!(
+                    "BEP 35 signature by '{name}' is not trusted: {reason}"
+                ));
+            }
+            synapse_meta::SignatureStatus::Invalid { reason } => {
+                errors.push(format!("BEP 35 signature by '{name}' is invalid: {reason}"));
+            }
+        }
+    }
 
     // Deep validation checks:
     // 1. Piece length sanity
@@ -307,11 +402,11 @@ pub fn inspect_torrent_bytes(file_path: &Path, bytes: &[u8]) -> TorrentDiagnosti
 
     // 2. Piece count vs total byte span check
     if piece_length > 0 {
-        let expected_pieces = (total_size_bytes as usize).div_ceil(piece_length as usize);
-        if total_pieces != expected_pieces && total_size_bytes > 0 {
+        let expected_pieces = (padded_len as usize).div_ceil(piece_length as usize);
+        if total_pieces != expected_pieces && padded_len > 0 {
             errors.push(format!(
                 "Piece count mismatch: torrent declares {} pieces, but payload size {} B requires {} pieces",
-                total_pieces, total_size_bytes, expected_pieces
+                total_pieces, padded_len, expected_pieces
             ));
         }
     }
@@ -319,14 +414,26 @@ pub fn inspect_torrent_bytes(file_path: &Path, bytes: &[u8]) -> TorrentDiagnosti
     // 3. File paths check
     for f in &info.files {
         if f.path.is_absolute() {
-            errors.push(format!("File path is absolute (security violation): {}", f.path.display()));
+            errors.push(format!(
+                "File path is absolute (security violation): {}",
+                f.path.display()
+            ));
         }
-        if f.path.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
-            errors.push(format!("File path contains parent directory '..' component (path traversal risk): {}", f.path.display()));
+        if f.path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            errors.push(format!(
+                "File path contains parent directory '..' component (path traversal risk): {}",
+                f.path.display()
+            ));
         }
         let path_str = f.path.to_string_lossy();
         if path_str.starts_with(".pad/") || path_str.contains("____padding_file_") {
-            warnings.push(format!("Contains BEP 47 alignment padding file: {}", f.path.display()));
+            warnings.push(format!(
+                "Contains BEP 47 alignment padding file: {}",
+                f.path.display()
+            ));
         }
     }
 
@@ -371,6 +478,9 @@ pub fn inspect_torrent_bytes(file_path: &Path, bytes: &[u8]) -> TorrentDiagnosti
         comment: info.comment,
         warnings,
         errors,
+        signatures_count,
+        is_signed,
+        root_hash_v1_hex: info.root_hash_v1.map(hex::encode),
     }
 }
 
@@ -421,7 +531,10 @@ mod tests {
         info.insert(b"length".to_vec(), BEncode::Int(piece_data.len() as i64));
 
         let mut root = BTreeMap::new();
-        root.insert(b"announce".to_vec(), BEncode::String(b"udp://tracker.opentrackr.org:1337/announce".to_vec()));
+        root.insert(
+            b"announce".to_vec(),
+            BEncode::String(b"udp://tracker.opentrackr.org:1337/announce".to_vec()),
+        );
         root.insert(b"info".to_vec(), BEncode::Dict(info));
 
         let mut out = Vec::new();
@@ -457,7 +570,10 @@ mod tests {
 
         let diag = inspect_torrent_bytes(Path::new("corrupt.torrent"), &bytes);
         assert!(!diag.is_valid);
-        assert!(diag.errors.iter().any(|e| e.contains("InvalidHashes") || e.contains("rejected")));
+        assert!(diag
+            .errors
+            .iter()
+            .any(|e| e.contains("InvalidHashes") || e.contains("rejected")));
     }
 
     #[test]
@@ -477,7 +593,10 @@ mod tests {
                 BEncode::String(b"passwd".to_vec()),
             ]),
         );
-        info.insert(b"files".to_vec(), BEncode::List(vec![BEncode::Dict(file_dict)]));
+        info.insert(
+            b"files".to_vec(),
+            BEncode::List(vec![BEncode::Dict(file_dict)]),
+        );
 
         let mut root = BTreeMap::new();
         root.insert(b"info".to_vec(), BEncode::Dict(info));
@@ -487,6 +606,16 @@ mod tests {
 
         let diag = inspect_torrent_bytes(Path::new("evil.torrent"), &bytes);
         assert!(!diag.is_valid);
-        assert!(diag.errors.iter().any(|e| e.contains("UnsafeFilePath") || e.contains("rejected")));
+        assert!(diag
+            .errors
+            .iter()
+            .any(|e| e.contains("UnsafeFilePath") || e.contains("rejected")));
+    }
+
+    #[test]
+    fn dates_are_formatted_as_utc() {
+        assert_eq!(format_utc(0), "1970-01-01 00:00:00 UTC");
+        assert_eq!(format_utc(1_700_000_000), "2023-11-14 22:13:20 UTC");
+        assert_eq!(format_utc(951_782_400), "2000-02-29 00:00:00 UTC");
     }
 }

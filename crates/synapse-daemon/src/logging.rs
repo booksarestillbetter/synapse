@@ -48,7 +48,11 @@ pub fn init_logging(config: &Config) {
                     .compact(),
             ),
             Err(e) => {
-                eprintln!("WARNING: failed to open log file {}: {}. Proceeding without file logging.", path.display(), e);
+                eprintln!(
+                    "WARNING: failed to open log file {}: {}. Proceeding without file logging.",
+                    path.display(),
+                    e
+                );
                 None
             }
         }
@@ -110,9 +114,9 @@ where
         event.record(&mut visitor);
 
         let pri = match *event.metadata().level() {
-            Level::ERROR => 11, // Local0.Error (16 * 8 + 3)
-            Level::WARN => 12,  // Local0.Warn  (16 * 8 + 4)
-            Level::INFO => 14,  // Local0.Info  (16 * 8 + 6)
+            Level::ERROR => 11,                // Local0.Error (16 * 8 + 3)
+            Level::WARN => 12,                 // Local0.Warn  (16 * 8 + 4)
+            Level::INFO => 14,                 // Local0.Info  (16 * 8 + 6)
             Level::DEBUG | Level::TRACE => 15, // Local0.Debug (16 * 8 + 7)
         };
 
@@ -121,7 +125,10 @@ where
 
         // Format RFC 5424 syslog line: <PRI>1 TIMESTAMP HOSTNAME APP-NAME PROCID MSGID MSG
         let now = chrono_timestamp();
-        let syslog_msg = format!("<{pri}>1 {now} localhost synapsed {} {target} - {msg}\n", std::process::id());
+        let syslog_msg = format!(
+            "<{pri}>1 {now} localhost synapsed {} {target} - {msg}\n",
+            std::process::id()
+        );
 
         let _ = self.sender.try_send(syslog_msg);
     }

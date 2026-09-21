@@ -55,7 +55,7 @@ fn test_bep11_pex_and_bep27_privacy_isolation() {
     let decoded = UtPexMessage::decode(&encoded).unwrap();
 
     let mut remote_pex = PexManager::new(false);
-    let discovered = remote_pex.ingest_pex_message(decoded);
+    let discovered = remote_pex.ingest_pex_message(decoded, "203.0.113.9".parse().unwrap());
     assert_eq!(discovered.len(), 2);
     assert!(discovered.contains(&peer_v4));
     assert!(discovered.contains(&peer_v6));
@@ -68,6 +68,7 @@ fn test_bep11_pex_and_bep27_privacy_isolation() {
     assert!(private_pex.generate_pex_message().is_none());
 
     // Ingesting PEX on private swarm must return empty list (rejecting external gossip)
-    let dropped_discovery = private_pex.ingest_pex_message(outgoing_pex);
+    let dropped_discovery =
+        private_pex.ingest_pex_message(outgoing_pex, "203.0.113.9".parse().unwrap());
     assert!(dropped_discovery.is_empty());
 }

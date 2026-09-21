@@ -31,10 +31,7 @@ fn build_test_info(file_data: &[u8], piece_len: u32, name: &str) -> Info {
     );
 
     let mut torrent_dict = std::collections::BTreeMap::new();
-    torrent_dict.insert(
-        b"info".to_vec(),
-        synapse_bencode::BEncode::Dict(info_dict),
-    );
+    torrent_dict.insert(b"info".to_vec(), synapse_bencode::BEncode::Dict(info_dict));
 
     Info::from_bencode(synapse_bencode::BEncode::Dict(torrent_dict)).expect("valid test torrent")
 }
@@ -52,8 +49,16 @@ async fn test_swarm_engine_multi_torrent_routing() {
         .await
         .unwrap();
 
-    let info_a = Arc::new(build_test_info(b"content of torrent A", 16384, "torrent_a.dat"));
-    let info_b = Arc::new(build_test_info(b"content of torrent B different", 16384, "torrent_b.dat"));
+    let info_a = Arc::new(build_test_info(
+        b"content of torrent A",
+        16384,
+        "torrent_a.dat",
+    ));
+    let info_b = Arc::new(build_test_info(
+        b"content of torrent B different",
+        16384,
+        "torrent_b.dat",
+    ));
 
     let hash_a = info_a.hash;
     let hash_b = info_b.hash;
@@ -99,23 +104,20 @@ async fn test_private_torrent_bep27_flags() {
         b"piece length".to_vec(),
         synapse_bencode::BEncode::Int(16384),
     );
-    info_dict.insert(b"pieces".to_vec(), synapse_bencode::BEncode::String(vec![0xAA; 20]));
     info_dict.insert(
-        b"length".to_vec(),
-        synapse_bencode::BEncode::Int(16384),
+        b"pieces".to_vec(),
+        synapse_bencode::BEncode::String(vec![0xAA; 20]),
     );
-    info_dict.insert(
-        b"private".to_vec(),
-        synapse_bencode::BEncode::Int(1),
-    );
+    info_dict.insert(b"length".to_vec(), synapse_bencode::BEncode::Int(16384));
+    info_dict.insert(b"private".to_vec(), synapse_bencode::BEncode::Int(1));
 
     let mut torrent_dict = std::collections::BTreeMap::new();
-    torrent_dict.insert(
-        b"info".to_vec(),
-        synapse_bencode::BEncode::Dict(info_dict),
-    );
+    torrent_dict.insert(b"info".to_vec(), synapse_bencode::BEncode::Dict(info_dict));
 
-    let info_private = Arc::new(Info::from_bencode(synapse_bencode::BEncode::Dict(torrent_dict)).expect("valid private torrent"));
+    let info_private = Arc::new(
+        Info::from_bencode(synapse_bencode::BEncode::Dict(torrent_dict))
+            .expect("valid private torrent"),
+    );
     assert!(info_private.private);
 
     let hash = info_private.hash;

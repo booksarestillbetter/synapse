@@ -8,3 +8,6 @@ description = "Piece picker, bitfield, and choking algorithm for the synapse rew
 
 [dependencies]
 roaring = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

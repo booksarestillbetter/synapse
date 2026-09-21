@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use synapse_rpc::proto_v2::synapse_control_client::SynapseControlClient;
 use synapse_rpc::proto_v2::synapse_control_server::SynapseControlServer;
-use synapse_rpc::proto_v2::{SubscribeTorrentsRequest, TorrentSummary, TorrentState};
+use synapse_rpc::proto_v2::{SubscribeTorrentsRequest, TorrentState, TorrentSummary};
 use synapse_rpc::{EventBus, SynapseService};
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
@@ -97,7 +97,9 @@ async fn test_grpc_subscribe_torrents_and_delta_streaming() {
 
     // Receive live delta after 50ms flush
     let delta_event = stream.next().await.unwrap().unwrap();
-    if let Some(synapse_rpc::proto_v2::torrent_list_event::Event::Updated(delta)) = delta_event.event {
+    if let Some(synapse_rpc::proto_v2::torrent_list_event::Event::Updated(delta)) =
+        delta_event.event
+    {
         assert_eq!(delta.hash, "hash_0000");
         assert_eq!(delta.progress, Some(0.75));
         assert_eq!(delta.rate_download, Some(1_200_000));

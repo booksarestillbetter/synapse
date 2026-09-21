@@ -19,6 +19,7 @@ pub enum BError {
     ParseInt,
     MaxDepthExceeded,
     StringTooLong,
+    TooManyTokens,
     EOF,
     IO,
 }
@@ -28,6 +29,12 @@ pub enum BError {
 const MAX_ALLOC_LEN: usize = 4 * 1024 * 1024;
 pub const MAX_DEPTH: usize = 128;
 pub const MAX_STRING_LEN: usize = 64 * 1024 * 1024;
+/// Most values (ints, strings, lists, dicts) one document may contain. Each decoded value
+/// costs far more memory than its encoded form (`i0e` is 3 bytes), so this bounds the
+/// amplification a small hostile payload can cause. Matches libtorrent's `bdecode` limit.
+pub const MAX_TOKENS: usize = 3_000_000;
+/// Longest accepted integer / string-length literal. `i64::MIN` is 20 characters.
+const MAX_INT_LITERAL: usize = 20;
 
 impl fmt::Display for BError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
@@ -36,8 +43,11 @@ impl fmt::Display for BError {
             BError::InvalidDict => write!(f, "Invalid BEncoded dictionary"),
             BError::InvalidChar(c) => write!(f, "Invalid character: {}", char::from(c)),
             BError::ParseInt => write!(f, "Invalid integer value encountered"),
-            BError::MaxDepthExceeded => write!(f, "Maximum BEncode recursion/nesting depth exceeded"),
+            BError::MaxDepthExceeded => {
+                write!(f, "Maximum BEncode recursion/nesting depth exceeded")
+            }
             BError::StringTooLong => write!(f, "BEncode string length exceeds maximum allowed"),
+            BError::TooManyTokens => write!(f, "BEncode document contains too many values"),
             BError::EOF => write!(f, "Unexpected EOF in data"),
             BError::IO => write!(f, "IO error"),
         }
@@ -188,14 +198,34 @@ pub fn decode_buf_first(bytes: &[u8]) -> Result<BEncode, BError> {
 }
 
 pub fn decode_first<R: io::Read>(bytes: &mut R) -> Result<BEncode, BError> {
-    do_decode(bytes, true)
+    do_decode(bytes, true, MAX_DEPTH, MAX_TOKENS)
 }
 
 pub fn decode<R: io::Read>(bytes: &mut R) -> Result<BEncode, BError> {
-    do_decode(bytes, false)
+    do_decode(bytes, false, MAX_DEPTH, MAX_TOKENS)
 }
 
-fn do_decode<R: io::Read>(bytes: &mut R, first: bool) -> Result<BEncode, BError> {
+/// Decodes a complete document under tighter limits than the defaults, for untrusted
+/// small messages (DHT KRPC packets use depth 10 / 500 tokens, as libtorrent does).
+pub fn decode_buf_limited(
+    bytes: &[u8],
+    max_depth: usize,
+    max_tokens: usize,
+) -> Result<BEncode, BError> {
+    do_decode(
+        &mut Cursor::new(bytes),
+        false,
+        max_depth.min(MAX_DEPTH),
+        max_tokens.min(MAX_TOKENS),
+    )
+}
+
+fn do_decode<R: io::Read>(
+    bytes: &mut R,
+    first: bool,
+    max_depth: usize,
+    max_tokens: usize,
+) -> Result<BEncode, BError> {
     enum Kind {
         Dict(usize),
         List(usize),
@@ -203,21 +233,29 @@ fn do_decode<R: io::Read>(bytes: &mut R, first: bool) -> Result<BEncode, BError>
     let mut cstack = vec![];
     let mut vstack = vec![];
     let mut buf = [0];
+    let mut tokens = 0usize;
     while !(first && cstack.is_empty() && vstack.len() == 1) {
-        match next_byte(bytes, &mut buf) {
+        let next = next_byte(bytes, &mut buf);
+        if matches!(next, Ok(c) if c != b'e') {
+            tokens += 1;
+            if tokens > max_tokens {
+                return Err(BError::TooManyTokens);
+            }
+        }
+        match next {
             Ok(b'i') => {
                 // Multiple non complex values are not allowed
                 if cstack.is_empty() && !vstack.is_empty() {
                     return Err(BError::EOF);
                 }
-                let s = read_until(bytes, b'e', &mut buf)?;
+                let s = read_until(bytes, b'e', &mut buf, MAX_INT_LITERAL)?;
                 vstack.push(BEncode::Int(decode_int(s)?));
             }
             Ok(b'l') => {
                 if cstack.is_empty() && !vstack.is_empty() {
                     return Err(BError::EOF);
                 }
-                if cstack.len() >= MAX_DEPTH {
+                if cstack.len() >= max_depth {
                     return Err(BError::MaxDepthExceeded);
                 }
                 cstack.push(Kind::List(vstack.len()));
@@ -226,7 +264,7 @@ fn do_decode<R: io::Read>(bytes: &mut R, first: bool) -> Result<BEncode, BError>
                 if cstack.is_empty() && !vstack.is_empty() {
                     return Err(BError::EOF);
                 }
-                if cstack.len() >= MAX_DEPTH {
+                if cstack.len() >= max_depth {
                     return Err(BError::MaxDepthExceeded);
                 }
                 cstack.push(Kind::Dict(vstack.len()));
@@ -250,7 +288,9 @@ fn do_decode<R: io::Read>(bytes: &mut R, first: bool) -> Result<BEncode, BError>
                         let val = vstack.pop().unwrap();
                         match vstack.pop().and_then(BEncode::into_bytes) {
                             Some(key) => {
-                                d.insert(key, val);
+                                if d.insert(key, val).is_some() {
+                                    return Err(BError::InvalidDict);
+                                }
                             }
                             None => return Err(BError::InvalidDict),
                         }
@@ -263,7 +303,7 @@ fn do_decode<R: io::Read>(bytes: &mut R, first: bool) -> Result<BEncode, BError>
                 if cstack.is_empty() && !vstack.is_empty() {
                     return Err(BError::EOF);
                 }
-                let mut slen = read_until(bytes, b':', &mut buf)?;
+                let mut slen = read_until(bytes, b':', &mut buf, MAX_INT_LITERAL)?;
                 slen.insert(0, d);
                 let len = decode_int(slen)?;
                 if len < 0 {
@@ -306,18 +346,38 @@ fn next_byte<R: io::Read>(r: &mut R, buf: &mut [u8; 1]) -> Result<u8, BError> {
     }
 }
 
-fn read_until<R: io::Read>(r: &mut R, b: u8, buf: &mut [u8; 1]) -> Result<Vec<u8>, BError> {
+fn read_until<R: io::Read>(
+    r: &mut R,
+    b: u8,
+    buf: &mut [u8; 1],
+    max: usize,
+) -> Result<Vec<u8>, BError> {
     let mut v = vec![];
     loop {
         let n = next_byte(r, buf)?;
         if b == n {
             return Ok(v);
         }
+        if v.len() >= max {
+            return Err(BError::ParseInt);
+        }
         v.push(n);
     }
 }
 
+/// Parses a canonical bencode integer: an optional `-`, then `0` or digits with no leading
+/// zero, and never `-0`. Non-canonical spellings (`+5`, `007`, `-0`) re-encode to different
+/// bytes, which would silently change a re-serialized document's hash.
 fn decode_int(v: Vec<u8>) -> Result<i64, BError> {
+    let digits = v.strip_prefix(b"-").unwrap_or(&v);
+    let canonical = match digits {
+        [] => false,
+        [b'0'] => v.len() == 1,
+        [first, rest @ ..] => (b'1'..=b'9').contains(first) && rest.iter().all(u8::is_ascii_digit),
+    };
+    if !canonical {
+        return Err(BError::ParseInt);
+    }
     String::from_utf8(v)
         .map_err(|_| BError::UTF8Decode)
         .and_then(|i| i.parse().map_err(|_| BError::ParseInt))
@@ -434,5 +494,91 @@ mod tests {
         deeply_nested.extend_from_slice(b"i1e");
         deeply_nested.extend(std::iter::repeat_n(b'e', 150));
         assert_eq!(decode_buf(&deeply_nested), Err(BError::MaxDepthExceeded));
+    }
+
+    #[test]
+    fn rejects_non_canonical_integers() {
+        for bad in [
+            &b"i+5e"[..],
+            b"i007e",
+            b"i-0e",
+            b"i-e",
+            b"ie",
+            b"i 5e",
+            b"i5 e",
+            b"d3:fooi01ee",
+            b"03:abc",
+        ] {
+            assert!(
+                decode_buf(bad).is_err(),
+                "{:?} must be rejected",
+                String::from_utf8_lossy(bad)
+            );
+        }
+        for good in [&b"i0e"[..], b"i-5e", b"i9223372036854775807e", b"0:"] {
+            assert!(
+                decode_buf(good).is_ok(),
+                "{:?} must parse",
+                String::from_utf8_lossy(good)
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_overlong_integer_literals() {
+        let mut doc = b"i".to_vec();
+        doc.extend(std::iter::repeat_n(b'9', 4096));
+        doc.push(b'e');
+        assert!(decode_buf(&doc).is_err());
+    }
+
+    #[test]
+    fn rejects_duplicate_dict_keys() {
+        assert_eq!(decode_buf(b"d1:ai1e1:ai2ee"), Err(BError::InvalidDict));
+    }
+
+    #[test]
+    fn enforces_the_token_budget() {
+        // "i0e" repeated is 3 bytes per value; a hostile ~9 MB payload would otherwise
+        // expand into millions of heap values.
+        let mut doc = vec![b'l'];
+        for _ in 0..super::MAX_TOKENS {
+            doc.extend_from_slice(b"i0e");
+        }
+        doc.push(b'e');
+        assert_eq!(decode_buf(&doc), Err(BError::TooManyTokens));
+
+        let mut ok = vec![b'l'];
+        for _ in 0..1000 {
+            ok.extend_from_slice(b"i0e");
+        }
+        ok.push(b'e');
+        assert!(decode_buf(&ok).is_ok());
+    }
+
+    #[test]
+    fn limited_decoder_enforces_depth_and_token_budgets() {
+        use super::decode_buf_limited;
+        let nested = |d: usize| {
+            let mut v = vec![b'l'; d];
+            v.extend_from_slice(b"i1e");
+            v.extend(std::iter::repeat_n(b'e', d));
+            v
+        };
+        assert!(decode_buf_limited(&nested(9), 10, 500).is_ok());
+        assert_eq!(
+            decode_buf_limited(&nested(11), 10, 500),
+            Err(BError::MaxDepthExceeded)
+        );
+        let mut wide = vec![b'l'];
+        for _ in 0..600 {
+            wide.extend_from_slice(b"i0e");
+        }
+        wide.push(b'e');
+        assert_eq!(
+            decode_buf_limited(&wide, 10, 500),
+            Err(BError::TooManyTokens)
+        );
+        assert!(decode_buf_limited(&wide, 10, 1000).is_ok());
     }
 }

@@ -11,6 +11,7 @@ use crate::{AnnounceRequest, AnnounceResponse, Event, TrackerError};
 const PROTOCOL_ID: u64 = 0x0000_0417_2710_1980;
 const ACTION_CONNECT: u32 = 0;
 const ACTION_ANNOUNCE: u32 = 1;
+const ACTION_SCRAPE: u32 = 2;
 const ACTION_ERROR: u32 = 3;
 const MAX_ATTEMPTS: u32 = 3;
 /// Bounded retransmission schedule: 5 * 2^n seconds (5s, 10s, 20s = 35s max) so an unreachable
@@ -28,18 +29,47 @@ pub async fn announce(
     req: &AnnounceRequest,
     key: u32,
 ) -> Result<AnnounceResponse, TrackerError> {
-    let sock = UdpSocket::bind(if addr.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" }).await?;
+    let sock = UdpSocket::bind(if addr.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    })
+    .await?;
     sock.connect(addr).await?;
 
     let connection_id = connect(&sock).await?;
     do_announce(&sock, connection_id, req, key).await
 }
 
+/// Announces to the first of `addrs` that answers, in the order given (BEP 34 failover across
+/// SRV targets and the several addresses one name can resolve to).
+pub async fn announce_any(
+    addrs: &[SocketAddr],
+    req: &AnnounceRequest,
+    key: u32,
+    per_attempt: std::time::Duration,
+) -> Result<AnnounceResponse, TrackerError> {
+    let mut last = TrackerError::Malformed("no tracker address to try");
+    for addr in addrs.iter().take(4) {
+        match tokio::time::timeout(per_attempt, announce(*addr, req, key)).await {
+            Ok(Ok(resp)) => return Ok(resp),
+            Ok(Err(e)) => last = e,
+            Err(_) => last = TrackerError::Malformed("tracker timed out"),
+        }
+    }
+    Err(last)
+}
+
 pub async fn scrape(
     addr: SocketAddr,
     info_hashes: &[[u8; 20]],
 ) -> Result<crate::ScrapeResponse, TrackerError> {
-    let sock = UdpSocket::bind(if addr.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" }).await?;
+    let sock = UdpSocket::bind(if addr.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    })
+    .await?;
     sock.connect(addr).await?;
 
     let connection_id = connect(&sock).await?;
@@ -51,7 +81,6 @@ async fn do_scrape(
     connection_id: u64,
     info_hashes: &[[u8; 20]],
 ) -> Result<crate::ScrapeResponse, TrackerError> {
-    const ACTION_SCRAPE: u32 = 2;
     let txn_id: u32 = rand::random();
     let mut pkt = Vec::with_capacity(16 + info_hashes.len() * 20);
     pkt.extend_from_slice(&connection_id.to_be_bytes());
@@ -63,15 +92,24 @@ async fn do_scrape(
 
     let mut buf = vec![0u8; 8 + info_hashes.len() * 12];
     let n = send_and_recv(sock, &pkt, txn_id, &mut buf).await?;
-    if n < 8 {
+    parse_scrape_response(&buf[..n], info_hashes)
+}
+
+pub fn parse_scrape_response(
+    buf: &[u8],
+    info_hashes: &[[u8; 20]],
+) -> Result<crate::ScrapeResponse, TrackerError> {
+    if buf.len() < 8 {
         return Err(TrackerError::Malformed("scrape response too short"));
     }
     let action = u32::from_be_bytes(buf[0..4].try_into().unwrap());
     match action {
         ACTION_SCRAPE => {
-            let data = &buf[8..n];
+            let data = &buf[8..];
             if !data.len().is_multiple_of(12) {
-                return Err(TrackerError::Malformed("scrape payload length not multiple of 12"));
+                return Err(TrackerError::Malformed(
+                    "scrape payload length not multiple of 12",
+                ));
             }
             let mut files = std::collections::HashMap::new();
             for (i, chunk) in data.as_chunks::<12>().0.iter().enumerate() {
@@ -79,18 +117,23 @@ async fn do_scrape(
                     let seeders = u32::from_be_bytes(chunk[0..4].try_into().unwrap());
                     let completed = u32::from_be_bytes(chunk[4..8].try_into().unwrap());
                     let leechers = u32::from_be_bytes(chunk[8..12].try_into().unwrap());
-                    files.insert(info_hashes[i], crate::ScrapeStats {
-                        seeders,
-                        completed,
-                        leechers,
-                        name: None,
-                    });
+                    files.insert(
+                        info_hashes[i],
+                        crate::ScrapeStats {
+                            seeders,
+                            completed,
+                            leechers,
+                            name: None,
+                        },
+                    );
                 }
             }
             Ok(crate::ScrapeResponse { files })
         }
-        ACTION_ERROR => Err(parse_error(&buf[8..n])),
-        _ => Err(TrackerError::Malformed("unexpected action in scrape response")),
+        ACTION_ERROR => Err(parse_error(&buf[8..])),
+        _ => Err(TrackerError::Malformed(
+            "unexpected action in scrape response",
+        )),
     }
 }
 
@@ -103,14 +146,20 @@ async fn connect(sock: &UdpSocket) -> Result<u64, TrackerError> {
 
     let mut buf = [0u8; 16];
     let n = send_and_recv(sock, &req, txn_id, &mut buf).await?;
-    if n < 16 {
+    parse_connect_response(&buf[..n])
+}
+
+pub fn parse_connect_response(buf: &[u8]) -> Result<u64, TrackerError> {
+    if buf.len() < 16 {
         return Err(TrackerError::Malformed("connect response too short"));
     }
     let action = u32::from_be_bytes(buf[0..4].try_into().unwrap());
     match action {
         ACTION_CONNECT => Ok(u64::from_be_bytes(buf[8..16].try_into().unwrap())),
-        ACTION_ERROR => Err(parse_error(&buf[8..n])),
-        _ => Err(TrackerError::Malformed("unexpected action in connect response")),
+        ACTION_ERROR => Err(parse_error(&buf[8..])),
+        _ => Err(TrackerError::Malformed(
+            "unexpected action in connect response",
+        )),
     }
 }
 
@@ -137,17 +186,32 @@ async fn do_announce(
         Event::Stopped => 3,
     };
     pkt[80..84].copy_from_slice(&event.to_be_bytes());
-    pkt[84..88].copy_from_slice(&0u32.to_be_bytes()); // IP: 0 = let the tracker infer it
+    if let Some(v4) = req.ipv4 {
+        pkt[84..88].copy_from_slice(&v4.octets());
+    } else {
+        pkt[84..88].copy_from_slice(&0u32.to_be_bytes()); // IP: 0 = let the tracker infer it
+    }
     pkt[88..92].copy_from_slice(&key.to_be_bytes());
     let num_want = req.num_want.unwrap_or(-1);
     pkt[92..96].copy_from_slice(&num_want.to_be_bytes());
     pkt[96..98].copy_from_slice(&req.port.to_be_bytes());
 
+    let ext_bytes = crate::udp_ext::encode_udp_options(&req.udp_options);
+    let mut full_pkt = Vec::with_capacity(98 + ext_bytes.len());
+    full_pkt.extend_from_slice(&pkt);
+    full_pkt.extend_from_slice(&ext_bytes);
+
     // Compact peer list: up to ~74 * 6-byte entries in a 500-byte buffer, generous for
     // a single announce response.
-    let mut buf = [0u8; 500];
-    let n = send_and_recv(sock, &pkt, txn_id, &mut buf).await?;
-    if n < 20 {
+    let mut buf = [0u8; 1024];
+    let n = send_and_recv(sock, &full_pkt, txn_id, &mut buf).await?;
+    parse_announce_response(&buf[..n], sock.peer_addr().is_ok_and(|a| a.is_ipv6()))
+}
+
+/// Parses an announce response. `v6` says the tracker was reached over IPv6, in which case its
+/// peers are 18 bytes each (BEP 15) rather than 6.
+pub fn parse_announce_response(buf: &[u8], v6: bool) -> Result<AnnounceResponse, TrackerError> {
+    if buf.len() < 20 {
         return Err(TrackerError::Malformed("announce response too short"));
     }
     let action = u32::from_be_bytes(buf[0..4].try_into().unwrap());
@@ -159,24 +223,49 @@ async fn do_announce(
             // `as_chunks` (not `chunks`) silently drops a ragged trailing chunk
             // instead of yielding it - the pre-rewrite fix for exactly this panic risk
             // (CHANGELOG.md) applies here too, from the start this time.
-            let peers = buf[20..n]
-                .as_chunks::<6>()
-                .0
-                .iter()
-                .map(|c| {
-                    let ip = std::net::Ipv4Addr::new(c[0], c[1], c[2], c[3]);
-                    SocketAddr::from((ip, u16::from_be_bytes([c[4], c[5]])))
-                })
-                .collect();
+            let mut peers: Vec<SocketAddr> = if v6 {
+                buf[20..]
+                    .as_chunks::<18>()
+                    .0
+                    .iter()
+                    .map(|c| {
+                        let mut ip = [0u8; 16];
+                        ip.copy_from_slice(&c[..16]);
+                        SocketAddr::from((
+                            std::net::Ipv6Addr::from(ip),
+                            u16::from_be_bytes([c[16], c[17]]),
+                        ))
+                    })
+                    .collect()
+            } else {
+                buf[20..]
+                    .as_chunks::<6>()
+                    .0
+                    .iter()
+                    .map(|c| {
+                        let ip = std::net::Ipv4Addr::new(c[0], c[1], c[2], c[3]);
+                        SocketAddr::from((ip, u16::from_be_bytes([c[4], c[5]])))
+                    })
+                    .collect()
+            };
+            peers.retain(|p| p.port() != 0);
+            peers.truncate(crate::MAX_PEERS_PER_RESPONSE);
             Ok(AnnounceResponse {
-                interval,
+                interval: interval
+                    .clamp(crate::MIN_ANNOUNCE_INTERVAL, crate::MAX_ANNOUNCE_INTERVAL),
                 leechers,
                 seeders,
                 peers,
+                min_interval: None,
+                tracker_id: None,
+                warning: None,
+                external_ip: None,
             })
         }
-        ACTION_ERROR => Err(parse_error(&buf[8..n])),
-        _ => Err(TrackerError::Malformed("unexpected action in announce response")),
+        ACTION_ERROR => Err(parse_error(&buf[8..])),
+        _ => Err(TrackerError::Malformed(
+            "unexpected action in announce response",
+        )),
     }
 }
 
@@ -239,6 +328,10 @@ mod tests {
             left: 1000,
             event: Event::Started,
             num_want: None,
+            ipv4: None,
+            ipv6: None,
+            udp_options: Vec::new(),
+            tracker_id: None,
         }
     }
 

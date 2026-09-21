@@ -2,7 +2,8 @@
 //!
 //! Provides a full-featured HTTP control plane for web browsers, scripting, and monitoring.
 
-use std::sync::Arc;
+use crate::metrics::{render_prometheus_metrics, PrometheusSnapshot};
+use crate::swagger::{get_swagger_ui_html, OPENAPI_JSON};
 use axum::{
     extract::{Path, Query, Request, State},
     http::{header, StatusCode},
@@ -12,9 +13,8 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use synapse_engine::SwarmEngine;
-use crate::metrics::{render_prometheus_metrics, PrometheusSnapshot};
-use crate::swagger::{get_swagger_ui_html, OPENAPI_JSON};
 
 #[derive(Clone)]
 pub struct ApiState {
@@ -145,7 +145,10 @@ pub fn create_http_router(engine: Arc<SwarmEngine>) -> Router {
 /// (health checks and Prometheus scraping are conventionally treated as same-trust-network
 /// concerns, not bearer-token-gated, and gating them would break a scrape config that doesn't
 /// send arbitrary headers).
-pub fn create_http_router_with_auth(engine: Arc<SwarmEngine>, auth_token: Option<String>) -> Router {
+pub fn create_http_router_with_auth(
+    engine: Arc<SwarmEngine>,
+    auth_token: Option<String>,
+) -> Router {
     create_http_router_full(engine, auth_token, true)
 }
 
@@ -193,14 +196,66 @@ pub fn create_http_router_all(
             "/api/v1/torrents/:info_hash/detail",
             get(get_torrent_detail_handler),
         )
-        .route("/api/v1/torrents/:info_hash/pause", post(pause_torrent_handler))
-        .route("/api/v1/torrents/:info_hash/resume", post(resume_torrent_handler))
-        .route("/api/v1/torrents/:info_hash/recheck", post(recheck_torrent_handler))
-        .route("/api/v1/torrents/:info_hash/location", post(set_location_handler))
-        .route("/api/v1/torrents/:info_hash/files/:index/priority", post(set_file_priority_handler))
-        .route("/api/v1/circuit-breakers", get(list_circuit_breakers_handler))
-        .route("/api/v1/circuit-breakers/:host/trip", post(trip_circuit_breaker_handler))
-        .route("/api/v1/circuit-breakers/:host/reset", post(reset_circuit_breaker_handler))
+        .route(
+            "/api/v1/torrents/:info_hash/pause",
+            post(pause_torrent_handler),
+        )
+        .route(
+            "/api/v1/torrents/:info_hash/resume",
+            post(resume_torrent_handler),
+        )
+        .route(
+            "/api/v1/torrents/:info_hash/recheck",
+            post(recheck_torrent_handler),
+        )
+        .route(
+            "/api/v1/torrents/:info_hash/location",
+            post(set_location_handler),
+        )
+        .route(
+            "/api/v1/torrents/:info_hash/files/:index/priority",
+            post(set_file_priority_handler),
+        )
+        .route("/api/v1/alerts", get(alerts_stream_handler))
+        .route("/api/v1/search", get(search_torrents_handler))
+        .route("/api/v1/torrents/create", post(create_torrent_handler))
+        .route("/api/v1/updates", get(list_updates_handler))
+        .route("/api/v1/updates/check", post(check_updates_handler))
+        .route(
+            "/api/v1/updates/:info_hash/apply",
+            post(apply_update_handler),
+        )
+        .route(
+            "/api/v1/search/engines",
+            get(list_search_engines_handler).post(add_search_engine_handler),
+        )
+        .route(
+            "/api/v1/search/engines/:name",
+            axum::routing::delete(remove_search_engine_handler),
+        )
+        .route(
+            "/api/v1/torrents/:info_hash/signatures",
+            get(torrent_signatures_handler),
+        )
+        .route(
+            "/api/v1/circuit-breakers",
+            get(list_circuit_breakers_handler),
+        )
+        .route(
+            "/api/v1/circuit-breakers/:host/trip",
+            post(trip_circuit_breaker_handler),
+        )
+        .route(
+            "/api/v1/circuit-breakers/:host/reset",
+            post(reset_circuit_breaker_handler),
+        )
+        .route(
+            "/api/v1/rss/feeds",
+            get(list_rss_feeds_handler)
+                .post(add_rss_feed_handler)
+                .delete(remove_rss_feed_handler),
+        )
+        .route("/api/v1/rss/poll", post(poll_rss_feeds_handler))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_auth));
 
     let mut public = Router::new()
@@ -225,7 +280,78 @@ pub fn create_http_router_all(
     protected.merge(public).with_state(state)
 }
 
-async fn require_auth(State(state): State<ApiState>, req: Request, next: Next) -> Result<Response, StatusCode> {
+#[derive(Deserialize)]
+struct AlertsQuery {
+    /// Only alerts for this torrent (40 hex characters).
+    info_hash: Option<String>,
+}
+
+/// JSON form of an alert: `{"type": ..., "info_hash": "<hex>", "data": {...}}`, with the info
+/// hash rendered as hex rather than a byte array.
+pub(crate) fn alert_to_json(alert: &synapse_engine::Alert) -> serde_json::Value {
+    let mut v = serde_json::to_value(alert).unwrap_or_default();
+    if let Some(data) = v.get_mut("data").and_then(|d| d.as_object_mut()) {
+        data.remove("info_hash");
+    }
+    v["info_hash"] = serde_json::Value::String(alert.info_hash_hex());
+    v
+}
+
+/// `GET /api/v1/alerts`: a live Server-Sent Events stream of engine alerts (torrent added,
+/// finished, error, piece finished, hash failure, peer connected/disconnected/banned, state
+/// change, tracker announce). Optional `?info_hash=` restricts it to one torrent. A client that
+/// falls too far behind receives a `lagged` event with the number of alerts it missed rather
+/// than the connection being dropped.
+async fn alerts_stream_handler(
+    State(state): State<ApiState>,
+    Query(query): Query<AlertsQuery>,
+) -> Result<
+    axum::response::sse::Sse<
+        impl futures::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>,
+    >,
+    (StatusCode, Json<ActionResponse>),
+> {
+    use axum::response::sse::{Event, KeepAlive, Sse};
+    use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream};
+    use tokio_stream::StreamExt;
+
+    let filter = match query.info_hash {
+        Some(ref h) => Some(parse_info_hash_hex(h).ok_or((
+            StatusCode::BAD_REQUEST,
+            Json(ActionResponse {
+                success: false,
+                message: "info_hash must be 40 hexadecimal characters".to_string(),
+            }),
+        ))?),
+        None => None,
+    };
+    let stream =
+        BroadcastStream::new(state.engine.subscribe_alerts()).filter_map(move |item| match item {
+            Ok(alert) => {
+                if filter.is_some_and(|f| f != alert.info_hash()) {
+                    return None;
+                }
+                let json = alert_to_json(&alert);
+                let name = json["type"].as_str().unwrap_or("alert").to_string();
+                Some(Ok(Event::default().event(name).data(json.to_string())))
+            }
+            Err(BroadcastStreamRecvError::Lagged(skipped)) => Some(Ok(Event::default()
+                .event("lagged")
+                .data(serde_json::json!({ "skipped": skipped }).to_string()))),
+        });
+    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+}
+
+/// Parses a 40-character hex info hash.
+fn parse_info_hash_hex(s: &str) -> Option<[u8; 20]> {
+    hex::decode(s).ok()?.try_into().ok()
+}
+
+async fn require_auth(
+    State(state): State<ApiState>,
+    req: Request,
+    next: Next,
+) -> Result<Response, StatusCode> {
     let Some(ref expected) = state.auth_token else {
         return Ok(next.run(req).await);
     };
@@ -258,7 +384,9 @@ fn circuit_state_label(state: synapse_tracker::CircuitState) -> &'static str {
     }
 }
 
-async fn list_circuit_breakers_handler(State(state): State<ApiState>) -> Json<Vec<CircuitBreakerStatusApi>> {
+async fn list_circuit_breakers_handler(
+    State(state): State<ApiState>,
+) -> Json<Vec<CircuitBreakerStatusApi>> {
     let breaker = state.engine.tracker_circuit_breaker();
     let breakers = breaker
         .all_hosts()
@@ -397,15 +525,18 @@ async fn list_torrents_handler(
     let limit = query.limit.unwrap_or(50).max(1);
     let offset = (page - 1) * limit;
 
-    let filter = query.state.as_deref().and_then(|s| match s.to_lowercase().as_str() {
-        "downloading" => Some(synapse_engine::SwarmStateFilter::Downloading),
-        "seeding" => Some(synapse_engine::SwarmStateFilter::Seeding),
-        "paused" | "stopped" => Some(synapse_engine::SwarmStateFilter::Paused),
-        "queued" => Some(synapse_engine::SwarmStateFilter::Queued),
-        "checking" => Some(synapse_engine::SwarmStateFilter::Checking),
-        "error" => Some(synapse_engine::SwarmStateFilter::Error),
-        _ => None,
-    });
+    let filter = query
+        .state
+        .as_deref()
+        .and_then(|s| match s.to_lowercase().as_str() {
+            "downloading" => Some(synapse_engine::SwarmStateFilter::Downloading),
+            "seeding" => Some(synapse_engine::SwarmStateFilter::Seeding),
+            "paused" | "stopped" => Some(synapse_engine::SwarmStateFilter::Paused),
+            "queued" => Some(synapse_engine::SwarmStateFilter::Queued),
+            "checking" => Some(synapse_engine::SwarmStateFilter::Checking),
+            "error" => Some(synapse_engine::SwarmStateFilter::Error),
+            _ => None,
+        });
 
     let (paged_swarms, total) = state.engine.list_torrents_paged(offset, limit, filter);
 
@@ -438,6 +569,279 @@ async fn list_torrents_handler(
         "page": page,
         "limit": limit
     }))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SearchQuery {
+    pub q: Option<String>,
+    /// Restrict a search of the configured engines to one, by name.
+    pub engine: Option<String>,
+    /// `local` searches the torrents this daemon holds instead of the configured engines.
+    pub scope: Option<String>,
+}
+
+/// `GET /api/v1/search?q=...`: queries the BEP 18 search engines the operator configured and
+/// returns their results, or with `scope=local` searches the torrents this daemon holds.
+async fn search_torrents_handler(
+    State(state): State<ApiState>,
+    Query(query): Query<SearchQuery>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let q = query.q.as_deref().unwrap_or("").trim().to_string();
+
+    if query.scope.as_deref() != Some("local") {
+        if q.is_empty() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "q is required"})),
+            )
+                .into_response();
+        }
+        let manager = state.engine.search_manager();
+        if manager.is_empty() {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "no search engines are configured (see [search] engines, or POST /api/v1/search/engines)"})),
+            )
+                .into_response();
+        }
+        let results = manager.search(&q, query.engine.as_deref()).await;
+        return Json(serde_json::json!({ "query": q, "engines": results })).into_response();
+    }
+
+    let (swarms, _) = state.engine.list_torrents_paged(0, 10_000, None);
+    let q_lower = q.to_lowercase();
+    let items: Vec<synapse_meta::SearchItem> = swarms
+        .into_iter()
+        .filter(|s| {
+            q_lower.is_empty()
+                || s.name.to_lowercase().contains(&q_lower)
+                || hex::encode(s.info_hash).contains(&q_lower)
+        })
+        .map(|s| synapse_meta::SearchItem {
+            name: s.name,
+            size: s.total_size,
+            seeds: s.peers_sending as u32,
+            leechers: s.peers_connected.saturating_sub(s.peers_sending) as u32,
+            info_hash: Some(s.info_hash),
+            download_url: None,
+            category: None,
+        })
+        .collect();
+    Json(synapse_meta::SearchResponse {
+        total_results: items.len() as u32,
+        items,
+    })
+    .into_response()
+}
+
+async fn list_search_engines_handler(State(state): State<ApiState>) -> Json<serde_json::Value> {
+    let engines = state.engine.search_manager().list();
+    Json(serde_json::json!({ "count": engines.len(), "engines": engines }))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AddSearchEngine {
+    /// A `.btsearch` file path or http(s) URL.
+    pub source: String,
+}
+
+async fn add_search_engine_handler(
+    State(state): State<ApiState>,
+    Json(payload): Json<AddSearchEngine>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ActionResponse>)> {
+    match state
+        .engine
+        .search_manager()
+        .add_source(payload.source.trim())
+        .await
+    {
+        Ok(engine) => Ok(Json(
+            serde_json::json!({ "success": true, "engine": engine }),
+        )),
+        Err(message) => Err((
+            StatusCode::BAD_REQUEST,
+            Json(ActionResponse {
+                success: false,
+                message,
+            }),
+        )),
+    }
+}
+
+async fn remove_search_engine_handler(
+    State(state): State<ApiState>,
+    Path(name): Path<String>,
+) -> StatusCode {
+    if state.engine.search_manager().remove(&name) {
+        StatusCode::NO_CONTENT
+    } else {
+        StatusCode::NOT_FOUND
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateTorrentRequest {
+    /// The file or directory to make a torrent of. It must be inside the download directory.
+    pub path: String,
+    #[serde(default)]
+    pub trackers: Vec<String>,
+    /// Put all trackers in one tier instead of one tier each.
+    #[serde(default)]
+    pub same_tier: bool,
+    #[serde(default)]
+    pub web_seeds: Vec<String>,
+    pub comment: Option<String>,
+    #[serde(default)]
+    pub private: bool,
+    pub source: Option<String>,
+    /// Piece size in KiB (a power of two, at least 16).
+    pub piece_size_kib: Option<u32>,
+    /// `v1` (default), `v2` or `hybrid`.
+    pub version: Option<String>,
+}
+
+/// `POST /api/v1/torrents/create`: hashes a file or directory in the download directory and returns
+/// the `.torrent` (base64), ready to pass to `POST /api/v1/torrents` as `torrent_base64`.
+async fn create_torrent_handler(
+    State(state): State<ApiState>,
+    Json(req): Json<CreateTorrentRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ActionResponse>)> {
+    let fail = |code: StatusCode, message: String| {
+        (
+            code,
+            Json(ActionResponse {
+                success: false,
+                message,
+            }),
+        )
+    };
+    // Only content already under the download directory: this endpoint must not become a way to
+    // probe arbitrary files on the host.
+    let base = state.engine.settings().read().download_dir.clone();
+    let base = std::fs::canonicalize(&base).map_err(|e| {
+        fail(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("download directory unavailable: {e}"),
+        )
+    })?;
+    let requested = std::path::PathBuf::from(&req.path);
+    let requested = if requested.is_absolute() {
+        requested
+    } else {
+        base.join(requested)
+    };
+    let path = std::fs::canonicalize(&requested)
+        .map_err(|e| fail(StatusCode::NOT_FOUND, format!("{}: {e}", req.path)))?;
+    if !path.starts_with(&base) {
+        return Err(fail(
+            StatusCode::FORBIDDEN,
+            "the path must be inside the download directory".into(),
+        ));
+    }
+    let version = match req.version.as_deref().unwrap_or("v1") {
+        "v1" => synapse_meta::create::TorrentVersion::V1,
+        "v2" => synapse_meta::create::TorrentVersion::V2,
+        "hybrid" => synapse_meta::create::TorrentVersion::Hybrid,
+        other => {
+            return Err(fail(
+                StatusCode::BAD_REQUEST,
+                format!("unknown version '{other}' (use v1, v2 or hybrid)"),
+            ))
+        }
+    };
+    let trackers = if req.same_tier {
+        vec![req.trackers]
+    } else {
+        req.trackers.into_iter().map(|t| vec![t]).collect()
+    };
+    let opts = synapse_meta::create::CreateOptions {
+        piece_length: req.piece_size_kib.map(|k| k.saturating_mul(1024)),
+        trackers,
+        web_seeds: req.web_seeds,
+        comment: req.comment,
+        created_by: Some(format!("Synapse/{}", env!("CARGO_PKG_VERSION"))),
+        private: req.private,
+        source: req.source,
+        name: None,
+        version,
+        creation_date: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|d| d.as_secs() as i64),
+    };
+    let bytes = tokio::task::spawn_blocking(move || {
+        synapse_meta::create::create_torrent(&path, &opts, |_, _| {})
+    })
+    .await
+    .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(|e| fail(StatusCode::BAD_REQUEST, e.to_string()))?;
+    let info = synapse_meta::Info::from_torrent_bytes(&bytes)
+        .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    use base64::Engine as _;
+    Ok(Json(serde_json::json!({
+        "info_hash": hex::encode(info.hash),
+        "name": info.name,
+        "size": bytes.len(),
+        "torrent_base64": base64::engine::general_purpose::STANDARD.encode(&bytes),
+    })))
+}
+
+/// BEP 39: updates found for torrents that carry an `update-url`.
+async fn list_updates_handler(State(state): State<ApiState>) -> Json<serde_json::Value> {
+    let updates = state.engine.update_manager().pending();
+    Json(serde_json::json!({ "count": updates.len(), "updates": updates }))
+}
+
+/// Asks every update feed now.
+async fn check_updates_handler(State(state): State<ApiState>) -> Json<serde_json::Value> {
+    let found = state.engine.check_for_updates().await;
+    Json(serde_json::json!({ "found": found }))
+}
+
+/// Adds the update found for `info_hash` (the old torrent).
+async fn apply_update_handler(
+    State(state): State<ApiState>,
+    Path(info_hash): Path<String>,
+) -> StatusCode {
+    let Some(hash) = parse_info_hash_hex(&info_hash) else {
+        return StatusCode::BAD_REQUEST;
+    };
+    if state.engine.apply_pending_update(&hash) {
+        StatusCode::NO_CONTENT
+    } else {
+        StatusCode::NOT_FOUND
+    }
+}
+
+/// BEP 35: the signatures a torrent carries and whether each verifies and is trusted.
+async fn torrent_signatures_handler(
+    State(state): State<ApiState>,
+    Path(info_hash): Path<String>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let hash = parse_info_hash_hex(&info_hash).ok_or(StatusCode::BAD_REQUEST)?;
+    let statuses = state
+        .engine
+        .torrent_signatures(&hash)
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let signatures: Vec<serde_json::Value> = statuses
+        .into_iter()
+        .map(|(signer, status)| match status {
+            synapse_meta::SignatureStatus::Trusted { .. } => {
+                serde_json::json!({"signer": signer, "status": "trusted"})
+            }
+            synapse_meta::SignatureStatus::Untrusted { reason } => {
+                serde_json::json!({"signer": signer, "status": "untrusted", "reason": reason})
+            }
+            synapse_meta::SignatureStatus::Invalid { reason } => {
+                serde_json::json!({"signer": signer, "status": "invalid", "reason": reason})
+            }
+        })
+        .collect();
+    Ok(Json(serde_json::json!({
+        "signed": !signatures.is_empty(),
+        "signatures": signatures,
+    })))
 }
 
 async fn add_torrent_handler(
@@ -478,15 +882,36 @@ async fn add_torrent_handler(
         }
     } else if let Some(ref b64) = payload.torrent_base64 {
         use base64::Engine;
-        let bytes = base64::engine::general_purpose::STANDARD.decode(b64.trim()).map_err(|e| {
-            (
-                StatusCode::BAD_REQUEST,
+        // base64 inflates by 4/3; reject before decoding so a huge string is never expanded.
+        if b64.len() > synapse_meta::MAX_TORRENT_FILE_BYTES.div_ceil(3) * 4 + 4 {
+            return Err((
+                StatusCode::PAYLOAD_TOO_LARGE,
                 Json(ActionResponse {
                     success: false,
-                    message: format!("Invalid base64 payload: {e}"),
+                    message: "torrent_base64 payload exceeds the maximum accepted size".to_string(),
                 }),
-            )
-        })?;
+            ));
+        }
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(b64.trim())
+            .map_err(|e| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(ActionResponse {
+                        success: false,
+                        message: format!("Invalid base64 payload: {e}"),
+                    }),
+                )
+            })?;
+        if bytes.len() > synapse_meta::MAX_TORRENT_FILE_BYTES {
+            return Err((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Json(ActionResponse {
+                    success: false,
+                    message: "Torrent payload exceeds the maximum accepted size".to_string(),
+                }),
+            ));
+        }
         let bencode = synapse_bencode::decode_buf(&bytes).map_err(|e| {
             (
                 StatusCode::BAD_REQUEST,
@@ -515,7 +940,18 @@ async fn add_torrent_handler(
         ));
     };
 
-    let handle = state.engine.add_torrent(std::sync::Arc::new(info), dir, None);
+    if let Err(message) = state.engine.check_signature_policy(&info) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ActionResponse {
+                success: false,
+                message,
+            }),
+        ));
+    }
+    let handle = state
+        .engine
+        .add_torrent(std::sync::Arc::new(info), dir, None);
     let hash = handle.stats.read().info_hash;
     let start_added = state.engine.settings().read().start_added_torrents;
     if payload.paused.unwrap_or(!start_added) {
@@ -524,7 +960,10 @@ async fn add_torrent_handler(
 
     Ok(Json(ActionResponse {
         success: true,
-        message: format!("Torrent added successfully with info_hash={}", hex::encode(hash)),
+        message: format!(
+            "Torrent added successfully with info_hash={}",
+            hex::encode(hash)
+        ),
     }))
 }
 
@@ -656,7 +1095,11 @@ async fn get_torrent_detail_handler(
                     }
                 }
             }
-            let prog = if f.length > 0 { (done as f64 / f.length as f64) as f32 } else { 1.0 };
+            let prog = if f.length > 0 {
+                (done as f64 / f.length as f64) as f32
+            } else {
+                1.0
+            };
             (done, prog.min(1.0))
         } else {
             (0, 0.0)
@@ -746,6 +1189,16 @@ async fn upload_torrent_handler(
         ));
     }
 
+    if bytes.len() > synapse_meta::MAX_TORRENT_FILE_BYTES {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(ActionResponse {
+                success: false,
+                message: "Torrent payload exceeds the maximum accepted size".to_string(),
+            }),
+        ));
+    }
+
     let bencode = synapse_bencode::decode_buf(&bytes).map_err(|e| {
         (
             StatusCode::BAD_REQUEST,
@@ -772,7 +1225,18 @@ async fn upload_torrent_handler(
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| state.engine.settings().read().download_dir.clone());
 
-    let handle = state.engine.add_torrent(std::sync::Arc::new(info), dir, None);
+    if let Err(message) = state.engine.check_signature_policy(&info) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ActionResponse {
+                success: false,
+                message,
+            }),
+        ));
+    }
+    let handle = state
+        .engine
+        .add_torrent(std::sync::Arc::new(info), dir, None);
     let hash = handle.stats.read().info_hash;
     let start_added = state.engine.settings().read().start_added_torrents;
     if query.paused.unwrap_or(!start_added) {
@@ -781,7 +1245,10 @@ async fn upload_torrent_handler(
 
     Ok(Json(ActionResponse {
         success: true,
-        message: format!("Torrent added successfully with info_hash={}", hex::encode(hash)),
+        message: format!(
+            "Torrent added successfully with info_hash={}",
+            hex::encode(hash)
+        ),
     }))
 }
 
@@ -840,10 +1307,16 @@ async fn set_file_priority_handler(
     let mut hash = [0u8; 20];
     hash.copy_from_slice(&hash_bytes);
 
-    if state.engine.set_file_priority(&hash, file_index, payload.priority) {
+    if state
+        .engine
+        .set_file_priority(&hash, file_index, payload.priority)
+    {
         Ok(Json(ActionResponse {
             success: true,
-            message: format!("Priority for file {} updated to {}", file_index, payload.priority),
+            message: format!(
+                "Priority for file {} updated to {}",
+                file_index, payload.priority
+            ),
         }))
     } else {
         Err(StatusCode::NOT_FOUND)
@@ -920,14 +1393,123 @@ async fn metrics_handler(State(state): State<ApiState>) -> Response {
         circuit_breakers_tripped: state.engine.circuit_breaker().tripped_count()
             + state.engine.tracker_circuit_breaker().tripped_count(),
         dht_nodes: state.engine.dht_node_count().await,
+        nat_mapped_port: state.engine.mapped_external_port(
+            state.engine.listen_port(),
+            synapse_engine::PortProtocol::Tcp,
+        ),
+        chokes_total: m.chokes_total,
+        unchokes_total: m.unchokes_total,
+        piece_requests_total: m.piece_requests_total,
+        piece_rejects_total: m.piece_rejects_total,
+        hash_fails_total: m.hash_fails_total,
+        peer_bans_total: m.peers_banned,
+        disk_write_queue_bytes: state.engine.disk_write_queue_bytes(),
+        utp_packet_loss_total: m.utp_packet_loss_total,
+        dht_dos_blocks_total: m.dht_dos_blocks_total,
     };
 
     let text = render_prometheus_metrics(&snapshot);
     (
-        [(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4",
+        )],
         text,
     )
         .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RemoveRssFeedQuery {
+    pub url: String,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct PollRssFeedQuery {
+    pub url: Option<String>,
+}
+
+async fn list_rss_feeds_handler(State(state): State<ApiState>) -> Json<serde_json::Value> {
+    let feeds = state.engine.feed_manager().list_feeds();
+    let total = feeds.len();
+    Json(serde_json::json!({
+        "feeds": feeds,
+        "count": total,
+    }))
+}
+
+async fn add_rss_feed_handler(
+    State(state): State<ApiState>,
+    Json(payload): Json<synapse_config::RssFeedConfig>,
+) -> Result<Json<ActionResponse>, (StatusCode, Json<ActionResponse>)> {
+    if payload.url.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ActionResponse {
+                success: false,
+                message: "url cannot be empty".into(),
+            }),
+        ));
+    }
+    state.engine.feed_manager().add_feed(payload);
+    Ok(Json(ActionResponse {
+        success: true,
+        message: "Feed registered successfully".into(),
+    }))
+}
+
+async fn remove_rss_feed_handler(
+    State(state): State<ApiState>,
+    Query(query): Query<RemoveRssFeedQuery>,
+) -> Result<Json<ActionResponse>, (StatusCode, Json<ActionResponse>)> {
+    let removed = state.engine.feed_manager().remove_feed(&query.url);
+    if removed {
+        Ok(Json(ActionResponse {
+            success: true,
+            message: "Feed removed successfully".into(),
+        }))
+    } else {
+        Err((
+            StatusCode::NOT_FOUND,
+            Json(ActionResponse {
+                success: false,
+                message: format!("Feed '{}' not found", query.url),
+            }),
+        ))
+    }
+}
+
+async fn poll_rss_feeds_handler(
+    State(state): State<ApiState>,
+    Query(query): Query<PollRssFeedQuery>,
+) -> Json<serde_json::Value> {
+    if let Some(ref url) = query.url {
+        match state
+            .engine
+            .feed_manager()
+            .poll_single_feed(url, &state.engine)
+            .await
+        {
+            Ok(items) => Json(serde_json::json!({
+                "success": true,
+                "url": url,
+                "items_count": items.len(),
+            })),
+            Err(e) => Json(serde_json::json!({
+                "success": false,
+                "url": url,
+                "error": e,
+            })),
+        }
+    } else {
+        let results = state.engine.poll_rss_feeds().await;
+        let successful = results.iter().filter(|r| r.is_ok()).count();
+        Json(serde_json::json!({
+            "success": true,
+            "total_feeds": results.len(),
+            "successful_feeds": successful,
+        }))
+    }
 }
 
 #[cfg(test)]
@@ -1012,7 +1594,9 @@ mod tests {
             .unwrap();
         let resp7 = app.oneshot(req7).await.unwrap();
         assert_eq!(resp7.status(), StatusCode::OK);
-        let bytes = axum::body::to_bytes(resp7.into_body(), 1024 * 1024).await.unwrap();
+        let bytes = axum::body::to_bytes(resp7.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
         let session_json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(session_json["download_limit_bytes"], 6_250_000);
         assert_eq!(session_json["download_limit_pretty"], "50 Mbps");

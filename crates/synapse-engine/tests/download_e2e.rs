@@ -12,14 +12,19 @@ use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
 
 use diskio::DiskEngine;
-use synapse_engine::{PeerEvent, SwarmState, SwarmStats, SwarmTier, TokenBucket, Torrent, TorrentConfig};
+use synapse_engine::{
+    PeerEvent, SwarmState, SwarmStats, SwarmTier, TokenBucket, Torrent, TorrentConfig,
+};
 use synapse_meta::Info;
 use synapse_picker::{Bitfield, Mode, RoaringBitfield};
 
 /// A fresh `SwarmStats` for a `Torrent` under test — this crate's `SwarmEngine::add_torrent`
 /// normally builds one of these and shares it with the `Torrent` it spawns; this test
 /// constructs `Torrent` directly (no `SwarmEngine` in the loop) so it needs to build its own.
-fn fresh_stats(info: &Info, download_dir: &std::path::Path) -> Arc<parking_lot::RwLock<SwarmStats>> {
+fn fresh_stats(
+    info: &Info,
+    download_dir: &std::path::Path,
+) -> Arc<parking_lot::RwLock<SwarmStats>> {
     Arc::new(parking_lot::RwLock::new(SwarmStats {
         info_hash: info.hash,
         name: info.name.clone(),
@@ -68,10 +73,7 @@ fn build_test_info(file_data: &[u8], piece_len: u32, name: &str) -> Info {
     );
 
     let mut torrent_dict = std::collections::BTreeMap::new();
-    torrent_dict.insert(
-        b"info".to_vec(),
-        synapse_bencode::BEncode::Dict(info_dict),
-    );
+    torrent_dict.insert(b"info".to_vec(), synapse_bencode::BEncode::Dict(info_dict));
 
     Info::from_bencode(synapse_bencode::BEncode::Dict(torrent_dict)).expect("valid test torrent")
 }
@@ -128,7 +130,9 @@ async fn run_download(file_data: &[u8], piece_len: u32) -> Vec<u8> {
             on_torrent_completed: None,
             on_piece_completed: None,
             stats: fresh_stats(&info, seeder_dir.path()),
-            bitfield: Arc::new(parking_lot::RwLock::new(Some(RoaringBitfield::from_bitfield(&seeder_have)))),
+            bitfield: Arc::new(parking_lot::RwLock::new(Some(
+                RoaringBitfield::from_bitfield(&seeder_have),
+            ))),
             download_bucket: Arc::new(TokenBucket::unthrottled()),
             upload_bucket: Arc::new(TokenBucket::unthrottled()),
             global_metrics: None,
@@ -137,8 +141,12 @@ async fn run_download(file_data: &[u8], piece_len: u32) -> Vec<u8> {
             piece_availability: Arc::new(parking_lot::RwLock::new(vec![1; info.pieces() as usize])),
             settings: Arc::new(parking_lot::RwLock::new(Default::default())),
             on_peers_discovered: None,
-            http_client: reqwest::Client::new(),
             on_metadata_resolved: None,
+            ban_list: Default::default(),
+            ip_filter: Default::default(),
+            super_seeding: false,
+            local_webseed_resolver: None,
+            alert_sender: None,
         },
         Some(&seeder_have),
     );
@@ -169,8 +177,12 @@ async fn run_download(file_data: &[u8], piece_len: u32) -> Vec<u8> {
             piece_availability: Arc::new(parking_lot::RwLock::new(vec![0; info.pieces() as usize])),
             settings: Arc::new(parking_lot::RwLock::new(Default::default())),
             on_peers_discovered: None,
-            http_client: reqwest::Client::new(),
             on_metadata_resolved: None,
+            ban_list: Default::default(),
+            ip_filter: Default::default(),
+            super_seeding: false,
+            local_webseed_resolver: None,
+            alert_sender: None,
         },
         None,
     );
@@ -185,9 +197,16 @@ async fn run_download(file_data: &[u8], piece_len: u32) -> Vec<u8> {
     let expected_hash = info.hash;
     tokio::spawn(async move {
         let (stream, addr) = listener.accept().await.unwrap();
-        synapse_engine::accept(stream, addr, seeder_peer_id, move |h| h == expected_hash, false, seeder_tx)
-            .await
-            .expect("seeder-side handshake failed");
+        synapse_engine::accept(
+            stream,
+            addr,
+            seeder_peer_id,
+            expected_hash,
+            false,
+            seeder_tx,
+        )
+        .await
+        .expect("seeder-side handshake failed");
     });
 
     synapse_engine::connect(seeder_addr, leecher_peer_id, info.hash, false, leecher_tx)

@@ -27,6 +27,17 @@ fn create_synthetic_info(index: usize) -> Info {
         file_offsets: Vec::new(),
         url_list: Vec::new(),
         web_seeds: Vec::new(),
+        meta_version: 1,
+        info_hash_v2: None,
+        piece_layers: std::collections::BTreeMap::new(),
+        file_roots: Vec::new(),
+        raw_info: None,
+        v2_aligned: false,
+        select_only: None,
+        signatures: Vec::new(),
+        root_hash_v1: None,
+        update_url: None,
+        originator: None,
     }
 }
 
@@ -61,7 +72,10 @@ async fn test_scale_50k_swarms() {
     let start_metrics = Instant::now();
     let metrics = engine.global_metrics();
     let metrics_time = start_metrics.elapsed();
-    assert!(metrics_time.as_micros() < 500, "Metrics query took too long: {metrics_time:?}");
+    assert!(
+        metrics_time.as_micros() < 500,
+        "Metrics query took too long: {metrics_time:?}"
+    );
     assert_eq!(metrics.total_torrents, SWARM_COUNT);
     assert_eq!(metrics.seeding_torrents, SWARM_COUNT);
     assert_eq!(metrics.active_actors, 0);
@@ -72,7 +86,10 @@ async fn test_scale_50k_swarms() {
     let page_time = start_page.elapsed();
     assert_eq!(total, SWARM_COUNT);
     assert_eq!(page.len(), 50);
-    assert!(page_time.as_millis() < 50, "Pagination took too long: {page_time:?}");
+    assert!(
+        page_time.as_millis() < 50,
+        "Pagination took too long: {page_time:?}"
+    );
 
     // 5. Test wake-on-peer promotion to Hot tier
     let target_hash = hashes[12_345];
