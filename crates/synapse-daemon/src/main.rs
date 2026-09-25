@@ -4,7 +4,7 @@
 //! multi-torrent SwarmEngine, and the Tonic gRPC / streaming delta control plane.
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -133,6 +133,122 @@ enum MigrateClient {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Migrate from qBittorrent (reads its BT_backup directory of .torrent + .fastresume pairs)
+    Qbittorrent {
+        /// Source qBittorrent BT_backup directory. Defaults to platform location
+        /// (~/Library/Application Support/QBittorrent/BT_backup on macOS,
+        /// ~/.local/share/qBittorrent/BT_backup on Linux).
+        #[arg(short, long)]
+        qbittorrent_dir: Option<PathBuf>,
+
+        /// Destination Synapse session directory. Defaults to configured session_dir.
+        #[arg(short, long)]
+        synapse_dir: Option<PathBuf>,
+
+        /// Preview migration items and verification without writing changes.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Migrate from Deluge (reads its state directory of .torrent + .fastresume pairs)
+    Deluge {
+        /// Source Deluge state directory. Defaults to platform location
+        /// (~/Library/Application Support/deluge/state on macOS, ~/.config/deluge/state on Linux).
+        #[arg(short, long)]
+        deluge_dir: Option<PathBuf>,
+
+        /// Destination Synapse session directory. Defaults to configured session_dir.
+        #[arg(short, long)]
+        synapse_dir: Option<PathBuf>,
+
+        /// Preview migration items and verification without writing changes.
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+fn print_migration_banner(client_label: &str, source_dir: &Path, target_dir: &Path, dry_run: bool) {
+    println!("📦 Synapse 2.0 Migration Tool — {client_label} Importer");
+    println!(
+        "📂 Source {client_label} Directory: {}",
+        source_dir.display()
+    );
+    println!("📂 Target Synapse Directory:      {}", target_dir.display());
+    if dry_run {
+        println!("🔍 Mode: DRY-RUN (Previewing without modifying files)\n");
+    } else {
+        println!("🚀 Mode: LIVE MIGRATION\n");
+    }
+}
+
+/// Prints the found/migrated summary table shared by every `migrate` subcommand — generic over
+/// each source client's own entry type (see `migrate::MigratedTorrent`) so this isn't
+/// duplicated per client.
+fn print_migration_report<T: migrate::MigratedTorrent>(
+    found: &[T],
+    migrated: usize,
+    errors: &[String],
+    dry_run: bool,
+) -> std::process::ExitCode {
+    println!("{:-<100}", "");
+    println!(
+        "{:<40} {:<12} {:<12} {:<20} {:<12}",
+        "NAME", "HASH", "SIZE", "PROGRESS", "STATE"
+    );
+    println!("{:-<100}", "");
+    for entry in found {
+        let size_mb = (entry.total_size() as f64) / 1024.0 / 1024.0;
+        let pct = if entry.total_pieces() > 0 {
+            (entry.completed_pieces() as f64 / entry.total_pieces() as f64) * 100.0
+        } else {
+            0.0
+        };
+        let state_str = if entry.is_paused() {
+            "Paused"
+        } else if pct >= 100.0 {
+            "Seeding"
+        } else {
+            "Downloading"
+        };
+        let hash = entry.info_hash_hex();
+        let hash_short = &hash[..8.min(hash.len())];
+        let name = entry.name();
+        let name_truncated = if name.len() > 38 {
+            format!("{}...", &name[..35])
+        } else {
+            name.to_string()
+        };
+        println!(
+            "{:<40} {:<12} {:>8.1} MB {:>6.1}% ({:>4}/{:<4}) {:<12}",
+            name_truncated,
+            hash_short,
+            size_mb,
+            pct,
+            entry.completed_pieces(),
+            entry.total_pieces(),
+            state_str
+        );
+    }
+    println!("{:-<100}", "");
+    if dry_run {
+        println!(
+            "\n✅ Found {} torrent(s) ready to migrate. Run without --dry-run to write session files.",
+            found.len()
+        );
+    } else {
+        println!(
+            "\n🎉 Successfully migrated {}/{} torrent(s) to Synapse!",
+            migrated,
+            found.len()
+        );
+        if !errors.is_empty() {
+            println!("⚠️ Warnings / Errors ({}):", errors.len());
+            for err in errors {
+                println!("  - {}", err);
+            }
+        }
+        println!("🚀 Start Synapse daemon to activate restored torrents: cargo run --release -p synapsed");
+    }
+    std::process::ExitCode::SUCCESS
 }
 
 #[tokio::main]
@@ -146,85 +262,75 @@ async fn main() -> std::process::ExitCode {
                 synapse_dir,
                 dry_run,
             } => {
-                let trans_dir = transmission_dir
+                let source_dir = transmission_dir
                     .or_else(migrate::default_transmission_dir)
                     .unwrap_or_else(|| PathBuf::from("./Transmission"));
-
                 let target_dir = synapse_dir.unwrap_or_else(migrate::default_synapse_session_dir);
 
-                println!("📦 Synapse 2.0 Migration Tool — Transmission Importer");
-                println!("📂 Source Transmission Directory: {}", trans_dir.display());
-                println!("📂 Target Synapse Directory:      {}", target_dir.display());
-                if dry_run {
-                    println!("🔍 Mode: DRY-RUN (Previewing without modifying files)\n");
-                } else {
-                    println!("🚀 Mode: LIVE MIGRATION\n");
-                }
+                print_migration_banner("Transmission", &source_dir, &target_dir, dry_run);
 
-                match migrate::migrate_transmission(&trans_dir, &target_dir, dry_run) {
-                    Ok(result) => {
-                        println!("{:-<100}", "");
-                        println!(
-                            "{:<40} {:<12} {:<12} {:<20} {:<12}",
-                            "NAME", "HASH", "SIZE", "PROGRESS", "STATE"
-                        );
-                        println!("{:-<100}", "");
-                        for entry in &result.found {
-                            let size_mb = (entry.total_size as f64) / 1024.0 / 1024.0;
-                            let pct = if entry.total_pieces > 0 {
-                                (entry.completed_pieces as f64 / entry.total_pieces as f64) * 100.0
-                            } else {
-                                0.0
-                            };
-                            let state_str = if entry.is_paused {
-                                "Paused"
-                            } else if pct >= 100.0 {
-                                "Seeding"
-                            } else {
-                                "Downloading"
-                            };
-                            let hash_short =
-                                &entry.info_hash_hex[..8.min(entry.info_hash_hex.len())];
-                            let name_truncated = if entry.name.len() > 38 {
-                                format!("{}...", &entry.name[..35])
-                            } else {
-                                entry.name.clone()
-                            };
-                            println!(
-                                "{:<40} {:<12} {:>8.1} MB {:>6.1}% ({:>4}/{:<4}) {:<12}",
-                                name_truncated,
-                                hash_short,
-                                size_mb,
-                                pct,
-                                entry.completed_pieces,
-                                entry.total_pieces,
-                                state_str
-                            );
-                        }
-                        println!("{:-<100}", "");
-                        if dry_run {
-                            println!("\n✅ Found {} torrent(s) ready to migrate. Run without --dry-run to write session files.", result.found.len());
-                        } else {
-                            println!(
-                                "\n🎉 Successfully migrated {}/{} torrent(s) to Synapse!",
-                                result.migrated,
-                                result.found.len()
-                            );
-                            if !result.errors.is_empty() {
-                                println!("⚠️ Warnings / Errors ({}):", result.errors.len());
-                                for err in &result.errors {
-                                    println!("  - {}", err);
-                                }
-                            }
-                            println!("🚀 Start Synapse daemon to activate restored torrents: cargo run --release -p synapsed");
-                        }
-                        return std::process::ExitCode::SUCCESS;
-                    }
+                return match migrate::migrate_transmission(&source_dir, &target_dir, dry_run) {
+                    Ok(result) => print_migration_report(
+                        &result.found,
+                        result.migrated,
+                        &result.errors,
+                        dry_run,
+                    ),
                     Err(e) => {
                         eprintln!("❌ Migration failed: {e}");
-                        return std::process::ExitCode::FAILURE;
+                        std::process::ExitCode::FAILURE
                     }
-                }
+                };
+            }
+            MigrateClient::Qbittorrent {
+                qbittorrent_dir,
+                synapse_dir,
+                dry_run,
+            } => {
+                let source_dir = qbittorrent_dir
+                    .or_else(migrate::default_qbittorrent_dir)
+                    .unwrap_or_else(|| PathBuf::from("./BT_backup"));
+                let target_dir = synapse_dir.unwrap_or_else(migrate::default_synapse_session_dir);
+
+                print_migration_banner("qBittorrent", &source_dir, &target_dir, dry_run);
+
+                return match migrate::migrate_qbittorrent(&source_dir, &target_dir, dry_run) {
+                    Ok(result) => print_migration_report(
+                        &result.found,
+                        result.migrated,
+                        &result.errors,
+                        dry_run,
+                    ),
+                    Err(e) => {
+                        eprintln!("❌ Migration failed: {e}");
+                        std::process::ExitCode::FAILURE
+                    }
+                };
+            }
+            MigrateClient::Deluge {
+                deluge_dir,
+                synapse_dir,
+                dry_run,
+            } => {
+                let source_dir = deluge_dir
+                    .or_else(migrate::default_deluge_dir)
+                    .unwrap_or_else(|| PathBuf::from("./state"));
+                let target_dir = synapse_dir.unwrap_or_else(migrate::default_synapse_session_dir);
+
+                print_migration_banner("Deluge", &source_dir, &target_dir, dry_run);
+
+                return match migrate::migrate_deluge(&source_dir, &target_dir, dry_run) {
+                    Ok(result) => print_migration_report(
+                        &result.found,
+                        result.migrated,
+                        &result.errors,
+                        dry_run,
+                    ),
+                    Err(e) => {
+                        eprintln!("❌ Migration failed: {e}");
+                        std::process::ExitCode::FAILURE
+                    }
+                };
             }
         }
     } else if let Some(Subcommand::Create {

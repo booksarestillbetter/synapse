@@ -1,8 +1,15 @@
-//! Migration tool to import torrents and resume states from Transmission to Synapse.
+//! Migration tool to import torrents and resume states from Transmission, qBittorrent, and
+//! Deluge into Synapse.
 //!
-//! Parses Transmission's `.torrent` files and `.resume` bencoded state dictionaries,
-//! translates piece bitfields and download destinations, and emits native Synapse
-//! session files (`<info_hash>.json`).
+//! Parses each client's `.torrent` files and resume-state dictionaries, translates piece
+//! bitfields and download destinations, and emits native Synapse session files
+//! (`<info_hash>.json`).
+//!
+//! qBittorrent and Deluge both embed libtorrent directly rather than implementing their own
+//! BitTorrent engine, and both write libtorrent's own `.fastresume` bencoded format per
+//! torrent — so unlike Transmission (which gets its own parser below), those two share one
+//! (`parse_libtorrent_fastresume`/`migrate_libtorrent_client`), differing only in their default
+//! on-disk directory layout and one qBittorrent-specific save-path override key.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -33,6 +40,39 @@ pub struct MigrationResult {
     pub found: Vec<TransmissionTorrentEntry>,
     pub migrated: usize,
     pub errors: Vec<String>,
+}
+
+/// A shared shape for a migrated torrent entry, whichever source client it came from —
+/// implemented by each client's own entry type so the CLI's summary table
+/// (`main.rs::print_migration_report`) isn't duplicated per client.
+pub trait MigratedTorrent {
+    fn name(&self) -> &str;
+    fn info_hash_hex(&self) -> &str;
+    fn total_size(&self) -> u64;
+    fn total_pieces(&self) -> usize;
+    fn completed_pieces(&self) -> usize;
+    fn is_paused(&self) -> bool;
+}
+
+impl MigratedTorrent for TransmissionTorrentEntry {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn info_hash_hex(&self) -> &str {
+        &self.info_hash_hex
+    }
+    fn total_size(&self) -> u64 {
+        self.total_size
+    }
+    fn total_pieces(&self) -> usize {
+        self.total_pieces
+    }
+    fn completed_pieces(&self) -> usize {
+        self.completed_pieces
+    }
+    fn is_paused(&self) -> bool {
+        self.is_paused
+    }
 }
 
 /// Automatically discovers Transmission data directory based on standard OS locations.
@@ -350,6 +390,409 @@ pub fn migrate_transmission(
     })
 }
 
+// --- qBittorrent & Deluge (both libtorrent-embedding clients) ---
+
+/// One torrent found in a libtorrent-based client's `.fastresume` + `.torrent` pair.
+#[derive(Debug, Clone)]
+pub struct LibtorrentTorrentEntry {
+    pub name: String,
+    pub info_hash_hex: String,
+    pub download_dir: PathBuf,
+    pub total_size: u64,
+    pub total_pieces: usize,
+    pub completed_pieces: usize,
+    pub uploaded_bytes: u64,
+    pub downloaded_bytes: u64,
+    pub is_paused: bool,
+    pub added_at: i64,
+    pub raw_bencode: Vec<u8>,
+    pub bitfield_hex: String,
+}
+
+impl MigratedTorrent for LibtorrentTorrentEntry {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn info_hash_hex(&self) -> &str {
+        &self.info_hash_hex
+    }
+    fn total_size(&self) -> u64 {
+        self.total_size
+    }
+    fn total_pieces(&self) -> usize {
+        self.total_pieces
+    }
+    fn completed_pieces(&self) -> usize {
+        self.completed_pieces
+    }
+    fn is_paused(&self) -> bool {
+        self.is_paused
+    }
+}
+
+#[derive(Debug)]
+pub struct LibtorrentMigrationResult {
+    pub found: Vec<LibtorrentTorrentEntry>,
+    pub migrated: usize,
+    pub errors: Vec<String>,
+}
+
+/// Which libtorrent-embedding client's on-disk layout to scan — see the module doc for why
+/// qBittorrent and Deluge share one parser instead of each getting their own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LibtorrentClient {
+    QBittorrent,
+    Deluge,
+}
+
+impl LibtorrentClient {
+    pub fn label(self) -> &'static str {
+        match self {
+            LibtorrentClient::QBittorrent => "qBittorrent",
+            LibtorrentClient::Deluge => "Deluge",
+        }
+    }
+}
+
+/// Automatically discovers qBittorrent's `BT_backup` directory (where it keeps a `.torrent` +
+/// `.fastresume` pair per torrent) based on standard OS locations.
+pub fn default_qbittorrent_dir() -> Option<PathBuf> {
+    if let Ok(home) = std::env::var("HOME") {
+        let home_path = PathBuf::from(home);
+        let mac_dir = home_path.join("Library/Application Support/QBittorrent/BT_backup");
+        if mac_dir.exists() {
+            return Some(mac_dir);
+        }
+        let linux_dir = home_path.join(".local/share/qBittorrent/BT_backup");
+        if linux_dir.exists() {
+            return Some(linux_dir);
+        }
+        // Pre-XDG-cleanup versions of qBittorrent used this path.
+        let linux_dir_legacy = home_path.join(".local/share/data/qBittorrent/BT_backup");
+        if linux_dir_legacy.exists() {
+            return Some(linux_dir_legacy);
+        }
+    }
+    None
+}
+
+/// Automatically discovers Deluge's `state` directory (where it keeps a `.torrent` +
+/// `.fastresume` pair per torrent, alongside its own separately-formatted `torrents.state` —
+/// not read here, since piece state/location/transfer stats all live in the fastresume half of
+/// the pair) based on standard OS locations.
+pub fn default_deluge_dir() -> Option<PathBuf> {
+    if let Ok(home) = std::env::var("HOME") {
+        let home_path = PathBuf::from(home);
+        let mac_dir = home_path.join("Library/Application Support/deluge/state");
+        if mac_dir.exists() {
+            return Some(mac_dir);
+        }
+        let linux_dir = home_path.join(".config/deluge/state");
+        if linux_dir.exists() {
+            return Some(linux_dir);
+        }
+    }
+    // Common Debian/Ubuntu deluged packaging: runs as its own user with this home directory.
+    let daemon_dir = PathBuf::from("/var/lib/deluge/.config/deluge/state");
+    if daemon_dir.exists() {
+        return Some(daemon_dir);
+    }
+    None
+}
+
+/// Parses a libtorrent `.fastresume` bencoded dictionary — the format qBittorrent and Deluge
+/// both write, since both embed libtorrent directly rather than each having its own resume
+/// format — and extracts download path, piece bitfield, and transfer stats.
+///
+/// Unlike Transmission's `.resume` bitfield (one *bit* per piece, matching the BitTorrent wire
+/// format), libtorrent's `pieces` entry is one *byte* per piece (0 = missing, nonzero = have).
+/// Getting this backwards silently reports a wrong-but-plausible-looking piece count instead of
+/// failing loudly, so it's called out here rather than left to be rediscovered later.
+pub fn parse_libtorrent_fastresume(
+    resume_bytes: &[u8],
+    total_pieces: usize,
+    prefer_qbt_save_path: bool,
+) -> Result<(PathBuf, Bitfield, u64, u64, bool, i64), String> {
+    let bencode = synapse_bencode::decode_buf(resume_bytes)
+        .map_err(|e| format!("Failed to parse fastresume bencode: {e}"))?;
+
+    let dict = match bencode {
+        BEncode::Dict(d) => d,
+        _ => return Err("fastresume file is not a bencoded dictionary".into()),
+    };
+
+    let get_str = |key: &[u8]| -> Option<String> {
+        dict.get(key).and_then(|v| match v {
+            BEncode::String(s) => String::from_utf8(s.clone()).ok(),
+            _ => None,
+        })
+    };
+    let get_int = |key: &[u8]| -> Option<i64> {
+        dict.get(key).and_then(|v| match v {
+            BEncode::Int(i) => Some(*i),
+            _ => None,
+        })
+    };
+
+    // qBittorrent >= 4.2 writes its own `qBt-savePath` alongside libtorrent's `save_path`, and
+    // prefers it internally when the two differ (its relocate/category handling can move a
+    // torrent without libtorrent's own field following along). Deluge has no such override.
+    let dest = if prefer_qbt_save_path {
+        get_str(b"qBt-savePath").or_else(|| get_str(b"save_path"))
+    } else {
+        get_str(b"save_path")
+    }
+    .unwrap_or_else(|| ".".to_string());
+    let download_dir = PathBuf::from(dest);
+
+    let uploaded = get_int(b"total_uploaded").unwrap_or(0).max(0) as u64;
+    let downloaded = get_int(b"total_downloaded").unwrap_or(0).max(0) as u64;
+    let is_paused = get_int(b"paused").unwrap_or(0) != 0;
+    let added_at = get_int(b"added_time").unwrap_or_else(|| {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64
+    });
+
+    let mut bitfield = Bitfield::new(total_pieces);
+    if let Some(BEncode::String(bytes)) = dict.get(b"pieces".as_slice()) {
+        for (idx, &state) in bytes.iter().enumerate() {
+            if idx < total_pieces && state != 0 {
+                bitfield.set(idx);
+            }
+        }
+    }
+
+    Ok((
+        download_dir,
+        bitfield,
+        uploaded,
+        downloaded,
+        is_paused,
+        added_at,
+    ))
+}
+
+/// Scans `source_dir` for a libtorrent-based client's `.torrent` + `.fastresume` pairs and
+/// migrates them to Synapse. Shared by both `migrate_qbittorrent` and `migrate_deluge` — see
+/// the module doc for why one scanner serves both.
+pub fn migrate_libtorrent_client(
+    client: LibtorrentClient,
+    source_dir: &Path,
+    synapse_torrents_dir: &Path,
+    dry_run: bool,
+) -> Result<LibtorrentMigrationResult, String> {
+    if !source_dir.exists() {
+        return Err(format!(
+            "{} directory not found: {}",
+            client.label(),
+            source_dir.display()
+        ));
+    }
+
+    let mut torrent_files: HashMap<String, (PathBuf, Info, Vec<u8>)> = HashMap::new();
+    let mut resume_files: HashMap<String, PathBuf> = HashMap::new();
+    let mut errors = Vec::new();
+
+    // qBittorrent and Deluge both keep the `.torrent` and `.fastresume` pair directly alongside
+    // each other in one directory (no Torrents/Resume split like Transmission).
+    if let Ok(entries) = std::fs::read_dir(source_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            match path.extension().and_then(|e| e.to_str()) {
+                Some("torrent") => {
+                    if let Ok(bytes) = std::fs::read(&path) {
+                        if let Ok(bencode) = synapse_bencode::decode_buf(&bytes) {
+                            if let Ok(info) = Info::from_persisted_bencode(bencode) {
+                                let hash_hex = hex::encode(info.hash);
+                                let stem = path
+                                    .file_stem()
+                                    .unwrap_or_default()
+                                    .to_string_lossy()
+                                    .to_string();
+                                torrent_files.insert(
+                                    hash_hex.clone(),
+                                    (path.clone(), info.clone(), bytes.clone()),
+                                );
+                                torrent_files.insert(stem, (path, info, bytes));
+                            }
+                        }
+                    }
+                }
+                Some("fastresume") => {
+                    let stem = path
+                        .file_stem()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string();
+                    resume_files.insert(stem, path);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut found_entries = Vec::new();
+    let mut processed_hashes = std::collections::HashSet::new();
+
+    for (key, (torrent_path, info, raw_bytes)) in &torrent_files {
+        let hash_hex = hex::encode(info.hash);
+        if processed_hashes.contains(&hash_hex) {
+            continue;
+        }
+        processed_hashes.insert(hash_hex.clone());
+
+        let total_pieces = info.pieces() as usize;
+        let mut download_dir = PathBuf::from(".");
+        let mut bitfield = Bitfield::new(total_pieces);
+        let mut uploaded = 0u64;
+        let mut downloaded = 0u64;
+        let mut is_paused = false;
+        let mut added_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+
+        let resume_path = resume_files
+            .get(key)
+            .or_else(|| resume_files.get(&hash_hex))
+            .or_else(|| {
+                let stem = torrent_path
+                    .file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+                resume_files.get(&stem)
+            });
+
+        if let Some(r_path) = resume_path {
+            if let Ok(r_bytes) = std::fs::read(r_path) {
+                match parse_libtorrent_fastresume(
+                    &r_bytes,
+                    total_pieces,
+                    client == LibtorrentClient::QBittorrent,
+                ) {
+                    Ok((d_dir, bf, ul, dl, paused, added)) => {
+                        download_dir = d_dir;
+                        bitfield = bf;
+                        uploaded = ul;
+                        downloaded = dl;
+                        is_paused = paused;
+                        added_at = added;
+                    }
+                    Err(e) => {
+                        errors.push(format!("Failed to parse fastresume for {}: {e}", info.name))
+                    }
+                }
+            }
+        }
+
+        let completed_pieces = bitfield.count_ones();
+        let bitfield_hex = hex::encode(bitfield.as_bytes());
+
+        found_entries.push(LibtorrentTorrentEntry {
+            name: info.name.clone(),
+            info_hash_hex: hash_hex,
+            download_dir,
+            total_size: info.total_len,
+            total_pieces,
+            completed_pieces,
+            uploaded_bytes: uploaded,
+            downloaded_bytes: downloaded,
+            is_paused,
+            added_at,
+            raw_bencode: raw_bytes.clone(),
+            bitfield_hex,
+        });
+    }
+
+    let mut migrated_count = 0;
+    if !dry_run {
+        let store = match SessionStore::new(synapse_torrents_dir) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                errors.push(format!(
+                    "Failed to initialize encrypted session store at {}: {e}",
+                    synapse_torrents_dir.display()
+                ));
+                None
+            }
+        };
+
+        for entry in &found_entries {
+            let ratio = if entry.downloaded_bytes > 0 {
+                Some(entry.uploaded_bytes as f32 / entry.downloaded_bytes as f32)
+            } else if entry.total_size > 0 && entry.uploaded_bytes > 0 {
+                Some(entry.uploaded_bytes as f32 / entry.total_size as f32)
+            } else {
+                Some(0.0)
+            };
+
+            let session_state = TorrentSessionState {
+                info_hash_hex: entry.info_hash_hex.clone(),
+                name: entry.name.clone(),
+                download_dir: entry.download_dir.to_string_lossy().to_string(),
+                bitfield_hex: entry.bitfield_hex.clone(),
+                total_pieces: entry.total_pieces,
+                total_size: entry.total_size,
+                uploaded_bytes: entry.uploaded_bytes,
+                downloaded_bytes: entry.downloaded_bytes,
+                added_at: entry.added_at,
+                is_paused: entry.is_paused,
+                ratio,
+                magnet_uri: None,
+                raw_bencode_hex: Some(hex::encode(&entry.raw_bencode)),
+                file_priorities: Vec::new(),
+                sequential: false,
+                tracker_override: None,
+            };
+
+            if let Some(ref s) = store {
+                match s.save_torrent(&session_state) {
+                    Ok(()) => migrated_count += 1,
+                    Err(e) => errors.push(format!(
+                        "Failed to save encrypted state for {}: {e}",
+                        entry.name
+                    )),
+                }
+            }
+        }
+    }
+
+    Ok(LibtorrentMigrationResult {
+        found: found_entries,
+        migrated: migrated_count,
+        errors,
+    })
+}
+
+pub fn migrate_qbittorrent(
+    qbittorrent_dir: &Path,
+    synapse_torrents_dir: &Path,
+    dry_run: bool,
+) -> Result<LibtorrentMigrationResult, String> {
+    migrate_libtorrent_client(
+        LibtorrentClient::QBittorrent,
+        qbittorrent_dir,
+        synapse_torrents_dir,
+        dry_run,
+    )
+}
+
+pub fn migrate_deluge(
+    deluge_dir: &Path,
+    synapse_torrents_dir: &Path,
+    dry_run: bool,
+) -> Result<LibtorrentMigrationResult, String> {
+    migrate_libtorrent_client(
+        LibtorrentClient::Deluge,
+        deluge_dir,
+        synapse_torrents_dir,
+        dry_run,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -460,5 +903,155 @@ mod tests {
         assert_eq!(loaded.download_dir, "/media/torrents");
         assert_eq!(loaded.total_pieces, 1);
         assert_eq!(loaded.downloaded_bytes, 16384);
+    }
+
+    #[test]
+    fn test_parse_libtorrent_fastresume_dictionary() {
+        let mut dict = BTreeMap::new();
+        dict.insert(
+            b"save_path".to_vec(),
+            BEncode::String(b"/data/downloads".to_vec()),
+        );
+        dict.insert(b"total_uploaded".to_vec(), BEncode::Int(2048000));
+        dict.insert(b"total_downloaded".to_vec(), BEncode::Int(10485760));
+        dict.insert(b"paused".to_vec(), BEncode::Int(1));
+        dict.insert(b"added_time".to_vec(), BEncode::Int(1690000000));
+        // 8 pieces, one byte each (libtorrent's format, not bit-packed like Transmission's):
+        // have, have, have, have, missing, missing, missing, missing.
+        dict.insert(
+            b"pieces".to_vec(),
+            BEncode::String(vec![1, 1, 1, 1, 0, 0, 0, 0]),
+        );
+
+        let mut buf = Vec::new();
+        BEncode::Dict(dict).encode(&mut buf).unwrap();
+
+        let (dest, bf, ul, dl, paused, added) =
+            parse_libtorrent_fastresume(&buf, 8, false).unwrap();
+        assert_eq!(dest, PathBuf::from("/data/downloads"));
+        assert_eq!(ul, 2048000);
+        assert_eq!(dl, 10485760);
+        assert!(paused);
+        assert_eq!(added, 1690000000);
+        assert_eq!(bf.count_ones(), 4);
+        assert!(bf.has(0));
+        assert!(bf.has(3));
+        assert!(!bf.has(4));
+    }
+
+    #[test]
+    fn qbittorrent_prefers_its_own_save_path_override_when_present() {
+        let mut dict = BTreeMap::new();
+        dict.insert(
+            b"save_path".to_vec(),
+            BEncode::String(b"/old/libtorrent/path".to_vec()),
+        );
+        dict.insert(
+            b"qBt-savePath".to_vec(),
+            BEncode::String(b"/new/qbittorrent/path".to_vec()),
+        );
+        dict.insert(b"pieces".to_vec(), BEncode::String(vec![1]));
+
+        let mut buf = Vec::new();
+        BEncode::Dict(dict.clone()).encode(&mut buf).unwrap();
+
+        let (dest, ..) = parse_libtorrent_fastresume(&buf, 1, true).unwrap();
+        assert_eq!(dest, PathBuf::from("/new/qbittorrent/path"));
+
+        // Deluge (and qBittorrent asked without the override) reads libtorrent's own field —
+        // there is no Deluge-specific save-path key to prefer.
+        let (dest, ..) = parse_libtorrent_fastresume(&buf, 1, false).unwrap();
+        assert_eq!(dest, PathBuf::from("/old/libtorrent/path"));
+    }
+
+    fn write_fake_libtorrent_torrent(dir: &std::path::Path, name: &str) -> (String, Vec<u8>) {
+        let mut info_dict = BTreeMap::new();
+        info_dict.insert(b"name".to_vec(), BEncode::String(name.as_bytes().to_vec()));
+        info_dict.insert(b"piece length".to_vec(), BEncode::Int(16384));
+        info_dict.insert(b"pieces".to_vec(), BEncode::String(vec![0u8; 20])); // 1 piece
+        info_dict.insert(b"length".to_vec(), BEncode::Int(16384));
+
+        let mut root_dict = BTreeMap::new();
+        root_dict.insert(b"info".to_vec(), BEncode::Dict(info_dict));
+
+        let mut torrent_bytes = Vec::new();
+        BEncode::Dict(root_dict).encode(&mut torrent_bytes).unwrap();
+
+        let info =
+            Info::from_bencode(synapse_bencode::decode_buf(&torrent_bytes).unwrap()).unwrap();
+        let hash_hex = hex::encode(info.hash);
+        std::fs::write(dir.join(format!("{hash_hex}.torrent")), &torrent_bytes).unwrap();
+        (hash_hex, torrent_bytes)
+    }
+
+    fn write_fake_fastresume(dir: &std::path::Path, hash_hex: &str, save_path: &str) {
+        let mut resume_dict = BTreeMap::new();
+        resume_dict.insert(
+            b"save_path".to_vec(),
+            BEncode::String(save_path.as_bytes().to_vec()),
+        );
+        resume_dict.insert(b"total_uploaded".to_vec(), BEncode::Int(5000));
+        resume_dict.insert(b"total_downloaded".to_vec(), BEncode::Int(16384));
+        resume_dict.insert(b"pieces".to_vec(), BEncode::String(vec![1])); // 1 piece, complete
+        let mut resume_bytes = Vec::new();
+        BEncode::Dict(resume_dict)
+            .encode(&mut resume_bytes)
+            .unwrap();
+        std::fs::write(dir.join(format!("{hash_hex}.fastresume")), &resume_bytes).unwrap();
+    }
+
+    #[test]
+    fn test_migrate_qbittorrent_end_to_end() {
+        let source_dir = TempDir::new().unwrap();
+        let synapse_dir = TempDir::new().unwrap();
+
+        let (hash_hex, _) = write_fake_libtorrent_torrent(source_dir.path(), "qbit_torrent");
+        write_fake_fastresume(source_dir.path(), &hash_hex, "/media/qbit");
+
+        let dry_res = migrate_qbittorrent(source_dir.path(), synapse_dir.path(), true).unwrap();
+        assert_eq!(dry_res.found.len(), 1);
+        assert_eq!(dry_res.migrated, 0);
+
+        let res = migrate_qbittorrent(source_dir.path(), synapse_dir.path(), false).unwrap();
+        assert_eq!(res.found.len(), 1);
+        assert_eq!(res.migrated, 1);
+        assert_eq!(res.found[0].completed_pieces, 1);
+
+        let store = SessionStore::new(synapse_dir.path()).unwrap();
+        let loaded = store.load_torrent(&hash_hex).unwrap().unwrap();
+        assert_eq!(loaded.name, "qbit_torrent");
+        assert_eq!(loaded.download_dir, "/media/qbit");
+        assert_eq!(loaded.downloaded_bytes, 16384);
+    }
+
+    #[test]
+    fn test_migrate_deluge_end_to_end() {
+        let source_dir = TempDir::new().unwrap();
+        let synapse_dir = TempDir::new().unwrap();
+
+        let (hash_hex, _) = write_fake_libtorrent_torrent(source_dir.path(), "deluge_torrent");
+        write_fake_fastresume(source_dir.path(), &hash_hex, "/media/deluge");
+
+        let res = migrate_deluge(source_dir.path(), synapse_dir.path(), false).unwrap();
+        assert_eq!(res.found.len(), 1);
+        assert_eq!(res.migrated, 1);
+
+        let store = SessionStore::new(synapse_dir.path()).unwrap();
+        let loaded = store.load_torrent(&hash_hex).unwrap().unwrap();
+        assert_eq!(loaded.name, "deluge_torrent");
+        assert_eq!(loaded.download_dir, "/media/deluge");
+    }
+
+    #[test]
+    fn missing_source_directory_is_a_clear_error_not_a_silent_empty_result() {
+        let synapse_dir = TempDir::new().unwrap();
+        let err = migrate_qbittorrent(
+            std::path::Path::new("/does/not/exist/anywhere"),
+            synapse_dir.path(),
+            true,
+        )
+        .unwrap_err();
+        assert!(err.contains("qBittorrent"));
+        assert!(err.contains("not found"));
     }
 }

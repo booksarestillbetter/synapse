@@ -168,7 +168,7 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
         <div class="daemon-info-card">
           <div><small>Engine:</small> <strong>Synapse 2.0</strong></div>
           <div><small>Peer ID:</small> <code>-SY2200-</code></div>
-          <div id="daemon-version"><small>Version:</small> 2.2.17</div>
+          <div id="daemon-version"><small>Version:</small> 2.2.18</div>
           <div id="daemon-dht"><small>DHT Nodes:</small> <span id="stat-dht-nodes">0</span></div>
         </div>
       </div>

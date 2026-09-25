@@ -1,6 +1,6 @@
 # Synapse 2.0
 [![Rust Build](https://github.com/booksarestillbetter/synapse/actions/workflows/rust.yml/badge.svg)](https://github.com/booksarestillbetter/synapse/actions/workflows/rust.yml)
-[![Version 2.2.17](https://img.shields.io/badge/version-2.2.17-blue.svg)](CHANGELOG.md)
+[![Version 2.2.18](https://img.shields.io/badge/version-2.2.18-blue.svg)](CHANGELOG.md)
 [![License: ISC](https://img.shields.io/badge/License-ISC-yellow.svg)](LICENSE)
 
 Synapse 2.0 is an ultra-high-performance, headless BitTorrent daemon built from the ground up in modern async Rust (Tokio/Tonic). It runs completely standalone as a **next-generation BitTorrent engine**, and its gRPC/REST control plane is built to be driven by any compatible media-management front-end that wants a high-scale retriever backend — see [`docs/CLIENT_PROTOCOLS_AND_SDK.md`](docs/CLIENT_PROTOCOLS_AND_SDK.md). Synapse ships with a lightweight built-in web interface (zero setup, embedded in the daemon binary — see below), or drive it with [**Conduit**](https://github.com/booksarestillbetter/conduit) (recommended) for the full multi-node, Arr-aware experience; any other front-end implementing the client contract works the same way.
@@ -226,14 +226,21 @@ synapsed create ./my-release -o my-release.torrent -t https://tracker.example/an
 
 The same is available over REST as `POST /api/v1/torrents/create` for content inside the download directory.
 
-### Migrating From Transmission
-Imports existing Transmission `.resume` and `.torrent` states into native Synapse encrypted sessions without re-downloading:
+### Migrating From Transmission, qBittorrent, or Deluge
+Imports existing torrent and resume state into native Synapse encrypted sessions without
+re-downloading. Each finds its source client's default directory automatically (`-t`/`-q`/`-d`
+to override); qBittorrent and Deluge both embed libtorrent and share one `.fastresume` parser,
+differing only in where they keep it and one qBittorrent-specific save-path override:
 ```bash
-# Dry run preview
+# Dry run preview (any of the three)
 cargo run --release -p synapsed -- migrate transmission --dry-run
+cargo run --release -p synapsed -- migrate qbittorrent --dry-run
+cargo run --release -p synapsed -- migrate deluge --dry-run
 
 # Execute migration
 cargo run --release -p synapsed -- migrate transmission
+cargo run --release -p synapsed -- migrate qbittorrent
+cargo run --release -p synapsed -- migrate deluge
 ```
 
 ### Running the Daemon

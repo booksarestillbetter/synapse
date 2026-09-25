@@ -3,6 +3,14 @@
 All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+## [2.2.18] - 2026-09-25
+
+### Added
+
+- **qBittorrent and Deluge migration importers** (`synapsed migrate qbittorrent`, `synapsed migrate deluge`): import existing torrents and resume state into native Synapse encrypted sessions without re-downloading, alongside the existing `migrate transmission`. Both clients embed libtorrent directly and write its `.fastresume` bencoded format, so they share one parser and scanner (`migrate::migrate_libtorrent_client`) — piece state there is one *byte* per piece (0/nonzero), not bit-packed like Transmission's `.resume`, which is called out in the parser's own docs since getting it backwards would silently report wrong piece counts instead of failing loudly. qBittorrent's `qBt-savePath` override is preferred over libtorrent's own `save_path` when present. The CLI's found/migrated summary table is now shared by all three importers via a small `MigratedTorrent` trait instead of being duplicated per client.
+
 ## [2.2.17] - 2026-09-24
 
 ### Added
