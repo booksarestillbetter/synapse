@@ -3,6 +3,12 @@
 All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [2.2.17] - 2026-09-24
+
+### Added
+
+- **Paranoid mode** (`[privacy].paranoid_mode`, off by default): a logging lockdown that suppresses every log line except daemon startup, each listener coming up (or failing to), and shutdown — no torrent names, hashes, peer addresses, tracker announces, file paths, or transfer stats reach the console, a log file, or syslog, however `[logging].level` or `RUST_LOG` are set (both are ignored while it's on). Enforced as a default-deny allowlist (only a dedicated `lifecycle` tracing target passes) rather than a denylist of individual log statements, so it isn't defeated by a new log line elsewhere that forgets to be careful about what it prints. `SYNAPSE_PARANOID_MODE` env var override. See [`docs/PARANOID_MODE.md`](docs/PARANOID_MODE.md).
+
 ## [2.2.16] - 2026-09-21
 
 Queue, picking, tracker and blocklist controls over gRPC, and three fixes found while adding them.
@@ -11,6 +17,13 @@ Queue, picking, tracker and blocklist controls over gRPC, and three fixes found 
 
 **Control API (gRPC)**
 - `MoveInQueue` (top, up, down, bottom), with a `queue_position` on every torrent in the list and its updates: position decides which queued torrent starts next when a download slot frees up. `SetSequentialDownload` per torrent (saved with the session), `ReannounceTorrents`, `ReplaceTrackers` (an empty list restores the torrent's own; saved with the session) and `ReloadIpFilter` (re-reads the configured CIDR list and blocklist file, returns the rule count). Each is listed by `GetCapabilities` (`queue_move_v1`, `sequential_download_v1`, `reannounce_v1`, `replace_trackers_v1`, `ip_filter_reload_v1`) so a manager can tell whether the daemon has it.
+
+**Post-completion scripts (`post_script`/`copy_script`)**
+- Now receive everything a completion instructions webhook does: `SYNAPSE_DOWNLOAD_DIR`, `SYNAPSE_FILE_COUNT`, `SYNAPSE_FILES` (newline-joined relative paths), `SYNAPSE_TRACKERS` (newline-joined announce URLs), and `SYNAPSE_EVENT_JSON` (the full completion event as JSON) — a script no longer has to guess at, or call back for, information synapse already had. New [`docs/POST_SCRIPTS.md`](docs/POST_SCRIPTS.md) documents every argument and variable with a working example; previously this hook wasn't documented anywhere outside the source.
+
+### Changed
+
+- **The lifecycle/staging/completion-instructions system is unambiguously independent of Conduit.** It always was at runtime — every completion option (`auto_hardlink`, `[lifecycle.instructions]`, `post_script`/`copy_script`) is separately optional and none of them fail, degrade, or do anything differently without Conduit or any other management app present — but the internal type names (`ConduitPlugin`, `ConduitLifecycleDispatcher`, `ConduitInstructionsPlugin`) and some doc/comparison-table wording said otherwise. Renamed to `StagingPlugin`, `LifecycleDispatcher`, and `InstructionsWebhookPlugin`; `docs/SYNAPSE_VS_TRANSMISSION_QBITTORRENT_DELUGE.md` and `docs/HACKING.md` no longer brand native, built-in features as "Conduit" features. Conduit remains one example of something you can point `[lifecycle.instructions]` at, and one example of a gRPC/REST client — never a requirement.
 
 ### Fixed
 

@@ -46,11 +46,11 @@ pub use fast_ext::compute_allowed_fast_set;
 pub use feed::{FeedManager, FeedStatus};
 pub use fs::get_available_disk_space;
 pub use hoffman::HoffmanWebSeed;
-pub use instructions::{ConduitInstructionsPlugin, InstructionsConfig};
+pub use instructions::{InstructionsConfig, InstructionsWebhookPlugin};
 pub use ipfilter::IpFilter;
 pub use lifecycle::{
-    CompletedFileInfo, ConduitLifecycleDispatcher, ConduitPlugin, LifecycleConfig, LifecycleError,
-    LifecyclePlugin, PostScriptPlugin, TorrentCompletedEvent,
+    CompletedFileInfo, LifecycleConfig, LifecycleDispatcher, LifecycleError, LifecyclePlugin,
+    PostScriptPlugin, StagingPlugin, TorrentCompletedEvent,
 };
 pub use local_webseed::LocalWebSeedResolver;
 pub use lsd::{DiscoveredLocalPeer, LsdManager};

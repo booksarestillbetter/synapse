@@ -67,7 +67,7 @@ async fn test_daemon_full_simulation_with_logging_and_syslog() {
     let disk = Arc::new(DiskEngine::auto().await);
     let peer_id = [0x53; 20];
     let session_store = Arc::new(synapse_engine::SessionStore::new(&session_dir).unwrap());
-    let lifecycle = Arc::new(synapse_engine::ConduitLifecycleDispatcher::new(
+    let lifecycle = Arc::new(synapse_engine::LifecycleDispatcher::new(
         synapse_engine::LifecycleConfig::default(),
     ));
 

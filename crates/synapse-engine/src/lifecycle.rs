@@ -1,9 +1,9 @@
-//! Conduit Dynamic Ingest & Lifecycle Execution Engine for Synapse 2.0.
+//! Post-download lifecycle & completion-processing engine for Synapse 2.0.
 //!
 //! Provides a pluggable post-processing pipeline (`LifecyclePlugin` trait):
-//! - `ConduitPlugin`: instant piece/torrent completion event dispatch, automatic payload
+//! - `StagingPlugin`: instant piece/torrent completion event dispatch, automatic payload
 //!   hardlinking into staging directories, and offline Write-Ahead Log (WAL) recording for reliable
-//!   event replay with Conduit.
+//!   event replay with an external consumer (e.g. a management app), if one is watching.
 //! - `PostScriptPlugin`: non-blocking execution of external post-processing scripts or copy-scripts
 //!   with rich environment variable and argument passing.
 
@@ -52,8 +52,9 @@ pub struct TorrentCompletedEvent {
     pub staged_path: Option<String>,
     pub timestamp_ms: i64,
     /// Announce URL(s) this torrent's tracker tier(s) list, host-and-scheme included — for
-    /// plugins that route by tracker (see `instructions::ConduitInstructionsPlugin`, which
-    /// mirrors conduit's own tracker-domain/regex media-type matching).
+    /// plugins that route by tracker (see `instructions::InstructionsWebhookPlugin`, which
+    /// mirrors the same tracker-domain/regex media-type matching a management app's own
+    /// routing rules would use).
     #[serde(default)]
     pub trackers: Vec<String>,
     #[serde(default)]
@@ -70,14 +71,14 @@ pub trait LifecyclePlugin: Send + Sync {
     ) -> Result<(), LifecycleError>;
 }
 
-/// Conduit Plugin: automates payload hardlinking and offline WAL persistence.
-pub struct ConduitPlugin {
+/// Staging plugin: automates payload hardlinking and offline WAL persistence.
+pub struct StagingPlugin {
     staging_dir: Option<PathBuf>,
     auto_hardlink: bool,
     wal_path: Option<PathBuf>,
 }
 
-impl ConduitPlugin {
+impl StagingPlugin {
     pub fn new(
         staging_dir: Option<PathBuf>,
         auto_hardlink: bool,
@@ -132,7 +133,7 @@ impl ConduitPlugin {
     }
 
     /// Hardlinks `src` to `dst`, falling back to a real copy across filesystem boundaries
-    /// (`EXDEV`) — crate-visible so `instructions::ConduitInstructionsPlugin` can reuse the same
+    /// (`EXDEV`) — crate-visible so `instructions::InstructionsWebhookPlugin` can reuse the same
     /// link-or-copy semantics for its own "post_cmd said hardlink" case instead of duplicating it.
     pub(crate) fn link_or_copy(src: &Path, dst: &Path) -> std::io::Result<()> {
         if let Some(parent) = dst.parent() {
@@ -213,9 +214,9 @@ impl ConduitPlugin {
 }
 
 #[async_trait]
-impl LifecyclePlugin for ConduitPlugin {
+impl LifecyclePlugin for StagingPlugin {
     fn name(&self) -> &str {
-        "conduit"
+        "staging"
     }
 
     async fn on_torrent_completed(
@@ -235,7 +236,12 @@ impl LifecyclePlugin for ConduitPlugin {
     }
 }
 
-/// Post-Script Plugin: invokes an external shell script, binary, or copy utility asynchronously upon completion.
+/// Post-Script Plugin: invokes an external shell script, binary, or copy utility asynchronously
+/// upon completion. Fully self-sufficient — every field of `TorrentCompletedEvent` reaches the
+/// script one way or another (individual `SYNAPSE_*` variables for the common ones, the full
+/// event as JSON in `SYNAPSE_EVENT_JSON` for anything else), so a script doesn't need to call
+/// back into synapse or any other service to learn what it needs to know. See
+/// `doc/POST_SCRIPTS.md` for the full reference and an example script.
 pub struct PostScriptPlugin {
     plugin_name: String,
     script_path: PathBuf,
@@ -274,6 +280,19 @@ impl LifecyclePlugin for PostScriptPlugin {
         );
 
         let staged = event.staged_path.clone().unwrap_or_default();
+        // Newline-joined, not comma-joined: a tracker URL's query string or a file's path can
+        // itself contain a comma, but BitTorrent paths and announce URLs can never contain a
+        // literal newline, so this splits back apart unambiguously in a shell script
+        // (`while IFS= read -r line; do ...; done <<< "$SYNAPSE_FILES"`).
+        let file_paths = event
+            .files
+            .iter()
+            .map(|f| f.path.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let trackers = event.trackers.join("\n");
+        let event_json = serde_json::to_string(event).unwrap_or_default();
+
         let status = tokio::process::Command::new(&self.script_path)
             .arg(&event.info_hash_hex)
             .arg(&event.name)
@@ -282,10 +301,15 @@ impl LifecyclePlugin for PostScriptPlugin {
             .arg(event.total_bytes.to_string())
             .env("SYNAPSE_INFO_HASH", &event.info_hash_hex)
             .env("SYNAPSE_TORRENT_NAME", &event.name)
+            .env("SYNAPSE_DOWNLOAD_DIR", &event.download_dir)
             .env("SYNAPSE_SOURCE_PATH", &event.source_path)
             .env("SYNAPSE_STAGED_PATH", &staged)
             .env("SYNAPSE_TOTAL_BYTES", event.total_bytes.to_string())
             .env("SYNAPSE_TIMESTAMP_MS", event.timestamp_ms.to_string())
+            .env("SYNAPSE_FILE_COUNT", event.files.len().to_string())
+            .env("SYNAPSE_FILES", file_paths)
+            .env("SYNAPSE_TRACKERS", trackers)
+            .env("SYNAPSE_EVENT_JSON", event_json)
             .status()
             .await;
 
@@ -325,25 +349,25 @@ pub struct LifecycleConfig {
     pub wal_path: Option<PathBuf>,
     pub post_script: Option<PathBuf>,
     pub copy_script: Option<PathBuf>,
-    /// `Some` registers `instructions::ConduitInstructionsPlugin`; `None` (the default) means
+    /// `Some` registers `instructions::InstructionsWebhookPlugin`; `None` (the default) means
     /// disabled — see that module for what it does.
     pub instructions: Option<crate::instructions::InstructionsConfig>,
 }
 
-pub struct ConduitLifecycleDispatcher {
-    conduit_plugin: Arc<ConduitPlugin>,
+pub struct LifecycleDispatcher {
+    staging_plugin: Arc<StagingPlugin>,
     plugins: Vec<Arc<dyn LifecyclePlugin>>,
 }
 
-impl ConduitLifecycleDispatcher {
+impl LifecycleDispatcher {
     pub fn new(config: LifecycleConfig) -> Self {
-        let conduit_plugin = Arc::new(ConduitPlugin::new(
+        let staging_plugin = Arc::new(StagingPlugin::new(
             config.staging_dir.clone(),
             config.auto_hardlink,
             config.wal_path.clone(),
         ));
 
-        let mut plugins: Vec<Arc<dyn LifecyclePlugin>> = vec![conduit_plugin.clone()];
+        let mut plugins: Vec<Arc<dyn LifecyclePlugin>> = vec![staging_plugin.clone()];
 
         if let Some(post_script) = config.post_script {
             plugins.push(Arc::new(PostScriptPlugin::new("post_script", post_script)));
@@ -353,12 +377,12 @@ impl ConduitLifecycleDispatcher {
         }
         if let Some(instructions_cfg) = config.instructions {
             plugins.push(Arc::new(
-                crate::instructions::ConduitInstructionsPlugin::new(instructions_cfg),
+                crate::instructions::InstructionsWebhookPlugin::new(instructions_cfg),
             ));
         }
 
         Self {
-            conduit_plugin,
+            staging_plugin,
             plugins,
         }
     }
@@ -393,9 +417,9 @@ impl ConduitLifecycleDispatcher {
         let source_path = download_dir.join(name);
         let mut staged_path: Option<String> = None;
 
-        // Perform staging hardlinks via conduit plugin
+        // Perform staging hardlinks via the staging plugin
         match self
-            .conduit_plugin
+            .staging_plugin
             .perform_hardlinks(download_dir, name, files)
         {
             Ok(Some(staged)) => {
@@ -444,13 +468,13 @@ impl ConduitLifecycleDispatcher {
         Ok(event)
     }
 
-    /// Access the underlying ConduitPlugin for WAL drainage.
-    pub fn conduit_plugin(&self) -> &ConduitPlugin {
-        &self.conduit_plugin
+    /// Access the underlying StagingPlugin for WAL drainage.
+    pub fn staging_plugin(&self) -> &StagingPlugin {
+        &self.staging_plugin
     }
 
     /// Reads and clears unacknowledged records from the offline WAL.
     pub fn drain_wal(&self) -> std::io::Result<Vec<TorrentCompletedEvent>> {
-        self.conduit_plugin.drain_wal()
+        self.staging_plugin.drain_wal()
     }
 }

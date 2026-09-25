@@ -219,6 +219,7 @@ For privacy-conscious operators, logging should be minimal, controllable, and le
 
 - **Configurable Log Levels**: Use standard `RUST_LOG` filtering (`warn`, `info`, `debug`, `trace`). Running with `RUST_LOG=warn` or `RUST_LOG=error` suppresses all routine transfer details.
 - **No Persistent File Logging by Default**: `synapsed` logs to standard output/standard error, allowing container runtimes (Docker, Podman) or system service managers (`systemd-journald`) to enforce log retention and rotation according to your local privacy policies.
+- **Paranoid Mode** (`[privacy].paranoid_mode`, off by default): a stricter guarantee than a low log level — a default-deny allowlist that logs only daemon startup, listeners coming up (or failing to), and shutdown, overriding `RUST_LOG`/`[logging].level` entirely. No torrent name, info hash, peer address, tracker announce, or transfer detail can reach any configured log sink (console, file, or syslog) while it's on, including from code added after this was written — see `docs/PARANOID_MODE.md`.
 - **Pull-Based Metrics**: Synapse exposes Prometheus metrics on `/metrics` (when `[http_api]` is enabled). Metrics are strictly pull-based—Synapse never pushes metrics to external servers.
 
 ---
@@ -236,6 +237,7 @@ For privacy-conscious operators, logging should be minimal, controllable, and le
 | **Data in Transit** | **MSE / PE Message Stream Encryption (RC4-drop1024 + Diffie-Hellman)** |
 | **Private Torrents (BEP 27)** | **Hardcoded isolation: DHT disabled, PEX disabled, LSD disabled** |
 | **Passkey Logging** | **Automatic redaction (`passkey=[REDACTED]`) in all logs/metrics** |
+| **Paranoid Mode** | **Default-deny logging allowlist: startup/listener/shutdown only, `[privacy].paranoid_mode`** |
 | **IP Filtering** | **Native IPv4/IPv6 CIDR and range blocklist engine** |
 | **Control Plane Auth** | **Constant-time Bearer Token validation** |
 | **Default Listen Bindings** | **Strictly `127.0.0.1` localhost** |

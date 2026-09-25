@@ -1,13 +1,13 @@
-//! "Ask conduit where this goes" completion plugin — an in-process replacement for the
-//! Transmission `script-torrent-done-filename` + copy2queue.py/.pl hook conduit already
-//! generates for other clients (see conduit's `GET /api/sync/hook-script` and
-//! `src/api/sync_routes.rs::classify_file`/`notify_download`). Instead of conduit generating a
-//! shell script that gets exec'd, synapse makes the same two HTTP calls itself and performs
-//! the file placement in-process.
+//! "Ask a server where this goes" completion plugin — an in-process replacement for the older
+//! pattern of a management app generating a Transmission `script-torrent-done-filename` +
+//! copy2queue.py/.pl hook that calls back into the app's API (Conduit's own
+//! `GET /api/sync/hook-script` and `src/api/sync_routes.rs::classify_file`/`notify_download`
+//! are one such implementation). Instead of a script being generated and exec'd, synapse makes
+//! the same two HTTP calls itself and performs the file placement in-process.
 //!
-//! The wire contract (what synapse sends, what it expects back) isn't conduit-specific — see
-//! `doc/COMPLETION_INSTRUCTIONS.md` for the full spec if you're pointing this at something
-//! other than conduit.
+//! The wire contract (what synapse sends, what it expects back) is open and documented, not
+//! tied to any one server — see `doc/COMPLETION_INSTRUCTIONS.md` for the full spec. Point it at
+//! Conduit, or at your own server that implements the same two routes.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -16,7 +16,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info, warn};
 
-use crate::lifecycle::{ConduitPlugin, LifecycleError, LifecyclePlugin, TorrentCompletedEvent};
+use crate::lifecycle::{LifecycleError, LifecyclePlugin, StagingPlugin, TorrentCompletedEvent};
 
 #[derive(Debug, Clone)]
 pub struct InstructionsConfig {
@@ -91,7 +91,7 @@ impl FileOp {
             std::fs::create_dir_all(parent)?;
         }
         match self {
-            FileOp::Hardlink => ConduitPlugin::link_or_copy(src, dst),
+            FileOp::Hardlink => StagingPlugin::link_or_copy(src, dst),
             FileOp::Copy => {
                 std::fs::copy(src, dst)?;
                 Ok(())
@@ -109,12 +109,12 @@ impl FileOp {
     }
 }
 
-pub struct ConduitInstructionsPlugin {
+pub struct InstructionsWebhookPlugin {
     http: reqwest::Client,
     config: InstructionsConfig,
 }
 
-impl ConduitInstructionsPlugin {
+impl InstructionsWebhookPlugin {
     pub fn new(config: InstructionsConfig) -> Self {
         let http = reqwest::Client::builder()
             .timeout(config.timeout)
@@ -177,9 +177,9 @@ impl ConduitInstructionsPlugin {
         let req = self.authed(self.http.post(&url).json(&body));
         if let Err(e) = req.send().await {
             // Non-fatal: file placement already happened by the time this runs, this is just
-            // telling conduit about it for its own event log / notifications.
+            // telling the server about it for its own event log / notifications.
             warn!(
-                "conduit_instructions: notify-download failed (file already placed): {}",
+                "completion_instructions: notify-download failed (file already placed): {}",
                 e
             );
         }
@@ -213,9 +213,9 @@ impl ConduitInstructionsPlugin {
 }
 
 #[async_trait]
-impl LifecyclePlugin for ConduitInstructionsPlugin {
+impl LifecyclePlugin for InstructionsWebhookPlugin {
     fn name(&self) -> &str {
-        "conduit_instructions"
+        "completion_instructions"
     }
 
     async fn on_torrent_completed(
@@ -228,7 +228,7 @@ impl LifecyclePlugin for ConduitInstructionsPlugin {
                 match self.place_files(event, Path::new(&resp.target_dir), op) {
                     Ok(final_path) => {
                         info!(
-                            "conduit_instructions: placed '{}' into {} (queue={}, op={:?})",
+                            "completion_instructions: placed '{}' into {} (queue={}, op={:?})",
                             event.name, resp.target_dir, resp.queue, op
                         );
                         self.notify(
@@ -241,7 +241,7 @@ impl LifecyclePlugin for ConduitInstructionsPlugin {
                     }
                     Err(e) => {
                         error!(
-                            "conduit_instructions: failed to place '{}' into {}: {}",
+                            "completion_instructions: failed to place '{}' into {}: {}",
                             event.name, resp.target_dir, e
                         );
                         return Err(LifecycleError::Staging(e.to_string()));
@@ -250,21 +250,21 @@ impl LifecyclePlugin for ConduitInstructionsPlugin {
             }
             Ok(_) => {
                 debug!(
-                    "conduit_instructions: classify returned no target_dir for '{}', leaving at {}",
+                    "completion_instructions: classify returned no target_dir for '{}', leaving at {}",
                     event.name, event.download_dir
                 );
             }
             Err(e) => match &self.config.fallback_dir {
                 Some(fallback) => {
                     warn!(
-                        "conduit_instructions: {} unreachable ({}), falling back to {}",
+                        "completion_instructions: {} unreachable ({}), falling back to {}",
                         self.config.url,
                         e,
                         fallback.display()
                     );
                     if let Err(e) = self.place_files(event, fallback, FileOp::Hardlink) {
                         error!(
-                            "conduit_instructions: fallback placement into {} also failed: {}",
+                            "completion_instructions: fallback placement into {} also failed: {}",
                             fallback.display(),
                             e
                         );
@@ -272,7 +272,7 @@ impl LifecyclePlugin for ConduitInstructionsPlugin {
                 }
                 None => {
                     warn!(
-                        "conduit_instructions: {} unreachable ({}), leaving '{}' at {}",
+                        "completion_instructions: {} unreachable ({}), leaving '{}' at {}",
                         self.config.url, e, event.name, event.download_dir
                     );
                 }

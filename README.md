@@ -1,6 +1,6 @@
 # Synapse 2.0
 [![Rust Build](https://github.com/booksarestillbetter/synapse/actions/workflows/rust.yml/badge.svg)](https://github.com/booksarestillbetter/synapse/actions/workflows/rust.yml)
-[![Version 2.2.1](https://img.shields.io/badge/version-2.2.1-blue.svg)](CHANGELOG.md)
+[![Version 2.2.17](https://img.shields.io/badge/version-2.2.17-blue.svg)](CHANGELOG.md)
 [![License: ISC](https://img.shields.io/badge/License-ISC-yellow.svg)](LICENSE)
 
 Synapse 2.0 is an ultra-high-performance, headless BitTorrent daemon built from the ground up in modern async Rust (Tokio/Tonic). It runs completely standalone as a **next-generation BitTorrent engine**, and its gRPC/REST control plane is built to be driven by any compatible media-management front-end that wants a high-scale retriever backend — see [`docs/CLIENT_PROTOCOLS_AND_SDK.md`](docs/CLIENT_PROTOCOLS_AND_SDK.md). Synapse ships with a lightweight built-in web interface (zero setup, embedded in the daemon binary — see below), or drive it with [**Conduit**](https://github.com/booksarestillbetter/conduit) (recommended) for the full multi-node, Arr-aware experience; any other front-end implementing the client contract works the same way.
@@ -120,6 +120,8 @@ synapse/
 │   ├── CLIENT_PROTOCOLS_AND_SDK.md # Client SDK reference (Rust, Go, Python, TS), REST API & Swagger
 │   ├── COMPLETION_INSTRUCTIONS.md # Wire spec for completion webhook placement
 │   ├── HACKING.md              # Contributor & developer guide (quality gates, invariants)
+│   ├── PARANOID_MODE.md        # Logging lockdown: what's still logged, what's suppressed, why
+│   ├── POST_SCRIPTS.md         # Post-completion script hook: args, env vars, example script
 │   ├── RPC.md                  # Control plane wire specification & Protobuf canonical schema
 │   ├── SCALING_50K_TORRENTS.md # 50k swarm scale design and implementation breakdown
 │   └── SESSION_SETTINGS.md     # Session settings, in-flight dynamic adjustment & Transmission parity
@@ -277,6 +279,8 @@ docker compose up -d
 
 The image auto-seeds `/etc/synapse/synapse.toml` from `example_config.toml` on first run if
 nothing is mounted there. See [`docs/CLIENT_PROTOCOLS_AND_SDK.md`](docs/CLIENT_PROTOCOLS_AND_SDK.md)
-for how to connect a control-plane client once it's running, and
+for how to connect a control-plane client once it's running,
 [`docs/COMPLETION_INSTRUCTIONS.md`](docs/COMPLETION_INSTRUCTIONS.md) for the optional
-completion-webhook contract.
+completion-webhook contract, and [`docs/POST_SCRIPTS.md`](docs/POST_SCRIPTS.md) for running your
+own script on completion instead — all three (plus plain hardlinking) are independent, optional,
+and need no management app to work.

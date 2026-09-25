@@ -18,6 +18,7 @@ use synapse_rpc::{EventBus, SynapseService};
 
 mod inspect;
 mod logging;
+use logging::LIFECYCLE_TARGET;
 mod migrate;
 
 #[derive(Parser)]
@@ -488,15 +489,15 @@ async fn main() -> std::process::ExitCode {
 
     tune_system_limits();
 
-    tracing::info!("🐕 Synapse 2.0 Daemon starting...");
+    tracing::info!(target: LIFECYCLE_TARGET, "🐕 Synapse 2.0 Daemon starting...");
 
     // Initialize Zero-Copy Disk Engine
     let disk = Arc::new(DiskEngine::auto_with_max_open_files(config.disk.max_open_files).await);
     if let Err(e) = startup_self_check(&disk, &config.disk.session_dir).await {
-        tracing::error!("disk engine startup self-check failed: {e}");
+        tracing::error!(target: LIFECYCLE_TARGET, "disk engine startup self-check failed: {e}");
         return std::process::ExitCode::FAILURE;
     }
-    tracing::info!("✅ Storage subsystem verified (io_uring / direct I/O active)");
+    tracing::info!(target: LIFECYCLE_TARGET, "✅ Storage subsystem verified (io_uring / direct I/O active)");
 
     // Generate local daemon peer_id: -SY2200-<12 random bytes>
     // INVARIANT: Synapse follows strict Azureus-style BEP 20 identification (-SY2200-).
@@ -505,11 +506,11 @@ async fn main() -> std::process::ExitCode {
     // or client spoofing. Changes to this prefix must only occur upon engine version bumps.
     let peer_id = synapse_engine::generate_peer_id();
 
-    // Initialize Session Store and Conduit Lifecycle Dispatcher
+    // Initialize Session Store and Lifecycle Dispatcher
     let session_store = match synapse_engine::SessionStore::new(&config.disk.session_dir) {
         Ok(s) => Arc::new(s),
         Err(e) => {
-            tracing::error!("failed to initialize session store: {e}");
+            tracing::error!(target: LIFECYCLE_TARGET, "failed to initialize session store: {e}");
             return std::process::ExitCode::FAILURE;
         }
     };
@@ -517,7 +518,7 @@ async fn main() -> std::process::ExitCode {
     let instructions_cfg = &config.lifecycle.instructions;
     let instructions = match (instructions_cfg.enabled, instructions_cfg.url.clone()) {
         (true, Some(url)) if !url.trim().is_empty() => {
-            tracing::info!("📡 Completion instructions webhook enabled: {}", url);
+            tracing::info!(target: LIFECYCLE_TARGET, "📡 Completion instructions webhook enabled: {}", url);
             Some(synapse_engine::InstructionsConfig {
                 url,
                 token: instructions_cfg.token.clone(),
@@ -527,7 +528,7 @@ async fn main() -> std::process::ExitCode {
             })
         }
         (true, _) => {
-            tracing::warn!("[lifecycle.instructions] enabled = true but no url configured — instructions webhook disabled");
+            tracing::warn!(target: LIFECYCLE_TARGET, "[lifecycle.instructions] enabled = true but no url configured — instructions webhook disabled");
             None
         }
         (false, _) => None,
@@ -545,9 +546,7 @@ async fn main() -> std::process::ExitCode {
         copy_script: config.lifecycle.copy_script.clone(),
         instructions,
     };
-    let lifecycle = Arc::new(synapse_engine::ConduitLifecycleDispatcher::new(
-        lifecycle_config,
-    ));
+    let lifecycle = Arc::new(synapse_engine::LifecycleDispatcher::new(lifecycle_config));
 
     let dynamic_settings = settings_from_config(&config);
 
@@ -573,9 +572,9 @@ async fn main() -> std::process::ExitCode {
         if let Some(ref dir) = config.signing.trusted_signers_dir {
             let (store, problems) = synapse_meta::TrustStore::load_dir(dir);
             for p in problems {
-                tracing::warn!("BEP 35 trust store: {p}");
+                tracing::warn!(target: LIFECYCLE_TARGET, "BEP 35 trust store: {p}");
             }
-            tracing::info!("BEP 35: {} trusted signer(s) loaded", store.len());
+            tracing::info!(target: LIFECYCLE_TARGET, "BEP 35: {} trusted signer(s) loaded", store.len());
             trust = store;
         }
         swarm_builder =
@@ -588,8 +587,12 @@ async fn main() -> std::process::ExitCode {
     let swarm = Arc::new(swarm_builder);
     for source in search_sources {
         match swarm.search_manager().add_source(&source).await {
-            Ok(engine) => tracing::info!("BEP 18: search engine '{}' loaded", engine.short_name),
-            Err(e) => tracing::warn!("BEP 18: could not load search engine {source}: {e}"),
+            Ok(engine) => {
+                tracing::info!(target: LIFECYCLE_TARGET, "BEP 18: search engine '{}' loaded", engine.short_name)
+            }
+            Err(e) => {
+                tracing::warn!(target: LIFECYCLE_TARGET, "BEP 18: could not load search engine {source}: {e}")
+            }
         }
     }
 
@@ -617,10 +620,11 @@ async fn main() -> std::process::ExitCode {
         for entry in &config.network.bind_interfaces {
             match entry.parse::<std::net::IpAddr>() {
                 Ok(ip) if ip.is_ipv6() && !config.network.enable_ipv6 => {
-                    tracing::info!("Skipping IPv6 bind_interfaces entry {entry}: enable_ipv6 is false");
+                    tracing::info!(target: LIFECYCLE_TARGET, "Skipping IPv6 bind_interfaces entry {entry}: enable_ipv6 is false");
                 }
                 Ok(ip) => listen_addrs.push(SocketAddr::new(ip, config.network.listen_port)),
                 Err(_) => tracing::warn!(
+                    target: LIFECYCLE_TARGET,
                     "bind_interfaces entry {entry:?} is not an IP address and is ignored (interface names are not supported)"
                 ),
             }
@@ -633,20 +637,21 @@ async fn main() -> std::process::ExitCode {
     for addr in listen_addrs.iter().filter(|_| !force_proxy) {
         match swarm.clone().start_listener(*addr).await {
             Ok(_) => {
-                tracing::info!("📡 SwarmEngine listener active on {}", addr);
+                tracing::info!(target: LIFECYCLE_TARGET, "📡 SwarmEngine listener active on {}", addr);
                 bound_any = true;
             }
             Err(e) if addr.is_ipv6() => {
                 tracing::debug!("IPv6 listener unavailable on {} ({})", addr, e);
             }
             Err(e) => {
-                tracing::warn!("Could not bind BitTorrent listen address {}: {}", addr, e);
+                tracing::warn!(target: LIFECYCLE_TARGET, "Could not bind BitTorrent listen address {}: {}", addr, e);
             }
         }
     }
 
     if !bound_any {
         tracing::error!(
+            target: LIFECYCLE_TARGET,
             "Failed to bind any BitTorrent listen port (port {})",
             config.network.listen_port
         );
@@ -658,11 +663,14 @@ async fn main() -> std::process::ExitCode {
     let _session_choker_handle = swarm.clone().start_session_choker_loop();
 
     if force_proxy {
-        tracing::info!("proxy.force_proxy: no listener, DHT, LSD, zeroconf, uTP or port mapping");
+        tracing::info!(target: LIFECYCLE_TARGET, "proxy.force_proxy: no listener, DHT, LSD, zeroconf, uTP or port mapping");
     } else {
         match swarm.clone().start_lsd().await {
-            Ok(_) => tracing::info!("📡 Local Peer Discovery (LSD) active"),
+            Ok(_) => {
+                tracing::info!(target: LIFECYCLE_TARGET, "📡 Local Peer Discovery (LSD) active")
+            }
             Err(e) => tracing::warn!(
+                target: LIFECYCLE_TARGET,
                 "Could not start Local Peer Discovery (LSD): {} (continuing without it)",
                 e
             ),
@@ -672,8 +680,11 @@ async fn main() -> std::process::ExitCode {
     if config.network.enable_zeroconf {
         if let Ok(group) = synapse_engine::zeroconf::MDNS_IPV4.parse() {
             match swarm.clone().start_zeroconf(group).await {
-                Ok(_) => tracing::info!("📡 Zeroconf (BEP 26) peer discovery active"),
+                Ok(_) => {
+                    tracing::info!(target: LIFECYCLE_TARGET, "📡 Zeroconf (BEP 26) peer discovery active")
+                }
                 Err(e) => tracing::warn!(
+                    target: LIFECYCLE_TARGET,
                     "Could not start Zeroconf discovery (BEP 26): {e} (continuing without it)"
                 ),
             }
@@ -681,19 +692,25 @@ async fn main() -> std::process::ExitCode {
     }
 
     if config.privacy.disable_dht_globally {
-        tracing::info!("DHT disabled via privacy.disable_dht_globally -- not starting a DHT node");
+        tracing::info!(target: LIFECYCLE_TARGET, "DHT disabled via privacy.disable_dht_globally -- not starting a DHT node");
     } else {
         // DHT conventionally shares the same port number as the TCP peer listener (just UDP).
         let dht_bind = SocketAddr::from(([0, 0, 0, 0], config.network.listen_port));
         match swarm.clone().start_dht(dht_bind).await {
-            Ok(addr) => tracing::info!("📡 DHT (Kademlia) node active on {}", addr),
-            Err(e) => tracing::warn!("Could not start DHT node: {} (continuing without it)", e),
+            Ok(addr) => {
+                tracing::info!(target: LIFECYCLE_TARGET, "📡 DHT (Kademlia) node active on {}", addr)
+            }
+            Err(e) => {
+                tracing::warn!(target: LIFECYCLE_TARGET, "Could not start DHT node: {} (continuing without it)", e)
+            }
         }
     }
 
     match swarm.restore_session() {
-        Ok(count) => tracing::info!("Restored {} active torrent swarms from session", count),
-        Err(e) => tracing::warn!("Failed to restore session swarms: {e}"),
+        Ok(count) => {
+            tracing::info!(target: LIFECYCLE_TARGET, "Restored {} active torrent swarms from session", count)
+        }
+        Err(e) => tracing::warn!(target: LIFECYCLE_TARGET, "Failed to restore session swarms: {e}"),
     }
 
     // Initialize Event Bus and gRPC Control Plane
@@ -798,6 +815,7 @@ async fn main() -> std::process::ExitCode {
         let mut shutdown_rx = shutdown_rx.clone();
         tokio::spawn(async move {
             tracing::info!(
+                target: LIFECYCLE_TARGET,
                 "📰 BEP 36 RSS feed poller active (interval: {:?})",
                 poll_interval
             );
@@ -822,6 +840,7 @@ async fn main() -> std::process::ExitCode {
             Ok(addr) => addr,
             Err(e) => {
                 tracing::error!(
+                    target: LIFECYCLE_TARGET,
                     "Invalid RPC listen address {}: {}",
                     config.rpc.listen_addr,
                     e
@@ -844,7 +863,7 @@ async fn main() -> std::process::ExitCode {
 
         let mut grpc_shutdown = shutdown_rx.clone();
         tokio::spawn(async move {
-            tracing::info!("⚡ gRPC Control Plane listening on http://{}", rpc_addr);
+            tracing::info!(target: LIFECYCLE_TARGET, "⚡ gRPC Control Plane listening on http://{}", rpc_addr);
             let shutdown_signal = async move {
                 while grpc_shutdown.changed().await.is_ok() {
                     if *grpc_shutdown.borrow() {
@@ -857,7 +876,7 @@ async fn main() -> std::process::ExitCode {
                 .serve_with_shutdown(rpc_addr, shutdown_signal)
                 .await
             {
-                tracing::error!("gRPC server error: {}", e);
+                tracing::error!(target: LIFECYCLE_TARGET, "gRPC server error: {}", e);
             }
         });
     }
@@ -898,16 +917,17 @@ async fn main() -> std::process::ExitCode {
                 metrics_enabled,
                 web_config,
             );
-            tracing::info!("🌐 REST API & Web Server listening on http://{}", http_addr);
+            tracing::info!(target: LIFECYCLE_TARGET, "🌐 REST API & Web Server listening on http://{}", http_addr);
             if web_enabled {
-                tracing::info!("   - Web Interface:          http://{}/", http_addr);
+                tracing::info!(target: LIFECYCLE_TARGET, "   - Web Interface:          http://{}/", http_addr);
             }
             tracing::info!(
+                target: LIFECYCLE_TARGET,
                 "   - Interactive Swagger UI: http://{}/swagger-ui",
                 http_addr
             );
             if metrics_enabled {
-                tracing::info!("   - Prometheus Metrics:     http://{}/metrics", http_addr);
+                tracing::info!(target: LIFECYCLE_TARGET, "   - Prometheus Metrics:     http://{}/metrics", http_addr);
             }
 
             match tokio::net::TcpListener::bind(http_addr).await {
@@ -923,11 +943,11 @@ async fn main() -> std::process::ExitCode {
                         .with_graceful_shutdown(shutdown_signal)
                         .await
                     {
-                        tracing::error!("HTTP server error: {}", e);
+                        tracing::error!(target: LIFECYCLE_TARGET, "HTTP server error: {}", e);
                     }
                 }
                 Err(e) => {
-                    tracing::error!("Failed to bind HTTP API address {}: {}", http_addr, e);
+                    tracing::error!(target: LIFECYCLE_TARGET, "Failed to bind HTTP API address {}: {}", http_addr, e);
                 }
             }
         });
@@ -941,7 +961,7 @@ async fn main() -> std::process::ExitCode {
         let dl_dir = config.disk.download_dir.clone();
         let mut watch_shutdown = shutdown_rx.clone();
         tokio::spawn(async move {
-            tracing::info!("👀 Watch directory active on {}", watch_dir.display());
+            tracing::info!(target: LIFECYCLE_TARGET, "👀 Watch directory active on {}", watch_dir.display());
             let imported_dir = watch_dir.join(".imported");
             let failed_dir = watch_dir.join(".failed");
             let _ = tokio::fs::create_dir_all(&imported_dir).await;
@@ -1064,13 +1084,14 @@ async fn main() -> std::process::ExitCode {
         });
     }
 
-    tracing::info!("🚀 Synapse 2.0 ready. Standing by for commands and swarm connections.");
+    tracing::info!(target: LIFECYCLE_TARGET, "🚀 Synapse 2.0 ready. Standing by for commands and swarm connections.");
 
     wait_for_shutdown_or_reload(swarm.clone(), args.config.clone()).await;
 
     let _ = shutdown_tx.send(true);
 
     tracing::info!(
+        target: LIFECYCLE_TARGET,
         "Shutting down: stopping torrent actors and flushing state to disk (5s timeout)..."
     );
     let shutdown_future = async {
@@ -1085,9 +1106,9 @@ async fn main() -> std::process::ExitCode {
         .await
         .is_err()
     {
-        tracing::warn!("⚠️ Graceful shutdown timed out after 5s — forcing process exit.");
+        tracing::warn!(target: LIFECYCLE_TARGET, "⚠️ Graceful shutdown timed out after 5s — forcing process exit.");
     } else {
-        tracing::info!("✅ Session state flushed successfully. Daemon shutdown complete.");
+        tracing::info!(target: LIFECYCLE_TARGET, "✅ Session state flushed successfully. Daemon shutdown complete.");
     }
 
     std::process::ExitCode::SUCCESS
@@ -1107,28 +1128,28 @@ async fn wait_for_shutdown_or_reload(swarm: Arc<SwarmEngine>, config_path: Optio
         loop {
             tokio::select! {
                 _ = sigterm.recv() => {
-                    tracing::info!("Received SIGTERM (Docker/systemd stop signal). Initiating graceful shutdown...");
+                    tracing::info!(target: LIFECYCLE_TARGET, "Received SIGTERM (Docker/systemd stop signal). Initiating graceful shutdown...");
                     break;
                 }
                 _ = sigint.recv() => {
-                    tracing::info!("Received SIGINT (Ctrl+C). Initiating graceful shutdown...");
+                    tracing::info!(target: LIFECYCLE_TARGET, "Received SIGINT (Ctrl+C). Initiating graceful shutdown...");
                     break;
                 }
                 _ = sigquit.recv() => {
-                    tracing::info!("Received SIGQUIT. Initiating graceful shutdown...");
+                    tracing::info!(target: LIFECYCLE_TARGET, "Received SIGQUIT. Initiating graceful shutdown...");
                     break;
                 }
                 _ = sighup.recv() => {
-                    tracing::info!("🔄 Received SIGHUP. Reloading configuration from disk...");
+                    tracing::info!(target: LIFECYCLE_TARGET, "🔄 Received SIGHUP. Reloading configuration from disk...");
                     let cfg_res = Config::load(config_path.as_deref());
                     match cfg_res {
                         Ok(new_cfg) => {
                             let new_dynamic = settings_from_config(&new_cfg);
                             swarm.update_settings(new_dynamic);
-                            tracing::info!("✅ Configuration and rate limits reloaded successfully via SIGHUP");
+                            tracing::info!(target: LIFECYCLE_TARGET, "✅ Configuration and rate limits reloaded successfully via SIGHUP");
                         }
                         Err(e) => {
-                            tracing::error!("Failed to reload configuration on SIGHUP: {e}");
+                            tracing::error!(target: LIFECYCLE_TARGET, "Failed to reload configuration on SIGHUP: {e}");
                         }
                     }
                 }
@@ -1139,9 +1160,9 @@ async fn wait_for_shutdown_or_reload(swarm: Arc<SwarmEngine>, config_path: Optio
     #[cfg(not(unix))]
     {
         if let Err(e) = tokio::signal::ctrl_c().await {
-            tracing::error!("Failed to listen for shutdown signal: {e}");
+            tracing::error!(target: LIFECYCLE_TARGET, "Failed to listen for shutdown signal: {e}");
         } else {
-            tracing::info!("Received shutdown signal. Initiating graceful shutdown...");
+            tracing::info!(target: LIFECYCLE_TARGET, "Received shutdown signal. Initiating graceful shutdown...");
         }
     }
 }
@@ -1196,6 +1217,7 @@ fn tune_system_limits() {
                 }
                 if libc::setrlimit(libc::RLIMIT_NOFILE, &updated) == 0 {
                     tracing::info!(
+                        target: LIFECYCLE_TARGET,
                         "🚀 Tuned RLIMIT_NOFILE: soft limit raised from {} to {}",
                         rlim.rlim_cur,
                         target_limit
@@ -1211,6 +1233,7 @@ fn tune_system_limits() {
                         updated.rlim_max = rlim.rlim_max;
                         if libc::setrlimit(libc::RLIMIT_NOFILE, &updated) == 0 {
                             tracing::info!(
+                                target: LIFECYCLE_TARGET,
                                 "🚀 Tuned RLIMIT_NOFILE: soft limit raised from {} to {}",
                                 rlim.rlim_cur,
                                 fallback
@@ -1218,6 +1241,7 @@ fn tune_system_limits() {
                         } else {
                             let err = std::io::Error::last_os_error();
                             tracing::warn!(
+                                target: LIFECYCLE_TARGET,
                                 "⚠️ Failed to raise RLIMIT_NOFILE to {}: {} (current: {})",
                                 fallback,
                                 err,

@@ -16,7 +16,7 @@ use synapse_picker::Bitfield;
 use crate::announcer::{AnnounceScheduler, Announcer, TrackerReport};
 use crate::circuit_breaker::PeerCircuitBreaker;
 use crate::ipfilter::IpFilter;
-use crate::lifecycle::ConduitLifecycleDispatcher;
+use crate::lifecycle::LifecycleDispatcher;
 use crate::lsd::LsdManager;
 use crate::peer::{accept_router_indexed, PeerEvent};
 use crate::queue::{QueueAction, QueueConfig, QueueManager};
@@ -607,7 +607,7 @@ pub struct SwarmEngine {
     peer_id: [u8; 20],
     listen_port: Arc<RwLock<u16>>,
     session_store: Option<Arc<SessionStore>>,
-    lifecycle: Option<Arc<ConduitLifecycleDispatcher>>,
+    lifecycle: Option<Arc<LifecycleDispatcher>>,
     download_bucket: Arc<TokenBucket>,
     upload_bucket: Arc<TokenBucket>,
     circuit_breaker: Arc<PeerCircuitBreaker>,
@@ -971,7 +971,7 @@ impl SwarmEngine {
         self
     }
 
-    pub fn with_lifecycle(mut self, lifecycle: Arc<ConduitLifecycleDispatcher>) -> Self {
+    pub fn with_lifecycle(mut self, lifecycle: Arc<LifecycleDispatcher>) -> Self {
         self.lifecycle = Some(lifecycle);
         self
     }
@@ -1367,7 +1367,7 @@ impl SwarmEngine {
             tokio::spawn(async move {
                 if complete_rx.await.is_ok() {
                     info!(
-                        "Torrent {} completed! Triggering Conduit lifecycle dispatcher",
+                        "Torrent {} completed! Triggering lifecycle dispatcher",
                         info_clone.name
                     );
                     let mut trackers: Vec<String> = Vec::new();
@@ -1700,7 +1700,7 @@ impl SwarmEngine {
         self.session_store.as_ref()
     }
 
-    pub fn lifecycle(&self) -> Option<&Arc<ConduitLifecycleDispatcher>> {
+    pub fn lifecycle(&self) -> Option<&Arc<LifecycleDispatcher>> {
         self.lifecycle.as_ref()
     }
 

@@ -442,6 +442,13 @@ pub struct PrivacyConfig {
     pub prefer_private_safe_defaults: bool,
     pub mask_passkeys_in_logs: bool,
     pub disable_dht_globally: bool,
+    /// "Tinfoil hat" mode: suppresses every log line except daemon startup, each listener
+    /// coming up (or failing to), and shutdown — no torrent names, hashes, peer addresses,
+    /// tracker announces, transfer stats, or errors that mention any of those, regardless of
+    /// `[logging].level` or `RUST_LOG` (both are ignored while this is on). See
+    /// `docs/PARANOID_MODE.md`. Off by default — this is a deliberate, restart-required opt-in,
+    /// not a general log-noise reducer (use `[logging].level` for that).
+    pub paranoid_mode: bool,
 }
 
 impl Default for PrivacyConfig {
@@ -450,6 +457,7 @@ impl Default for PrivacyConfig {
             prefer_private_safe_defaults: true,
             mask_passkeys_in_logs: true,
             disable_dht_globally: false,
+            paranoid_mode: false,
         }
     }
 }
@@ -1240,6 +1248,11 @@ impl Config {
                 self.privacy.disable_dht_globally = b;
             }
         }
+        if let Ok(val) = std::env::var("SYNAPSE_PARANOID_MODE") {
+            if let Ok(b) = val.parse::<bool>() {
+                self.privacy.paranoid_mode = b;
+            }
+        }
     }
 }
 
@@ -1345,6 +1358,18 @@ mod tests {
         std::env::remove_var("SYNAPSE_DOWNLOAD_QUEUE_SIZE");
         std::env::remove_var("SYNAPSE_ALT_SPEED_ENABLED");
         std::env::remove_var("SYNAPSE_ALT_SPEED_DOWN");
+    }
+
+    #[test]
+    fn paranoid_mode_is_off_by_default_and_settable_via_env() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(!Config::default().privacy.paranoid_mode);
+
+        let mut cfg = Config::default();
+        std::env::set_var("SYNAPSE_PARANOID_MODE", "true");
+        cfg.apply_env_overrides();
+        assert!(cfg.privacy.paranoid_mode);
+        std::env::remove_var("SYNAPSE_PARANOID_MODE");
     }
 
     #[test]

@@ -20,7 +20,7 @@ This document provides an in-depth technical comparison between **Synapse 2.0**,
 | **Disk Subsystem** | `io_uring` + asynchronous worker pool with FD pooling | POSIX pread/pwrite threadpool | `libtorrent` disk cache with memory-mapped or POSIX I/O | `libtorrent` disk cache |
 | **Bitfield Storage** | Roaring Bitmaps + run-length encoding (~130 B / cold swarm) | Dense byte arrays / `std::vector<bool>` | Dense byte arrays in `libtorrent::torrent` | Dense byte arrays wrapped in Python objects |
 | **Session Persistence** | Embedded encrypted `redb` (ChaCha20-Poly1305 AEAD) | Flat `.resume` bencoded files in directory | Fastresume bencoded files or SQLite database | Pickle / JSON state files |
-| **Enterprise Automation** | Integrated Conduit post-processing, atomic hardlinks, webhooks | External `script-torrent-done-filename` | External "Run external program on completion" | Python plugins (Execute, AutoAdd) |
+| **Enterprise Automation** | Native post-processing: atomic hardlinks, completion scripts, instructions webhook | External `script-torrent-done-filename` | External "Run external program on completion" | Python plugins (Execute, AutoAdd) |
 | **Built-in Web Interface** | **Embedded Zero-Dep WebUI** (TransGUI / qBittorrent layout) | Built-in WebUI | Built-in WebUI | WebUI via plugin / separate port |
 
 ---
@@ -161,7 +161,7 @@ Memory (RSS) at 50,000 Torrents:
 | gRPC / Protocol Buffers | ✅ HTTP/2 gRPC | ❌ No | ❌ No | ❌ No |
 | Delta Streaming Sync | ✅ Bidirectional | ❌ Polling only | ⚠️ RID Polling | ❌ Full Broadcast |
 | Native JSON-RPC Endpoint | ✅ Built-in | ✅ Primary | ❌ WebAPI REST | ❌ Twisted PB |
-| Conduit Lifecycle / Hardlink Automation | ✅ Native Built-in | ❌ External script | ❌ External script | ⚠️ Plugin |
+| Lifecycle / Hardlink Automation | ✅ Native Built-in | ❌ External script | ❌ External script | ⚠️ Plugin |
 
 ---
 
@@ -170,7 +170,7 @@ Memory (RSS) at 50,000 Torrents:
 ### Choose **Synapse 2.0** when:
 - **Massive Swarm Density**: You seed 2,000 to 100,000+ torrents on a single host or VPS with strict memory constraints.
 - **Headless Cloud & Cluster Environments**: You need a modern, cloud-native daemon with robust gRPC APIs, low CPU footprint, and zero-overhead delta streaming.
-- **Automated Media Pipelines**: You require native atomic hardlinking, deduplication, and lifecycle webhooks (Conduit) without fragile shell scripts.
+- **Automated Media Pipelines**: You require native atomic hardlinking, deduplication, and lifecycle webhooks — built in, no management app required — without fragile shell scripts.
 - **Zero-Trust Security**: You require encrypted session states, safe logging without passkey leakage, and memory safety.
 
 ### Choose **Transmission** when:

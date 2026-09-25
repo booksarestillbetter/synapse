@@ -19,9 +19,30 @@ use tracing_subscriber::layer::Context;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{fmt, EnvFilter, Layer};
 
+/// The `tracing` target every startup/listener/shutdown log line in `main.rs` uses. Paranoid
+/// mode's allowlist (below) names this target precisely rather than trying to enumerate every
+/// individual call site, so anything added later that doesn't explicitly opt in stays silenced.
+pub const LIFECYCLE_TARGET: &str = "lifecycle";
+
+/// The `EnvFilter` directive `init_logging` builds, factored out as a pure function so its
+/// logic is unit-testable — `EnvFilter`/`tracing`'s global subscriber can only be installed
+/// once per process, which rules out testing `init_logging` itself directly.
+fn filter_directive(config: &Config) -> String {
+    if config.privacy.paranoid_mode {
+        // Default-deny: nothing is enabled except the lifecycle target at info. This
+        // deliberately ignores RUST_LOG and [logging].level entirely — paranoid mode must not
+        // be silently reopened by an environment variable left over from a debugging session,
+        // and a log line elsewhere that isn't careful about what it prints still can't leak
+        // through an allowlist it was never added to.
+        format!("off,{LIFECYCLE_TARGET}=info")
+    } else {
+        std::env::var("RUST_LOG").unwrap_or_else(|_| config.logging.level.as_filter().to_string())
+    }
+}
+
 /// Initializes the global tracing subscriber according to daemon configuration.
 pub fn init_logging(config: &Config) {
-    let filter = EnvFilter::try_from_default_env()
+    let filter = EnvFilter::try_new(filter_directive(config))
         .unwrap_or_else(|_| EnvFilter::new(config.logging.level.as_filter()));
 
     // 1. Console Layer
@@ -77,6 +98,18 @@ pub fn init_logging(config: &Config) {
         (None, None) => {
             registry.init();
         }
+    }
+
+    if config.privacy.paranoid_mode {
+        // Emitted after `.init()` (a tracing event dispatched before the global subscriber is
+        // installed goes nowhere) so this confirmation is itself the proof paranoid mode took
+        // effect — if this line doesn't show up, nothing configured after it will either.
+        tracing::info!(
+            target: LIFECYCLE_TARGET,
+            "🕶️  Paranoid mode active: only startup, listener and shutdown events are logged \
+             — no torrent, peer, tracker or transfer detail. RUST_LOG and [logging].level are \
+             ignored while this is on."
+        );
     }
 }
 
@@ -203,11 +236,48 @@ fn chrono_timestamp() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    // filter_directive reads RUST_LOG, a process-global env var; serialize against
+    // `cargo test`'s default parallelism the same way synapse-config's own env-var tests do.
+    static ENV_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_chrono_timestamp_format() {
         let ts = chrono_timestamp();
         assert!(ts.ends_with('Z'));
         assert!(ts.contains('.'));
+    }
+
+    #[test]
+    fn paranoid_mode_ignores_rust_log_and_the_configured_level() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("RUST_LOG", "trace");
+
+        let mut config = Config::default();
+        config.privacy.paranoid_mode = true;
+        config.logging.level = synapse_config::LogLevel::Trace;
+
+        assert_eq!(
+            filter_directive(&config),
+            format!("off,{LIFECYCLE_TARGET}=info")
+        );
+
+        std::env::remove_var("RUST_LOG");
+    }
+
+    #[test]
+    fn without_paranoid_mode_rust_log_wins_over_the_configured_level_when_set() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("RUST_LOG");
+
+        let mut config = Config::default();
+        config.logging.level = synapse_config::LogLevel::Warn;
+        assert_eq!(filter_directive(&config), "warn");
+
+        std::env::set_var("RUST_LOG", "debug");
+        assert_eq!(filter_directive(&config), "debug");
+
+        std::env::remove_var("RUST_LOG");
     }
 }
