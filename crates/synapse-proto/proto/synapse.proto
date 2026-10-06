@@ -150,6 +150,12 @@ message TorrentSummary {
   uint32 piece_count = 15;
   uint32 piece_size = 16;
   uint32 queue_position = 17; // 0 is next in line to start
+  // Host (and port, when non-default) of each tracker the torrent announces to, deduplicated.
+  // Hosts only — never full announce URLs, which usually carry the user's passkey. Lets a
+  // manager group/filter its torrent list by tracker without a detail call per torrent.
+  // Carried by snapshots and "added" events; not by TorrentDelta (trackers rarely change, and
+  // a change is re-sent as an "added" event).
+  repeated string tracker_hosts = 18;
 }
 
 message TorrentDelta {

@@ -5,6 +5,13 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+## [2.2.19] - 2026-10-05
+
+### Added
+
+- **`TorrentSummary.tracker_hosts`** (proto field 18): the host (plus port, when non-default) of every tracker a torrent announces to, deduplicated and sorted, carried in the list stream's snapshots and "added" events. A manager can now group or filter its torrent list by tracker without a `SubscribeTorrentDetail` call per torrent — Conduit's Fetchers sidebar tracker list and tracker filter previously came up empty for a Synapse node for exactly that reason. **Hosts only, never announce URLs**: those usually carry the user's passkey, and this stream is polled every second and fanned out to every connected UI. Additive and backward compatible — an older client ignores the field, and a client talking to an older daemon just sees it empty.
+  - Read from the engine's live tracker reports once per torrent when it first appears, re-read whenever the list is empty (announce data not in yet), and refreshed about once a minute after that — not on every one-second sync tick. `TorrentDelta` deliberately has no tracker field (trackers rarely change); a changed host list is re-sent as a fresh "added" event, which subscribers already treat as replace-by-hash.
+
 ## [2.2.18] - 2026-09-25
 
 ### Added

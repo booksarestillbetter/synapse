@@ -17,7 +17,11 @@ pub struct SynapseService {
     session_stats: Arc<parking_lot::RwLock<SessionStatsUpdate>>,
     swarm_engine: Option<Arc<synapse_engine::SwarmEngine>>,
     auth_token: Option<String>,
+    sync_tick: Arc<std::sync::atomic::AtomicU64>,
 }
+
+/// `sync_from_engine` runs once a second; re-read every torrent's tracker hosts this often.
+const TRACKER_HOSTS_REFRESH_TICKS: u64 = 60;
 
 impl SynapseService {
     pub fn new(event_bus: Arc<EventBus>) -> Self {
@@ -39,6 +43,7 @@ impl SynapseService {
             active_summaries: Arc::new(DashMap::new()),
             session_stats: Arc::new(parking_lot::RwLock::new(default_stats)),
             swarm_engine: None,
+            sync_tick: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             auth_token: None,
         }
     }
@@ -98,6 +103,7 @@ impl SynapseService {
         };
         let live = engine.list_torrents();
         let positions = engine.queue_positions();
+        let tick = self.sync_tick.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut seen = std::collections::HashSet::with_capacity(live.len());
 
         for stats in &live {
@@ -107,11 +113,34 @@ impl SynapseService {
             new_summary.queue_position = positions.get(&stats.info_hash).copied().unwrap_or(0);
 
             let existing = self.active_summaries.get(&hash).map(|r| r.value().clone());
+
+            // Tracker hosts barely ever change, so don't recompute them every tick: reuse the
+            // last value, and re-read when it's empty (announce data not in yet), on a slow
+            // cadence, or for a brand-new torrent.
+            let refresh_hosts = tick % TRACKER_HOSTS_REFRESH_TICKS == 0
+                || existing.as_ref().map_or(true, |o| o.tracker_hosts.is_empty());
+            new_summary.tracker_hosts = match (&existing, refresh_hosts) {
+                (Some(old), false) => old.tracker_hosts.clone(),
+                _ => {
+                    let reports = engine.get_tracker_reports(&stats.info_hash);
+                    tracker_hosts_from_urls(reports.iter().map(|r| r.url.as_str()))
+                }
+            };
+
             match existing {
                 Some(old) => {
-                    if let Some(delta) = diff_summary(&old, &new_summary) {
-                        self.active_summaries.insert(hash, new_summary);
+                    let hosts_changed = old.tracker_hosts != new_summary.tracker_hosts;
+                    let delta = diff_summary(&old, &new_summary);
+                    if delta.is_some() || hosts_changed {
+                        self.active_summaries.insert(hash, new_summary.clone());
+                    }
+                    if let Some(delta) = delta {
                         self.event_bus.record_delta(delta);
+                    }
+                    // `TorrentDelta` has no tracker field; a changed host list goes out as a
+                    // fresh "added" event, which subscribers treat as replace-by-hash.
+                    if hosts_changed {
+                        self.event_bus.emit_summary_added(new_summary);
                     }
                 }
                 None => self.upsert_torrent(new_summary),
@@ -195,7 +224,27 @@ fn swarm_stats_to_summary(s: &synapse_engine::SwarmStats) -> TorrentSummary {
         piece_count: s.piece_count,
         piece_size: s.piece_size,
         queue_position: 0,
+        tracker_hosts: Vec::new(),
     }
+}
+
+/// Distinct tracker hosts (`host[:port]`, never the path/query where passkeys live) for a
+/// torrent's announce URLs, in a stable order.
+fn tracker_hosts_from_urls<'a>(urls: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let mut hosts: Vec<String> = urls
+        .into_iter()
+        .filter_map(|raw| {
+            let u = url::Url::parse(raw.trim()).ok()?;
+            let host = u.host_str()?;
+            Some(match u.port() {
+                Some(port) => format!("{host}:{port}"),
+                None => host.to_string(),
+            })
+        })
+        .collect();
+    hosts.sort();
+    hosts.dedup();
+    hosts
 }
 
 /// Decodes a 40-character hex info hash.
@@ -822,6 +871,8 @@ impl SynapseControl for SynapseService {
             piece_count,
             piece_size,
             queue_position: 0,
+            // Filled in by the next `sync_from_engine` pass (announce data isn't known yet).
+            tracker_hosts: Vec::new(),
         };
 
         self.upsert_torrent(summary);
@@ -1360,5 +1411,22 @@ impl SynapseControl for SynapseService {
         Ok(Response::new(ReloadIpFilterResponse {
             rules: rules as u32,
         }))
+    }
+}
+
+#[cfg(test)]
+mod tracker_host_tests {
+    use super::tracker_hosts_from_urls;
+
+    #[test]
+    fn hosts_only_deduplicated_and_never_the_passkey() {
+        let hosts = tracker_hosts_from_urls([
+            "https://tracker.example.org/abc123PASSKEY/announce",
+            "https://tracker.example.org/other/announce?passkey=zzz",
+            "udp://open.tracker.net:6969/announce",
+            "not a url",
+        ]);
+        assert_eq!(hosts, vec!["open.tracker.net:6969".to_string(), "tracker.example.org".to_string()]);
+        assert!(hosts.iter().all(|h| !h.contains("PASSKEY") && !h.contains("zzz")));
     }
 }
