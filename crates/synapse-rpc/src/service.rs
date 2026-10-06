@@ -103,7 +103,9 @@ impl SynapseService {
         };
         let live = engine.list_torrents();
         let positions = engine.queue_positions();
-        let tick = self.sync_tick.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tick = self
+            .sync_tick
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut seen = std::collections::HashSet::with_capacity(live.len());
 
         for stats in &live {
@@ -117,8 +119,8 @@ impl SynapseService {
             // Tracker hosts barely ever change, so don't recompute them every tick: reuse the
             // last value, and re-read when it's empty (announce data not in yet), on a slow
             // cadence, or for a brand-new torrent.
-            let refresh_hosts = tick % TRACKER_HOSTS_REFRESH_TICKS == 0
-                || existing.as_ref().map_or(true, |o| o.tracker_hosts.is_empty());
+            let refresh_hosts = tick.is_multiple_of(TRACKER_HOSTS_REFRESH_TICKS)
+                || existing.as_ref().is_none_or(|o| o.tracker_hosts.is_empty());
             new_summary.tracker_hosts = match (&existing, refresh_hosts) {
                 (Some(old), false) => old.tracker_hosts.clone(),
                 _ => {
@@ -1426,7 +1428,15 @@ mod tracker_host_tests {
             "udp://open.tracker.net:6969/announce",
             "not a url",
         ]);
-        assert_eq!(hosts, vec!["open.tracker.net:6969".to_string(), "tracker.example.org".to_string()]);
-        assert!(hosts.iter().all(|h| !h.contains("PASSKEY") && !h.contains("zzz")));
+        assert_eq!(
+            hosts,
+            vec![
+                "open.tracker.net:6969".to_string(),
+                "tracker.example.org".to_string()
+            ]
+        );
+        assert!(hosts
+            .iter()
+            .all(|h| !h.contains("PASSKEY") && !h.contains("zzz")));
     }
 }
