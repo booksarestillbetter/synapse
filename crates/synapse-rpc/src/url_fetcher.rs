@@ -66,25 +66,28 @@ pub async fn fetch_or_parse_torrent(url_or_magnet: &str) -> Result<Info, FetchTo
     }
 
     // 2. Local File Path Fast-Path
-    let resolved_path = if let Some(subpath) = trimmed.strip_prefix("~/") {
-        if let Some(home) = std::env::var_os("HOME") {
-            let mut p = std::path::PathBuf::from(home);
-            p.push(subpath);
-            p
+    if !trimmed.starts_with("http://") && !trimmed.starts_with("https://") {
+        let resolved_path = if let Some(subpath) = trimmed.strip_prefix("~/") {
+            if let Some(home) = std::env::var_os("HOME") {
+                let mut p = std::path::PathBuf::from(home);
+                p.push(subpath);
+                p
+            } else {
+                std::path::PathBuf::from(trimmed)
+            }
         } else {
             std::path::PathBuf::from(trimmed)
-        }
-    } else {
-        std::path::PathBuf::from(trimmed)
-    };
+        };
 
-    if resolved_path.is_file() {
-        let bytes = read_torrent_file(&resolved_path).await?;
-        let bencode = synapse_bencode::decode(&mut bytes.as_slice())
-            .map_err(|e| FetchTorrentError::BencodeDecode(format!("Invalid local bencode: {e}")))?;
-        return Info::from_bencode(bencode).map_err(|e| {
-            FetchTorrentError::Metadata(format!("Failed to parse local torrent metadata: {e}"))
-        });
+        if resolved_path.is_file() {
+            let bytes = read_torrent_file(&resolved_path).await?;
+            let bencode = synapse_bencode::decode(&mut bytes.as_slice()).map_err(|e| {
+                FetchTorrentError::BencodeDecode(format!("Invalid local bencode: {e}"))
+            })?;
+            return Info::from_bencode(bencode).map_err(|e| {
+                FetchTorrentError::Metadata(format!("Failed to parse local torrent metadata: {e}"))
+            });
+        }
     }
 
     // 2. HTTP/HTTPS URL Validation

@@ -120,7 +120,7 @@ fn verify_resume_bitfield(
 const AUTO_MANAGE_STARTUP: Duration = Duration::from_secs(120);
 
 /// Inbound connections allowed to sit mid-handshake at once.
-const MAX_PENDING_HANDSHAKES: usize = 256;
+const MAX_PENDING_HANDSHAKES: usize = 64;
 
 /// Connections accepted beyond `max_global_peers` before new ones are refused pre-handshake
 /// (libtorrent's `connections_limit` slack).
@@ -3031,6 +3031,7 @@ impl SwarmEngine {
                     }
                     Err(e) => {
                         warn!("Error accepting inbound peer connection: {}", e);
+                        tokio::time::sleep(Duration::from_millis(100)).await;
                     }
                 }
             }

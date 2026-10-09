@@ -24,7 +24,7 @@ async fn flood_of_silent_connections_is_capped_at_the_pending_handshake_limit() 
 
     // Open well over the limit without ever sending a handshake.
     let mut socks = Vec::new();
-    for _ in 0..400 {
+    for _ in 0..120 {
         socks.push(TcpStream::connect(addr).await.unwrap());
     }
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -40,11 +40,11 @@ async fn flood_of_silent_connections_is_capped_at_the_pending_handshake_limit() 
         }
     }
     assert!(
-        closed >= 400 - 256 - 5,
+        closed >= 120 - 64 - 5,
         "expected the excess connections to be refused, only {closed} were"
     );
     assert!(
-        closed < 400,
+        closed < 120,
         "connections within the limit must be allowed to wait for a handshake"
     );
 }
