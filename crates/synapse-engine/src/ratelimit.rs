@@ -3,6 +3,7 @@
 //! Provides lockless and async token-bucket rate limiting for global and per-swarm
 //! upload and download bandwidth management.
 
+use crate::atomic_compat::FetchUpdateCompat;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
@@ -106,7 +107,7 @@ impl TokenBucket {
             // plain load/store here could overwrite (lose) a concurrent consumption.
             let _ = self
                 .tokens
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |t| {
+                .fetch_update_compat(Ordering::Relaxed, Ordering::Relaxed, |t| {
                     Some((t + added_tokens).min(cap))
                 });
 
@@ -151,7 +152,7 @@ impl TokenBucket {
         let cap = self.capacity_bytes.load(Ordering::Relaxed) as i64;
         let _ = self
             .tokens
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |t| {
+            .fetch_update_compat(Ordering::Relaxed, Ordering::Relaxed, |t| {
                 Some((t + bytes as i64).min(cap.max(t)))
             });
     }

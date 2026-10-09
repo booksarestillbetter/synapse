@@ -3,6 +3,7 @@
 //! struct + `CIO` trait + `amy`-based event loop (see `doc/REWRITE_ROADMAP.md` Part 1)
 //! with a plain tokio task that `select!`s between peer events and a periodic tick.
 
+use crate::atomic_compat::FetchUpdateCompat;
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::path::PathBuf;
@@ -801,7 +802,7 @@ impl Torrent {
             }
         }
         if let Some(ref m) = self.global_metrics {
-            let _ = m.active_actors.fetch_update(
+            let _ = m.active_actors.fetch_update_compat(
                 std::sync::atomic::Ordering::Relaxed,
                 std::sync::atomic::Ordering::Relaxed,
                 |v| Some(v.saturating_sub(1)),

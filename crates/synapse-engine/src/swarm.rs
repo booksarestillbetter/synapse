@@ -1,3 +1,4 @@
+use crate::atomic_compat::FetchUpdateCompat;
 use dashmap::DashMap;
 use parking_lot::{Mutex, RwLock};
 use std::net::SocketAddr;
@@ -233,73 +234,73 @@ impl GlobalEngineMetrics {
     }
 
     pub fn record_remove(&self, s: &SwarmStats) {
-        let _ = self
-            .total_torrents
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                Some(v.saturating_sub(1))
-            });
         let _ =
-            self.total_downloaded_bytes
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                    Some(v.saturating_sub(s.downloaded_bytes))
+            self.total_torrents
+                .fetch_update_compat(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                    Some(v.saturating_sub(1))
                 });
-        let _ = self
-            .total_uploaded_bytes
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                Some(v.saturating_sub(s.uploaded_bytes))
-            });
-        let _ = self
-            .global_download_rate
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                Some(v.saturating_sub(s.download_rate))
-            });
-        let _ = self
-            .global_upload_rate
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                Some(v.saturating_sub(s.upload_rate))
-            });
-        let _ =
-            self.global_peers_connected
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                    Some(v.saturating_sub(s.peers_connected))
-                });
+        let _ = self.total_downloaded_bytes.fetch_update_compat(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |v| Some(v.saturating_sub(s.downloaded_bytes)),
+        );
+        let _ = self.total_uploaded_bytes.fetch_update_compat(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |v| Some(v.saturating_sub(s.uploaded_bytes)),
+        );
+        let _ = self.global_download_rate.fetch_update_compat(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |v| Some(v.saturating_sub(s.download_rate)),
+        );
+        let _ = self.global_upload_rate.fetch_update_compat(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |v| Some(v.saturating_sub(s.upload_rate)),
+        );
+        let _ = self.global_peers_connected.fetch_update_compat(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |v| Some(v.saturating_sub(s.peers_connected)),
+        );
 
         match s.state {
             SwarmState::Downloading => {
-                let _ = self.downloading_count.fetch_update(
+                let _ = self.downloading_count.fetch_update_compat(
                     Ordering::Relaxed,
                     Ordering::Relaxed,
                     |v| Some(v.saturating_sub(1)),
                 );
             }
             SwarmState::Seeding => {
-                let _ =
-                    self.seeding_count
-                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                            Some(v.saturating_sub(1))
-                        });
+                let _ = self.seeding_count.fetch_update_compat(
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                    |v| Some(v.saturating_sub(1)),
+                );
             }
             SwarmState::Queued => {
-                let _ = self
-                    .queued_count
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                        Some(v.saturating_sub(1))
-                    });
+                let _ = self.queued_count.fetch_update_compat(
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                    |v| Some(v.saturating_sub(1)),
+                );
             }
             SwarmState::Stopped => {
-                let _ = self
-                    .paused_count
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                        Some(v.saturating_sub(1))
-                    });
+                let _ = self.paused_count.fetch_update_compat(
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                    |v| Some(v.saturating_sub(1)),
+                );
             }
             _ => {
                 if s.tier == SwarmTier::Cold {
-                    let _ =
-                        self.paused_count
-                            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                                Some(v.saturating_sub(1))
-                            });
+                    let _ = self.paused_count.fetch_update_compat(
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                        |v| Some(v.saturating_sub(1)),
+                    );
                 }
             }
         }
@@ -311,32 +312,32 @@ impl GlobalEngineMetrics {
         }
         match old_state {
             SwarmState::Downloading => {
-                let _ = self.downloading_count.fetch_update(
+                let _ = self.downloading_count.fetch_update_compat(
                     Ordering::Relaxed,
                     Ordering::Relaxed,
                     |v| Some(v.saturating_sub(1)),
                 );
             }
             SwarmState::Seeding => {
-                let _ =
-                    self.seeding_count
-                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                            Some(v.saturating_sub(1))
-                        });
+                let _ = self.seeding_count.fetch_update_compat(
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                    |v| Some(v.saturating_sub(1)),
+                );
             }
             SwarmState::Queued => {
-                let _ = self
-                    .queued_count
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                        Some(v.saturating_sub(1))
-                    });
+                let _ = self.queued_count.fetch_update_compat(
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                    |v| Some(v.saturating_sub(1)),
+                );
             }
             SwarmState::Stopped => {
-                let _ = self
-                    .paused_count
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                        Some(v.saturating_sub(1))
-                    });
+                let _ = self.paused_count.fetch_update_compat(
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                    |v| Some(v.saturating_sub(1)),
+                );
             }
             _ => {}
         }
@@ -371,7 +372,7 @@ impl GlobalEngineMetrics {
                 .fetch_add(new_dl - old_dl, Ordering::Relaxed);
         } else {
             let diff = old_dl - new_dl;
-            let _ = self.global_download_rate.fetch_update(
+            let _ = self.global_download_rate.fetch_update_compat(
                 Ordering::Relaxed,
                 Ordering::Relaxed,
                 |val| Some(val.saturating_sub(diff)),
@@ -382,18 +383,18 @@ impl GlobalEngineMetrics {
                 .fetch_add(new_ul - old_ul, Ordering::Relaxed);
         } else {
             let diff = old_ul - new_ul;
-            let _ =
-                self.global_upload_rate
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |val| {
-                        Some(val.saturating_sub(diff))
-                    });
+            let _ = self.global_upload_rate.fetch_update_compat(
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+                |val| Some(val.saturating_sub(diff)),
+            );
         }
         if new_peers >= old_peers {
             self.global_peers_connected
                 .fetch_add(new_peers - old_peers, Ordering::Relaxed);
         } else {
             let diff = old_peers - new_peers;
-            let _ = self.global_peers_connected.fetch_update(
+            let _ = self.global_peers_connected.fetch_update_compat(
                 Ordering::Relaxed,
                 Ordering::Relaxed,
                 |val| Some(val.saturating_sub(diff)),

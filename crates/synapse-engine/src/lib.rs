@@ -1,5 +1,6 @@
 pub mod alert;
 pub mod announcer;
+pub(crate) mod atomic_compat;
 pub mod bandwidth;
 pub mod banlist;
 pub mod circuit_breaker;

@@ -5,6 +5,10 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- **Lint gate failed on Rust 1.99.** 1.99 deprecated `Atomic*::fetch_update` (renamed `try_update`, identical semantics), which `-D warnings` turned into 21 hard errors across `synapse-engine` (rate limiter, swarm counters, actor accounting). Our minimum supported Rust is 1.88, where `try_update` doesn't exist, so the calls now go through a single `FetchUpdateCompat` wrapper (`synapse-engine/src/atomic_compat.rs`) that holds the one `#[allow(deprecated)]`; swap its body to `try_update` once the minimum reaches 1.99. No behavior change.
+
 ## [2.2.19] - 2026-10-05
 
 ### Added
