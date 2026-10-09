@@ -3,7 +3,17 @@
 All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [2.2.20] - 2026-10-09
+
+### Added
+
+- **Prebuilt Linux binaries.** Each GitHub release now carries `synapsed` tarballs for x86_64 and aarch64 plus a `SHA256SUMS` file (built on Ubuntu 22.04, so glibc 2.35+ / OpenSSL 3).
+
+### Changed
+
+- **Inbound handshake cap lowered from 256 to 64** simultaneous mid-handshake connections, to harden against handshake floods. Sockets only occupy a slot until the handshake completes.
+- **Accept loop backs off 100 ms after an accept error**, so a persistent failure (e.g. out of file descriptors) no longer spins and floods the log.
+- Torrent URLs beginning with `http://` or `https://` skip the local-file probe.
 
 ### Fixed
 
