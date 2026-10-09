@@ -189,6 +189,20 @@ post_script = "/usr/local/bin/on_torrent_completed.sh"
 
 ## Quick Start & CLI Tools
 
+### Prebuilt Binaries
+
+Each tagged release on the [GitHub Releases](../../releases) page ships a `synapsed` tarball for
+Linux **x86_64** and **aarch64** (ARM64), plus a `SHA256SUMS` file:
+
+```bash
+tar xzf synapse-vX.Y.Z-linux-x86_64.tar.gz     # or ...-linux-aarch64.tar.gz
+sha256sum -c --ignore-missing SHA256SUMS
+./synapse-vX.Y.Z-linux-x86_64/synapsed --help
+```
+
+They are built on Ubuntu 22.04 (glibc 2.35, OpenSSL 3), so they run on Ubuntu 22.04+, Debian 12+
+and similarly recent distros. On older or musl-based hosts, use the Docker image or build from source.
+
 ### Building the Entire Workspace
 ```bash
 cargo build --workspace --release
