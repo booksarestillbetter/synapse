@@ -862,6 +862,74 @@ struct SwarmMeta {
     discovered_from_dht: u64,
     discovered_from_pex: u64,
     discovered_from_lsd: u64,
+    file_priorities: Arc<RwLock<Vec<u8>>>,
+    compressed_bitfield: Arc<RwLock<Option<synapse_picker::RoaringBitfield>>>,
+    initial_downloaded: u64,
+}
+
+/// Computes the total missing bytes across all wanted files/pieces.
+/// A piece is considered wanted if any file it covers has priority > 0.
+pub fn compute_missing_wanted_bytes(
+    info: &Info,
+    file_priorities: &[u8],
+    have: Option<&synapse_picker::RoaringBitfield>,
+) -> u64 {
+    // Nothing skipped: every missing piece counts, no per-piece file lookup needed.
+    let all_wanted = file_priorities.iter().all(|&p| p > 0);
+    let mut missing = 0u64;
+    for piece in 0..info.pieces() {
+        if let Some(bf) = have {
+            if bf.has(piece as usize) {
+                continue;
+            }
+        }
+        let is_wanted = if all_wanted {
+            true
+        } else {
+            info.block_locations(piece, 0, info.piece_len(piece))
+                .iter()
+                .any(|loc| {
+                    if synapse_meta::is_padding_file(&info.files[loc.file].path, None) {
+                        false
+                    } else {
+                        file_priorities.get(loc.file).copied().unwrap_or(4) > 0
+                    }
+                })
+        };
+        if is_wanted {
+            missing += info.piece_len(piece) as u64;
+        }
+    }
+    missing
+}
+
+/// Per-torrent state the scheduler needs to compute the `downloaded`/`left` counters it announces.
+pub struct AnnounceDetails {
+    pub file_priorities: Arc<RwLock<Vec<u8>>>,
+    pub compressed_bitfield: Arc<RwLock<Option<synapse_picker::RoaringBitfield>>>,
+    /// `downloaded_bytes` already present when the torrent was registered (the session baseline).
+    pub initial_downloaded: u64,
+}
+
+/// The `(downloaded, left)` pair sent to trackers.
+///
+/// `downloaded` is only what this session pulled from the swarm: bytes already on disk when the
+/// torrent was added (cross-seeding, resume) are the baseline and are never reported. `left` is 0
+/// for a seeding/complete torrent, otherwise the bytes still missing from *wanted* files.
+pub fn announce_transfer_counters(
+    stats: &SwarmStats,
+    initial_downloaded: u64,
+    info: &Info,
+    file_priorities: &[u8],
+    have: Option<&synapse_picker::RoaringBitfield>,
+) -> (u64, u64) {
+    let downloaded = stats.downloaded_bytes.saturating_sub(initial_downloaded);
+    let left = if stats.state == crate::swarm::SwarmState::Seeding || stats.progress >= 1.0 {
+        0
+    } else {
+        compute_missing_wanted_bytes(info, file_priorities, have)
+    };
+    (downloaded, left)
 }
 
 /// Callback type for dynamically waking dormant swarms and obtaining their peer event channel.
@@ -947,16 +1015,22 @@ impl AnnounceScheduler {
         &self.announcer
     }
 
-    /// Registers a new or restored torrent in the centralized announce queue.
+    /// Registers a new or restored torrent in the centralized announce queue with priority and bitfield details.
     /// Downloading swarms announce immediately; seeding swarms apply startup jitter.
-    pub fn register(
+    pub fn register_with_details(
         &self,
         info_hash: [u8; 20],
         info: Arc<Info>,
         stats: Arc<RwLock<SwarmStats>>,
         events_tx: mpsc::Sender<PeerEvent>,
         is_downloading: bool,
+        details: AnnounceDetails,
     ) {
+        let AnnounceDetails {
+            file_priorities,
+            compressed_bitfield,
+            initial_downloaded,
+        } = details;
         let next_announce_at = if is_downloading {
             Instant::now()
         } else {
@@ -1014,6 +1088,9 @@ impl AnnounceScheduler {
                     discovered_from_dht: 0,
                     discovered_from_pex: 0,
                     discovered_from_lsd: 0,
+                    file_priorities,
+                    compressed_bitfield,
+                    initial_downloaded,
                 },
             );
         }
@@ -1031,6 +1108,31 @@ impl AnnounceScheduler {
         if is_downloading {
             self.wake_notify.notify_one();
         }
+    }
+
+    /// Registers a new or restored torrent in the centralized announce queue.
+    /// Downloading swarms announce immediately; seeding swarms apply startup jitter.
+    pub fn register(
+        &self,
+        info_hash: [u8; 20],
+        info: Arc<Info>,
+        stats: Arc<RwLock<SwarmStats>>,
+        events_tx: mpsc::Sender<PeerEvent>,
+        is_downloading: bool,
+    ) {
+        let initial_downloaded = stats.read().downloaded_bytes;
+        self.register_with_details(
+            info_hash,
+            info,
+            stats,
+            events_tx,
+            is_downloading,
+            AnnounceDetails {
+                file_priorities: Arc::new(RwLock::new(Vec::new())),
+                compressed_bitfield: Arc::new(RwLock::new(None)),
+                initial_downloaded,
+            },
+        );
     }
 
     /// Enqueues newly discovered peers from Trackers, DHT, PEX, or LSD into the swarm's candidate pool,
@@ -1466,11 +1568,23 @@ impl AnnounceScheduler {
                         m.stats.clone(),
                         m.consecutive_failures,
                         m.next_announce_at,
+                        m.file_priorities.clone(),
+                        m.compressed_bitfield.clone(),
+                        m.initial_downloaded,
                     )
                 })
             };
 
-            let Some((info, stats, failures, scheduled_for)) = meta_opt else {
+            let Some((
+                info,
+                stats,
+                failures,
+                scheduled_for,
+                file_priorities,
+                compressed_bitfield,
+                initial_downloaded,
+            )) = meta_opt
+            else {
                 continue; // Unregistered torrent
             };
 
@@ -1483,12 +1597,11 @@ impl AnnounceScheduler {
 
             let (state, dl, left, ul) = {
                 let s = stats.read();
-                (
-                    s.state.clone(),
-                    s.downloaded_bytes,
-                    s.total_size.saturating_sub(s.downloaded_bytes),
-                    s.uploaded_bytes,
-                )
+                let prios = file_priorities.read();
+                let bf = compressed_bitfield.read();
+                let (dl, left) =
+                    announce_transfer_counters(&s, initial_downloaded, &info, &prios, bf.as_ref());
+                (s.state.clone(), dl, left, s.uploaded_bytes)
             };
 
             if matches!(
@@ -1534,37 +1647,18 @@ impl AnnounceScheduler {
                 let peer_count = peers.len();
                 scheduler.add_candidate_peers(&job.info_hash, peers);
 
-                let (current_connected, current_sending) = {
-                    let swarms = scheduler.swarms.read();
-                    swarms
-                        .get(&job.info_hash)
-                        .map(|m| {
-                            let s = m.stats.read();
-                            (s.peers_connected, s.peers_sending)
-                        })
-                        .unwrap_or((0, 0))
-                };
-
-                let is_starved = is_dl && (current_connected < 8 || current_sending == 0);
-
                 let all_cb = !reports.is_empty() && reports.iter().all(|r| r.is_circuit_broken);
                 let (delay_secs, new_failures) = if all_cb && peer_count == 0 {
                     // Stagger retry during circuit breaker cooling/ramp-up: 5 to 15 seconds randomized jitter
                     let stagger = rand::Rng::gen_range(&mut rand::thread_rng(), 5..=15);
                     (stagger as u64, failures)
                 } else if (peer_count > 0 || tracker_interval > 0) && !reports.is_empty() {
-                    let base = if is_starved {
-                        if peer_count == 0 {
-                            30
-                        } else {
-                            60
-                        }
-                    } else if tracker_interval > 0 {
+                    let base = if tracker_interval > 0 {
                         tracker_interval
                     } else {
                         scheduler.default_interval.as_secs() as u32
                     }
-                    .clamp(15, 3600);
+                    .clamp(60, 3600);
 
                     // BEP 3 recommended +/- 10% randomized jitter
                     let jitter_range = (base as f64 * 0.1) as i64;
@@ -1573,7 +1667,7 @@ impl AnnounceScheduler {
                     } else {
                         0
                     };
-                    ((base as i64 + jitter).max(15) as u64, 0)
+                    ((base as i64 + jitter).max(60) as u64, 0)
                 } else {
                     // Exponential backoff on failed or unreachable tracker: 30s, 60s, 120s...
                     let backoff = (30 * (1 << failures.min(5))).min(1800);

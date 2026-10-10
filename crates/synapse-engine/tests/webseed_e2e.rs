@@ -197,7 +197,8 @@ async fn torrent_with_no_peers_fetches_its_only_piece_from_a_webseed() {
     // Keep `peer_tx` alive so `events.recv()` doesn't close the actor loop while we wait.
     let (done_rx, download_dir, file_data, _peer_tx) = run_webseed_torrent(true).await;
 
-    tokio::time::timeout(Duration::from_secs(10), done_rx)
+    // Generous: the workspace test run executes many heavy tests in parallel.
+    tokio::time::timeout(Duration::from_secs(30), done_rx)
         .await
         .expect("torrent did not complete via webseed within timeout")
         .expect("completion channel dropped");

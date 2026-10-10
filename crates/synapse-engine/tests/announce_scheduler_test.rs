@@ -244,3 +244,109 @@ async fn test_candidate_peer_queue_and_dialing() {
     scheduler.shutdown();
     let _ = tokio::time::timeout(Duration::from_millis(500), handle).await;
 }
+
+#[tokio::test]
+async fn cross_seeding_announces_zero_downloaded_and_zero_left() {
+    use synapse_engine::announcer::announce_transfer_counters;
+
+    let tmp = tempdir().expect("create temp dir");
+    let disk = Arc::new(DiskEngine::auto().await);
+    let engine = Arc::new(SwarmEngine::new(disk, [0x44; 20]));
+
+    let info = Arc::new(build_dummy_torrent("cross-seed-test.bin"));
+    let mut bf = Bitfield::new(info.pieces() as usize);
+    for p in 0..info.pieces() {
+        bf.set(p as usize);
+    }
+
+    // Adding an existing complete torrent (cross-seeding) without historical resume data.
+    let handle = engine.add_torrent(info.clone(), tmp.path().to_path_buf(), Some(&bf));
+    let stats = handle.stats.read().clone();
+    assert_eq!(stats.state, SwarmState::Seeding);
+    assert_eq!(stats.progress, 1.0);
+    // Verified on-disk bytes still drive progress / UI...
+    assert_eq!(stats.downloaded_bytes, info.total_len);
+
+    // ...but the tracker is told nothing was downloaded and nothing is left.
+    let (dl, left) = announce_transfer_counters(
+        &stats,
+        stats.downloaded_bytes,
+        &info,
+        &[],
+        handle.compressed_bitfield.read().as_ref(),
+    );
+    assert_eq!((dl, left), (0, 0));
+
+    engine.shutdown();
+}
+
+#[tokio::test]
+async fn announce_counters_report_session_download_and_missing_wanted_bytes() {
+    use synapse_engine::announcer::announce_transfer_counters;
+    use synapse_picker::RoaringBitfield;
+
+    let tmp = tempdir().expect("create temp dir");
+    let disk = Arc::new(DiskEngine::auto().await);
+    let engine = Arc::new(SwarmEngine::new(disk, [0x45; 20]));
+    let info = Arc::new(build_dummy_torrent("session-test.bin"));
+    let piece = info.piece_len(0) as u64;
+
+    // Added with 2 of 4 pieces already on disk.
+    let mut bf = Bitfield::new(4);
+    bf.set(0);
+    bf.set(1);
+    let handle = engine.add_torrent(info.clone(), tmp.path().to_path_buf(), Some(&bf));
+    let mut stats = handle.stats.read().clone();
+    let baseline = stats.downloaded_bytes;
+    assert_eq!(baseline, 2 * piece);
+
+    let have = RoaringBitfield::from_bitfield(&bf);
+    let (dl, left) = announce_transfer_counters(&stats, baseline, &info, &[], Some(&have));
+    assert_eq!(
+        (dl, left),
+        (0, 2 * piece),
+        "nothing downloaded yet this session"
+    );
+
+    // One more piece arrives from the swarm.
+    stats.downloaded_bytes += piece;
+    bf.set(2);
+    let have = RoaringBitfield::from_bitfield(&bf);
+    let (dl, left) = announce_transfer_counters(&stats, baseline, &info, &[], Some(&have));
+    assert_eq!((dl, left), (piece, piece));
+
+    // Complete: left is strictly 0 whatever the bitfield says.
+    stats.state = SwarmState::Seeding;
+    stats.progress = 1.0;
+    let (_, left) = announce_transfer_counters(&stats, baseline, &info, &[], Some(&have));
+    assert_eq!(left, 0);
+
+    engine.shutdown();
+}
+
+#[test]
+fn test_selective_download_left_counts_only_wanted_pieces() {
+    use synapse_engine::announcer::compute_missing_wanted_bytes;
+    use synapse_picker::RoaringBitfield;
+
+    let info = build_dummy_torrent("selective-test.bin");
+    assert_eq!(info.pieces(), 4);
+
+    // All pieces missing, no file priorities (all wanted)
+    let missing_all = compute_missing_wanted_bytes(&info, &[], None);
+    assert_eq!(missing_all, info.total_len);
+
+    // Have first 3 pieces, none skipped
+    let mut bf = Bitfield::new(info.pieces() as usize);
+    bf.set(0);
+    bf.set(1);
+    bf.set(2);
+    let rbf = RoaringBitfield::from_bitfield(&bf);
+    let missing_last = compute_missing_wanted_bytes(&info, &[], Some(&rbf));
+    assert_eq!(missing_last, info.piece_len(3) as u64);
+
+    // If file 0 is skipped (priority 0)
+    let prios = vec![0u8];
+    let missing_skipped = compute_missing_wanted_bytes(&info, &prios, None);
+    assert_eq!(missing_skipped, 0);
+}

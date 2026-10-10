@@ -3,6 +3,18 @@
 All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [2.2.22] - 2026-10-10
+
+### Fixed
+
+- **Cross-seeding tracker download attribution**: Trackers are now only sent actual swarm payload downloaded during the current session (`s.downloaded_bytes.saturating_sub(initial_downloaded)`). Previously, adding a complete torrent without prior resume state reported the full torrent size as downloaded on initial announce (`event=started`), which caused private trackers to falsely record cross-seeded data as new downloads. On-disk verified byte accounting for UI progress and recheck recalculations remains intact.
+- **Resumed torrents report only this session's download.** The announce baseline is the byte count already on disk when the torrent is added or woken, so a restart no longer re-announces historical downloads. `announce_transfer_counters` is covered by unit tests.
+- **Tracker announce interval honoring**: Removed aggressive starvation retry overrides (`is_starved`) in `AnnounceScheduler`. Torrents with fewer than 8 connected peers or no active seeders no longer override the tracker-specified interval with 30s/60s loops. Tracker intervals are respected within `[60, 3600]` seconds with ±10% randomized jitter.
+- **Tracker `left` calculation on completed and selective downloads**:
+  - Torrents in `Seeding` state or at 100% progress now strictly announce `left=0` rather than subtracting verified bytes from total size.
+  - Selective downloads now calculate `left` strictly over missing *wanted* pieces (files with priority > 0) rather than including unwanted files as missing bytes.
+- The `webseed_e2e` integration test waits up to 30 s (was 10 s) so a loaded CI runner running the whole workspace in parallel doesn't flake.
+
 ## [2.2.21] - 2026-10-10
 
 ### Fixed

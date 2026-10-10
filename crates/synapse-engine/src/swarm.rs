@@ -1686,12 +1686,21 @@ impl SwarmEngine {
                     first_seen.insert(hash, now);
                     let _ = self.wake_torrent_internal(&handle);
                     let peer_tx = handle.peer_event_tx().unwrap_or_else(|| mpsc::channel(1).0);
-                    self.announce_scheduler.register(
+                    let initial_dl = {
+                        let s = handle.stats.read();
+                        s.downloaded_bytes
+                    };
+                    self.announce_scheduler.register_with_details(
                         hash,
                         handle.info.clone(),
                         handle.stats.clone(),
                         peer_tx,
                         true,
+                        crate::announcer::AnnounceDetails {
+                            file_priorities: handle.file_priorities.clone(),
+                            compressed_bitfield: handle.compressed_bitfield.clone(),
+                            initial_downloaded: initial_dl,
+                        },
                     );
                     active_non_stalled += 1;
                 }
@@ -2028,8 +2037,21 @@ impl SwarmEngine {
 
         if !is_paused {
             let is_dl = initial_state == SwarmState::Downloading;
-            self.announce_scheduler
-                .register(info_hash, info, stats, peer_tx, is_dl);
+            // Trackers get only what this session downloads; bytes already on disk (cross-seed,
+            // resume) are the baseline.
+            let initial_dl = downloaded_bytes;
+            self.announce_scheduler.register_with_details(
+                info_hash,
+                info,
+                stats,
+                peer_tx,
+                is_dl,
+                crate::announcer::AnnounceDetails {
+                    file_priorities: handle.file_priorities.clone(),
+                    compressed_bitfield: handle.compressed_bitfield.clone(),
+                    initial_downloaded: initial_dl,
+                },
+            );
         }
 
         handle
@@ -2695,12 +2717,21 @@ impl SwarmEngine {
             let is_dl = target_state == SwarmState::Downloading;
             let _ = self.wake_torrent_internal(&handle);
             let peer_tx = handle.peer_event_tx().unwrap_or_else(|| mpsc::channel(1).0);
-            self.announce_scheduler.register(
+            let initial_dl = {
+                let s = handle.stats.read();
+                s.downloaded_bytes
+            };
+            self.announce_scheduler.register_with_details(
                 *info_hash,
                 handle.info.clone(),
                 handle.stats.clone(),
                 peer_tx,
                 is_dl,
+                crate::announcer::AnnounceDetails {
+                    file_priorities: handle.file_priorities.clone(),
+                    compressed_bitfield: handle.compressed_bitfield.clone(),
+                    initial_downloaded: initial_dl,
+                },
             );
             self.announce_scheduler.notify_resumed(info_hash);
             self.lsd_manager
