@@ -61,7 +61,8 @@ pub use part_file::PartFileManager;
 pub use peer::{
     accept, accept_router, accept_router_indexed, accept_router_with_candidates, accept_with_mode,
     connect, connect_with_mode, connect_with_options, generate_peer_id, parse_client_name,
-    PeerError, PeerEvent, PeerHandle, PeerId, PeerInfo, PeerStream, SYNAPSE_PEER_ID_PREFIX,
+    with_synapse_prefix, PeerError, PeerEvent, PeerHandle, PeerId, PeerInfo, PeerStream,
+    SYNAPSE_PEER_ID_PREFIX,
 };
 pub use pex::PexManager;
 pub use queue::{QueueAction, QueueConfig, QueueManager};

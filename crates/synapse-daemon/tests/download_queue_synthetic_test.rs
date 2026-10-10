@@ -7,14 +7,6 @@ use tracing_subscriber::FmtSubscriber;
 use diskio::DiskEngine;
 use synapse_engine::{QueueConfig, SwarmEngine, SwarmState};
 
-const TORRENT_URLS: &[&str] = &[
-    "https://webtorrent.io/torrents/big-buck-bunny.torrent",
-    "https://webtorrent.io/torrents/cosmos-laundromat.torrent",
-    "https://webtorrent.io/torrents/sintel.torrent",
-    "https://webtorrent.io/torrents/tears-of-steel.torrent",
-    "https://webtorrent.io/torrents/wired-cd.torrent",
-];
-
 fn build_synthetic_torrent(name: &str, file_len: usize, piece_len: u32) -> synapse_meta::Info {
     use sha1::{Digest, Sha1};
     let mut pieces = Vec::new();
@@ -48,13 +40,13 @@ fn build_synthetic_torrent(name: &str, file_len: usize, piece_len: u32) -> synap
 }
 
 #[tokio::test]
-async fn test_live_download_webtorrent_swarms_and_queue_pipeline() {
+async fn synthetic_swarms_and_queue_pipeline() {
     // 1. Initialize formatted tracing subscriber for live debug visibility
     let _ = FmtSubscriber::builder()
         .with_max_level(Level::INFO)
         .try_init();
 
-    info!("🚀 STARTING SYNAPSE 2.0 LIVE WEBTORRENT DOWNLOAD TEST");
+    info!("🚀 STARTING SYNAPSE 2.0 SYNTHETIC DOWNLOAD QUEUE TEST");
 
     let tmp = tempdir().expect("create temp dir");
     let download_dir = tmp.path().to_path_buf();
@@ -81,51 +73,28 @@ async fn test_live_download_webtorrent_swarms_and_queue_pipeline() {
         ..Default::default()
     });
 
-    // 3. Securely fetch and ingest the 5 torrents via URL
+    // 3. Ingest synthetic torrents only. Tests must never touch the public internet: no remote
+    //    .torrent downloads, no external trackers, no live swarms. (A loopback swarm is fine.)
     let mut loaded_handles = Vec::new();
-    for url in TORRENT_URLS {
-        info!("📥 Fetching & validating remote .torrent from: {}", url);
-        match synapse_rpc::fetch_or_parse_torrent(url).await {
-            Ok(info) => {
-                let info_arc = Arc::new(info);
-                let handle = swarm.add_torrent(info_arc.clone(), download_dir.clone(), None);
-                info!(
-                    "✅ Ingested swarm '{}' (size: {} MB, pieces: {}, info_hash: {})",
-                    info_arc.name,
-                    info_arc.total_len / (1024 * 1024),
-                    info_arc.pieces(),
-                    hex::encode(info_arc.hash)
-                );
-                loaded_handles.push(handle);
-            }
-            Err(e) => {
-                info!("⚠️ Could not fetch {} (network/offline): {}", url, e);
-            }
-        }
-    }
-
-    if loaded_handles.is_empty() {
-        info!("⚠️ No remote torrents could be fetched (network offline / isolated environment). Generating synthetic torrents for telemetry test.");
-        for (i, name) in [
-            "synthetic-bunny.iso",
-            "synthetic-sintel.mkv",
-            "synthetic-tears.mp4",
-        ]
-        .iter()
-        .enumerate()
-        {
-            let info = build_synthetic_torrent(name, 1024 * 1024 * (i + 1), 64 * 1024);
-            let info_arc = Arc::new(info);
-            let handle = swarm.add_torrent(info_arc.clone(), download_dir.clone(), None);
-            info!(
-                "✅ Ingested synthetic swarm '{}' (size: {} MB, pieces: {}, info_hash: {})",
-                info_arc.name,
-                info_arc.total_len / (1024 * 1024),
-                info_arc.pieces(),
-                hex::encode(info_arc.hash)
-            );
-            loaded_handles.push(handle);
-        }
+    for (i, name) in [
+        "synthetic-bunny.iso",
+        "synthetic-sintel.mkv",
+        "synthetic-tears.mp4",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let info = build_synthetic_torrent(name, 1024 * 1024 * (i + 1), 64 * 1024);
+        let info_arc = Arc::new(info);
+        let handle = swarm.add_torrent(info_arc.clone(), download_dir.clone(), None);
+        info!(
+            "✅ Ingested synthetic swarm '{}' (size: {} MB, pieces: {}, info_hash: {})",
+            info_arc.name,
+            info_arc.total_len / (1024 * 1024),
+            info_arc.pieces(),
+            hex::encode(info_arc.hash)
+        );
+        loaded_handles.push(handle);
     }
 
     assert!(

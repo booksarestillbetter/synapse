@@ -3,6 +3,17 @@
 All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [2.2.21] - 2026-10-10
+
+### Fixed
+
+- **Synapse can no longer present another client's peer ID.** `SwarmEngine::new` now forces the `-SY` prefix onto whatever ID it is given (`peer::with_synapse_prefix`), so no caller (daemon, benchmark, test, embedder) can announce or handshake as Transmission, qBittorrent, etc. The `synapse-bench live-download` tool had hardcoded `-TR4050-` and now uses `generate_peer_id()`.
+- **Tests never touch the public internet.** The daemon integration test that fetched five `.torrent` files from `webtorrent.io` and joined their live swarms on every `cargo test --workspace` is now synthetic-only (renamed `download_queue_synthetic_test`).
+
+### Added
+
+- Two guard tests (`synapse-engine/tests/peer_id_guard.rs`, `no_external_network_guard.rs`) fail the build if a source file contains another client's Azureus-style peer-ID prefix, or an integration test names a non-loopback / non-reserved host.
+
 ## [2.2.20] - 2026-10-09
 
 ### Added

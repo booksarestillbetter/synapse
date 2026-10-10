@@ -132,7 +132,7 @@ async fn test_bep54_lt_donthave_wire_handling() {
         .send(Message::Handshake {
             reserved,
             info_hash: hash,
-            peer_id: *b"-UT3530-extpeer12345",
+            peer_id: *b"-SY2200-extpeer12345",
         })
         .await
         .unwrap();

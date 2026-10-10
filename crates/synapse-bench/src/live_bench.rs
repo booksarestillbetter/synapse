@@ -64,9 +64,7 @@ pub async fn run_live_download_monitor(
     println!("📂 Target Download Directory: {}", download_dir.display());
 
     let disk = Arc::new(DiskEngine::auto().await);
-    let mut peer_id = [0x53; 20];
-    peer_id[0..8].copy_from_slice(b"-TR4050-");
-    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut peer_id[8..]);
+    let peer_id = synapse_engine::generate_peer_id();
 
     let swarm = Arc::new(SwarmEngine::new(disk, peer_id));
     swarm.set_queue_config(QueueConfig {

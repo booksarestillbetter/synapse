@@ -741,9 +741,35 @@ pub fn generate_peer_id() -> [u8; 20] {
     peer_id
 }
 
+/// Forces the Synapse prefix onto `peer_id`, keeping the caller's last 12 bytes.
+///
+/// `SwarmEngine::new` runs every peer ID through this, so nothing built on the engine (daemon,
+/// benchmarks, tests, embedders) can ever announce or handshake as another client.
+pub fn with_synapse_prefix(mut peer_id: [u8; 20]) -> [u8; 20] {
+    peer_id[0..8].copy_from_slice(SYNAPSE_PEER_ID_PREFIX);
+    peer_id
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn with_synapse_prefix_overrides_any_other_client_prefix() {
+        for other in [
+            b"-TR4050-",
+            b"-qB4430-",
+            b"-UT3550-",
+            b"-DE1360-",
+            b"\0\0\0\0\0\0\0\0",
+        ] {
+            let mut id = [7u8; 20];
+            id[..8].copy_from_slice(other);
+            let fixed = with_synapse_prefix(id);
+            assert_eq!(&fixed[..8], SYNAPSE_PEER_ID_PREFIX);
+            assert_eq!(&fixed[8..], &id[8..]);
+        }
+    }
 
     #[test]
     fn test_generate_peer_id() {

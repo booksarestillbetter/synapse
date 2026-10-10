@@ -668,6 +668,8 @@ struct SignaturePolicy {
 
 impl SwarmEngine {
     pub fn new(disk: Arc<DiskEngine>, peer_id: [u8; 20]) -> Self {
+        // Never identify as another client, whatever the caller passed in.
+        let peer_id = crate::peer::with_synapse_prefix(peer_id);
         let listen_port = Arc::new(RwLock::new(0));
         let circuit_breaker = Arc::new(PeerCircuitBreaker::default());
         let nat_manager = Arc::new(RwLock::new(crate::nat::NatManager::new(true)));
