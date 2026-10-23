@@ -168,7 +168,7 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
         <div class="daemon-info-card">
           <div><small>Engine:</small> <strong>Synapse 2.0</strong></div>
           <div><small>Peer ID:</small> <code>-SY2200-</code></div>
-          <div id="daemon-version"><small>Version:</small> 2.2.22</div>
+          <div id="daemon-version"><small>Version:</small> 2.2.23</div>
           <div id="daemon-dht"><small>DHT Nodes:</small> <span id="stat-dht-nodes">0</span></div>
         </div>
       </div>
@@ -1226,7 +1226,7 @@ function renderTorrentTable() {
 
     tr.innerHTML = `
       <td>${idx + 1}</td>
-      <td title="${t.name}"><strong>${escapeHtml(t.name)}</strong></td>
+      <td title="${escapeHtml(t.name)}"><strong>${escapeHtml(t.name)}</strong></td>
       <td>${formatBytes(t.total_bytes)}</td>
       <td>
         <div class="prog-wrapper">
@@ -1236,7 +1236,7 @@ function renderTorrentTable() {
           <span class="prog-text">${pct}%</span>
         </div>
       </td>
-      <td><span class="badge ${badgeClass}">${stClean}</span></td>
+      <td><span class="badge ${badgeClass}">${escapeHtml(stClean)}</span></td>
       <td>${t.peers_connected || 0}</td>
       <td>${t.peers_connected || 0}</td>
       <td style="color: var(--dl-color);">${formatSpeed(t.download_rate)}</td>
@@ -1370,7 +1370,7 @@ async function updateInspector(hash) {
       tBody.innerHTML = d.trackers.map(tr => `
         <tr>
           <td><code>${escapeHtml(tr.url)}</code></td>
-          <td>${tr.status || 'Active'}</td>
+          <td>${escapeHtml(tr.status || 'Active')}</td>
           <td>${tr.seeders || '-'}</td>
           <td>${tr.leechers || '-'}</td>
           <td>${tr.next_announce_in ? tr.next_announce_in + 's' : '-'}</td>
@@ -1404,7 +1404,7 @@ async function updateInspector(hash) {
       fBody.innerHTML = d.files.map(f => `
         <tr>
           <td>${f.index + 1}</td>
-          <td title="${f.path}">${escapeHtml(f.path)}</td>
+          <td title="${escapeHtml(f.path)}">${escapeHtml(f.path)}</td>
           <td>${formatBytes(f.size_bytes)}</td>
           <td>
             <div class="prog-wrapper">
@@ -1413,7 +1413,7 @@ async function updateInspector(hash) {
             </div>
           </td>
           <td>
-            <select class="prio-select" onchange="setFilePriority('${hash}', ${f.index}, this.value)">
+            <select class="prio-select" onchange="setFilePriority('${escapeHtml(hash)}', ${f.index}, this.value)">
               <option value="0" ${f.priority === 0 ? 'selected' : ''}>Skip</option>
               <option value="1" ${f.priority === 1 ? 'selected' : ''}>Low</option>
               <option value="4" ${f.priority === 4 ? 'selected' : ''}>Normal</option>
@@ -1750,7 +1750,12 @@ function switchSettingsTab(tab) {
 
 function escapeHtml(str) {
   if (!str) return '';
-  return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
 }
 
 // Initial Setup & Listeners
@@ -1876,3 +1881,23 @@ window.addEventListener('DOMContentLoaded', () => {
   updateTurtleButtonState();
 });
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn app_js_escapes_all_untrusted_dom_interpolations() {
+        assert!(!APP_JS.contains("title=\"${t.name}\""));
+        assert!(!APP_JS.contains("title=\"${f.path}\""));
+        assert!(!APP_JS.contains(">${stClean}<"));
+        assert!(!APP_JS.contains("<td>${tr.status"));
+        assert!(!APP_JS.contains("setFilePriority('${hash}'"));
+        assert!(APP_JS.contains("title=\"${escapeHtml(t.name)}\""));
+        assert!(APP_JS.contains("title=\"${escapeHtml(f.path)}\""));
+        assert!(APP_JS.contains(">${escapeHtml(stClean)}<"));
+        assert!(APP_JS.contains("<td>${escapeHtml(tr.status || 'Active')}</td>"));
+        assert!(APP_JS.contains("setFilePriority('${escapeHtml(hash)}'"));
+        assert!(APP_JS.contains(".replace(/'/g, '&#39;')"));
+    }
+}

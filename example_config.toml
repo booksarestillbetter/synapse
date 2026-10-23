@@ -109,7 +109,7 @@ max_global_peers = 2000
 enabled = true
 # Bind to 0.0.0.0 (not just 127.0.0.1) if conduit or another client runs in a
 # different container/host — set auth_token below before doing that. Default: "127.0.0.1:50051"
-listen_addr = "0.0.0.0:50051"
+listen_addr = "127.0.0.1:50051"
 # Shared-secret bearer token — every gRPC call and every /api/v1/* REST route must send
 # `authorization: Bearer <token>` once this is set (see docs/CLIENT_PROTOCOLS_AND_SDK.md's
 # Authentication section). Default: unset (both control planes are open — fine for a

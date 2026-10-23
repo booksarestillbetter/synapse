@@ -72,8 +72,24 @@ impl TorrentUpdatePointer {
         crate::storage::compute_mutable_target(&self.public_key, self.salt.as_deref())
     }
 
+    /// Verifies that `item` carries a valid Ed25519 signature for `self.public_key` and
+    /// `self.salt` over `(salt, seq, v)`, and if so applies the update via [`Self::process_update`].
+    pub fn process_verified_item(&mut self, item: &crate::proto::GetItem) -> bool {
+        let (Some(k), Some(sig), Some(seq)) = (item.k, item.sig, item.seq) else {
+            return false;
+        };
+        if k != self.public_key {
+            return false;
+        }
+        let payload = crate::storage::format_sign_payload(self.salt.as_deref(), seq, &item.v);
+        if !crate::storage::verify_ed25519(&self.public_key, &payload, &sig) {
+            return false;
+        }
+        self.process_update(seq, &item.v)
+    }
+
     /// Queries a DHT node for updates to this torrent pointer using BEP 44 `get`.
-    /// Returns true if a newer revision was received and applied.
+    /// Returns true if a newer revision was received, cryptographically verified, and applied.
     pub async fn poll_node(
         &mut self,
         dht: &crate::node::DhtHandle,
@@ -82,9 +98,7 @@ impl TorrentUpdatePointer {
         let target = self.target_hash();
         let (_token, item_opt) = dht.get(addr, target, Some(self.latest_seq)).await?;
         if let Some(item) = item_opt {
-            if let Some(seq) = item.seq {
-                return Ok(self.process_update(seq, &item.v));
-            }
+            return Ok(self.process_verified_item(&item));
         }
         Ok(false)
     }
@@ -93,6 +107,7 @@ impl TorrentUpdatePointer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
     use std::collections::BTreeMap;
 
     #[test]
@@ -119,5 +134,57 @@ mod tests {
         assert!(updater.process_update(2, &bencode_bytes));
         assert_eq!(updater.current_info_hash, Some(hash2));
         assert_eq!(updater.latest_seq, 2);
+    }
+
+    #[test]
+    fn test_bep46_verified_item_rejects_forged_signature_or_wrong_key() {
+        let sk = SigningKey::from_bytes(&[0x42; 32]);
+        let pk = sk.verifying_key().to_bytes();
+        let salt = Some(b"my-feed".to_vec());
+        let mut updater = TorrentUpdatePointer::new(pk, salt.clone());
+
+        let mut dict = BTreeMap::new();
+        let valid_hash = [0xAA; 20];
+        dict.insert(b"ih".to_vec(), BEncode::String(valid_hash.to_vec()));
+        let v = BEncode::Dict(dict).encode_to_buf();
+
+        // 1. Forged signature is rejected
+        let forged_item = crate::proto::GetItem {
+            v: v.clone(),
+            k: Some(pk),
+            sig: Some([0x99; 64]),
+            seq: Some(1),
+        };
+        assert!(!updater.process_verified_item(&forged_item));
+        assert_eq!(updater.current_info_hash, None);
+
+        // 2. Valid signature from wrong key is rejected
+        let other_sk = SigningKey::from_bytes(&[0x24; 32]);
+        let other_pk = other_sk.verifying_key().to_bytes();
+        let other_sig = other_sk
+            .sign(&crate::storage::format_sign_payload(salt.as_deref(), 1, &v))
+            .to_bytes();
+        let wrong_key_item = crate::proto::GetItem {
+            v: v.clone(),
+            k: Some(other_pk),
+            sig: Some(other_sig),
+            seq: Some(1),
+        };
+        assert!(!updater.process_verified_item(&wrong_key_item));
+        assert_eq!(updater.current_info_hash, None);
+
+        // 3. Valid signature from expected key is accepted
+        let valid_sig = sk
+            .sign(&crate::storage::format_sign_payload(salt.as_deref(), 1, &v))
+            .to_bytes();
+        let valid_item = crate::proto::GetItem {
+            v,
+            k: Some(pk),
+            sig: Some(valid_sig),
+            seq: Some(1),
+        };
+        assert!(updater.process_verified_item(&valid_item));
+        assert_eq!(updater.current_info_hash, Some(valid_hash));
+        assert_eq!(updater.latest_seq, 1);
     }
 }

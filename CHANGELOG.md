@@ -3,6 +3,40 @@
 All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [2.2.23] - 2026-10-22
+
+### Security
+
+A full-workspace security audit covered the RPC control plane, filesystem lifecycle, protocol state machines, and cryptographic verification paths. This release closes all findings except one deliberate tradeoff (noted at the end).
+
+**Control plane & filesystem:**
+- gRPC now binds to `127.0.0.1:50051` by default (was `0.0.0.0`); all 23 gRPC handlers enforce `verify_auth`.
+- Magnet `dn=` names are sanitized against path traversal. `delete_torrent`, `set_location`, and the completion-webhook file placer all canonicalize and contain their target paths under the configured download root and refuse symlinked sources/targets; `set_location` only moves files the torrent has actually verified data for.
+- `/etc/synapse` (config, `on-complete.sh`) is no longer `chown`-ed to the runtime PUID/PGID — it stays root-owned.
+- `PATCH /api/v1/session` can no longer redirect `download_dir` outside an immutable base root fixed at startup; `create_torrent` checks path containment before existence, closing a 403-vs-404 path-probing oracle.
+- Empty/whitespace auth tokens are normalized to `None` and rejected outright. Both REST and gRPC token checks are constant-time, and state-mutating REST endpoints now require an `Origin`/`Sec-Fetch-Site` CSRF check.
+
+**Protocol & crypto:**
+- BEP 46 mutable-torrent DHT `get` responses are now Ed25519-signature-verified before being accepted, closing a remote feed-hijacking vector.
+- The Web UI's "Required (Encrypted Only)" setting and `encryption = "required"` in config no longer silently downgrade to `PreferEncrypted`.
+- Choking or disconnecting a peer mid-piece now frees the allocated `InProgressPiece` buffer instead of leaking it; concurrent in-progress pieces are additionally capped by count and total bytes.
+- `ut_metadata` header offsets are read from the decoder's own cursor position instead of a fragile re-encoded guess; negative `piece`/`total_size` values are rejected; a single bad peer's bogus `metadata_size` can no longer permanently lock out magnet resolution.
+- BEP 52 v2 negative file lengths are rejected, length sums use checked arithmetic, piece counts are range-checked before truncating to `u32`, file path segments require strict UTF-8, and `validate_layout` now runs for pure-v2 torrents too.
+- BEP 35 certificate chain validation checks `BasicConstraints`/`KeyUsage` on the issuer (closing a leaf-cert-as-CA bypass) and binds the claimed signer name to the certificate's Subject CN/SAN.
+
+**Network isolation & disk I/O:**
+- `Announcer::scrape` now refuses UDP trackers under a configured/forced proxy, matching `announce`; `force_proxy` fails closed instead of silently falling back to a direct connection; the completion-classification webhook client now routes through the global proxy.
+- `safe_http`'s local-address check no longer vacuously passes on an empty address list when a proxy is configured; NAT64/IPv4-compatible ranges are filtered; `SearchManager::add_source` stats a path before reading it (no more `/dev/zero` OOM); the feed parser and URL-fetcher SSRF policy now default to deny; BEP 55 holepunch peers are filtered through an address allow-list.
+- Piece read/write, preallocation, local-webseed fetch, and staging all call `verify_no_symlinks_under`; the staging plugin's single-file path bug (using the display name instead of `files[0].path`) is fixed. This release additionally closes the remaining TOCTOU window by opening piece files with `O_NOFOLLOW` (`synapse-diskio::cache::FileCache::get_or_open`).
+- **New in this release:** `IoUringDiskEngine::run_ring` previously failed every submission past the fixed 256-entry queue depth with `QueueFull` once a burst of queued jobs exceeded it. It now flushes (`ring.submit()`) and retries instead of dropping the operation.
+- **New in this release:** tracker-announced peer addresses are now filtered the same way PEX/holepunch peers already were (`pex::pex_address_allowed`) — a malicious or compromised HTTP/UDP tracker could otherwise hand back `127.0.0.1:<port>` or `192.168.x.x:<port>` peer entries and have Synapse dial them, probing the host's own network on the tracker's behalf. Private-range targets are now only accepted when the tracker itself was reached over a private/loopback address.
+
+**DHT, config, UPnP, and misc hardening:** DHT IP-voting now rejects RFC 1918 addresses outright; `enforce_node_id` survives routing-table rebuilds; an empty BEP 44 `salt` is treated as absent. Tracker URL sanitization now redacts path-based passkeys and URL userinfo; `session.key` is created with `0600` permissions atomically (no TOCTOU); legacy plaintext session state is migrated into the encrypted store. Config `${VAR}` expansion is sanitized before TOML parsing; SIGHUP now warns when a non-reloadable security setting changed instead of silently ignoring it. UPnP `serviceType` is allowlisted; private torrents no longer drop all BEP 10 extended messages, only `ut_pex`/`ut_holepunch`. Plus: a `subscribe_torrent_detail` refresh-interval floor, a pagination-overflow fix, CRLF-stripping on syslog fields, and `docker-entrypoint.sh` config args passed as a safe positional array instead of string interpolation.
+
+**Known tradeoff, left as-is:** `SearchManager::search`'s per-query fetch intentionally still allows local/LAN addresses (`LocalPolicy::AllowAny`) — self-hosted search indexers (Jackett/Prowlarr-style) are a supported use case, and the engine's URL template is operator-added, not attacker-supplied.
+
+**Also in this release:** `SwarmEngine::new()` no longer defaults to real NAT-PMP/UPnP/PCP discovery. Dozens of tests across the workspace construct a `SwarmEngine` and call `start_listener()` without wanting port-mapping behavior at all — the constructor silently enabled it anyway, so every one of them sent real NAT-PMP/UPnP/PCP broadcasts onto the local network on every `cargo test` run. The actual daemon is unaffected (`main.rs` always sets it explicitly from `network.enable_nat`); only the one test that genuinely exercises NAT discovery (against a local mock gateway) now opts in.
+
 ## [2.2.22] - 2026-10-10
 
 ### Fixed

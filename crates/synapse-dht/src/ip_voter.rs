@@ -32,9 +32,40 @@ fn voter_key(voter: IpAddr) -> Vec<u8> {
     }
 }
 
-/// Reported addresses that can never be our public address.
+/// Reported addresses that can never be our public internet address.
 fn plausible(reported: IpAddr) -> bool {
-    !(reported.is_unspecified() || reported.is_loopback() || reported.is_multicast())
+    if reported.is_unspecified() || reported.is_loopback() || reported.is_multicast() {
+        return false;
+    }
+    match reported {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            if v4.is_private()
+                || v4.is_link_local()
+                || v4.is_broadcast()
+                || o[0] == 0
+                || (o[0] == 100 && (o[1] & 0xC0) == 64) // RFC 6598 CGNAT 100.64.0.0/10
+                || o[0] >= 240
+            {
+                return false;
+            }
+            true
+        }
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return plausible(IpAddr::V4(v4));
+            }
+            let s = v6.segments();
+            // Reject ULA (fc00::/7), link-local (fe80::/10), and documentation (2001:db8::/32)
+            if (s[0] & 0xfe00) == 0xfc00
+                || (s[0] & 0xffc0) == 0xfe80
+                || (s[0] == 0x2001 && s[1] == 0x0db8)
+            {
+                return false;
+            }
+            true
+        }
+    }
 }
 
 impl IpVoter {
@@ -138,6 +169,14 @@ mod tests {
         for n in 0..20u8 {
             assert_eq!(v.vote(voter(n), "0.0.0.0".parse().unwrap()), None);
             assert_eq!(v.vote(voter(n), "127.0.0.1".parse().unwrap()), None);
+            assert_eq!(v.vote(voter(n), "10.0.0.1".parse().unwrap()), None);
+            assert_eq!(v.vote(voter(n), "172.16.5.4".parse().unwrap()), None);
+            assert_eq!(v.vote(voter(n), "192.168.1.1".parse().unwrap()), None);
+            assert_eq!(v.vote(voter(n), "169.254.1.1".parse().unwrap()), None);
+            assert_eq!(v.vote(voter(n), "100.64.0.1".parse().unwrap()), None);
+            assert_eq!(v.vote(voter(n), "240.0.0.1".parse().unwrap()), None);
+            assert_eq!(v.vote(voter(n), "fc00::1".parse().unwrap()), None);
+            assert_eq!(v.vote(voter(n), "fe80::1".parse().unwrap()), None);
         }
         assert_eq!(v.consensus(), None);
         assert_eq!(

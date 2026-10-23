@@ -18,9 +18,14 @@ impl LocalWebSeedResolver {
     /// Searches configured local cache directories for a file matching the relative path.
     pub fn find_local_file(&self, relative_path: &Path) -> Option<PathBuf> {
         for dir in &self.cache_dirs {
+            if crate::fs::verify_no_symlinks_under(dir, relative_path).is_err() {
+                continue;
+            }
             let candidate = dir.join(relative_path);
-            if candidate.exists() && candidate.is_file() {
-                return Some(candidate);
+            if let Ok(meta) = std::fs::symlink_metadata(&candidate) {
+                if meta.file_type().is_file() {
+                    return Some(candidate);
+                }
             }
         }
         None
@@ -38,6 +43,30 @@ mod tests {
         assert_eq!(
             resolver.find_local_file(Path::new("non_existent_file.iso")),
             None
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_bep38_local_resolver_rejects_symlinks_and_parent_traversal() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let outside_dir = tempfile::tempdir().unwrap();
+        let secret = outside_dir.path().join("secret.bin");
+        std::fs::write(&secret, b"secret-data").unwrap();
+
+        let symlink_path = temp_dir.path().join("linked.bin");
+        std::os::unix::fs::symlink(&secret, &symlink_path).unwrap();
+
+        let resolver = LocalWebSeedResolver::new(vec![temp_dir.path().to_path_buf()]);
+        assert_eq!(
+            resolver.find_local_file(Path::new("linked.bin")),
+            None,
+            "Symlinks in local webseed cache must be rejected"
+        );
+        assert_eq!(
+            resolver.find_local_file(Path::new("../secret.bin")),
+            None,
+            "Parent traversal in local webseed cache must be rejected"
         );
     }
 }

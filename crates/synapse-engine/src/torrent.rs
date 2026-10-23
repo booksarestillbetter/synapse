@@ -354,7 +354,11 @@ struct PeerState {
     last_requested_piece: Option<u32>,
 }
 
+const MAX_IN_PROGRESS_PIECES: usize = 256;
+const MAX_IN_PROGRESS_BYTES: usize = 256 * 1024 * 1024;
+
 struct InProgressPiece {
+    piece_len: u32,
     buf: Vec<u8>,
     received_blocks: HashSet<u32>,
     expected_blocks: usize,
@@ -367,10 +371,17 @@ impl InProgressPiece {
     fn new(piece_len: u32) -> InProgressPiece {
         let expected_blocks = (piece_len as usize).div_ceil(BLOCK_LEN as usize);
         InProgressPiece {
-            buf: vec![0u8; piece_len as usize],
-            received_blocks: HashSet::with_capacity(expected_blocks),
+            piece_len,
+            buf: Vec::new(),
+            received_blocks: HashSet::new(),
             expected_blocks,
-            contributors: HashMap::with_capacity(expected_blocks),
+            contributors: HashMap::new(),
+        }
+    }
+
+    fn ensure_allocated(&mut self) {
+        if self.buf.is_empty() && self.piece_len > 0 {
+            self.buf.resize(self.piece_len as usize, 0);
         }
     }
 
@@ -1041,15 +1052,54 @@ impl Torrent {
                 self.picker.peer_lost(i);
             }
         }
-        for ((idx, _), _) in peer.in_flight.drain() {
-            if !self.picker.have(idx) {
-                let any_in_flight = self
-                    .peers
-                    .values()
-                    .any(|p| p.in_flight.keys().any(|&(i, _)| i == idx));
-                if !any_in_flight {
-                    self.picker.mark_missing(idx);
+        let drained_pieces: Vec<u32> = peer.in_flight.drain().map(|((idx, _), _)| idx).collect();
+        for idx in drained_pieces {
+            self.cleanup_abandoned_piece(idx);
+        }
+        if !self.metadata_resolved {
+            if let Some(fetcher) = self.metadata_fetcher.as_mut() {
+                if fetcher.pieces_received == 0 {
+                    fetcher.reset();
                 }
+            }
+        }
+    }
+
+    fn can_start_new_in_progress_piece(&self, piece_len: u32) -> bool {
+        if self.in_progress.len() >= MAX_IN_PROGRESS_PIECES {
+            return false;
+        }
+        let allocated: usize = self
+            .in_progress
+            .values()
+            .map(|p| {
+                if p.buf.is_empty() {
+                    p.piece_len as usize
+                } else {
+                    p.buf.len()
+                }
+            })
+            .fold(0usize, usize::saturating_add);
+        allocated.saturating_add(piece_len as usize) <= MAX_IN_PROGRESS_BYTES
+    }
+
+    fn cleanup_abandoned_piece(&mut self, idx: u32) {
+        if self.picker.have(idx) {
+            return;
+        }
+        let any_in_flight = self
+            .peers
+            .values()
+            .any(|p| p.in_flight.keys().any(|&(i, _)| i == idx));
+        if !any_in_flight {
+            self.picker.mark_missing(idx);
+            if self
+                .in_progress
+                .get(&idx)
+                .is_some_and(|p| p.received_blocks.is_empty())
+            {
+                self.in_progress.remove(&idx);
+                self.exclusive_pieces.remove(&idx);
             }
         }
     }
@@ -1066,16 +1116,7 @@ impl Torrent {
                     Vec::new()
                 };
                 for idx in &drained {
-                    let idx = *idx;
-                    if !self.picker.have(idx) {
-                        let any_in_flight = self
-                            .peers
-                            .values()
-                            .any(|peer| peer.in_flight.keys().any(|&(i, _)| i == idx));
-                        if !any_in_flight {
-                            self.picker.mark_missing(idx);
-                        }
-                    }
+                    self.cleanup_abandoned_piece(*idx);
                 }
                 if !drained.is_empty() {
                     let other_unchoked: Vec<PeerId> = self
@@ -1220,11 +1261,14 @@ impl Torrent {
                 self.maybe_show_interest(id).await;
                 self.try_request_more(id).await;
             }
-            Message::RejectRequest { index, .. } => {
+            Message::RejectRequest { index, begin, .. } => {
                 if let Some(ref m) = self.global_metrics {
                     m.piece_rejects_total.fetch_add(1, Ordering::Relaxed);
                 }
-                self.picker.mark_missing(index);
+                if let Some(peer) = self.peers.get_mut(&id) {
+                    peer.in_flight.remove(&(index, begin));
+                }
+                self.cleanup_abandoned_piece(index);
             }
             Message::Cancel { .. } => {}
             Message::Port(port) => {
@@ -1235,18 +1279,19 @@ impl Torrent {
                 id: ext_id,
                 payload,
             } => {
-                // BEP 10 / BEP 11 / BEP 27: Extension messages (including ut_pex) are strictly discarded
-                // when info.private is true.
-                if self.info.private {
-                    tracing::trace!(peer = %id, ext_id, "Ignoring extension message on private swarm (BEP 27)");
-                } else if ext_id == 0 {
+                if ext_id == 0 {
                     // BEP 10: the peer's own extension handshake. `hs.m` names the ids
                     // *we* must use when sending extension messages *to this peer* --
                     // stored for that purpose (see `maybe_broadcast_pex` and the ut_metadata
                     // request below), independent of the fixed ids we expect incoming
                     // messages addressed to *us* to use (`EXT_ID_UT_METADATA`/`EXT_ID_UT_PEX`).
                     match ExtensionHandshake::decode(&payload) {
-                        Ok(hs) => {
+                        Ok(mut hs) => {
+                            if self.info.private {
+                                // BEP 27: Never negotiate or send PEX/holepunch on private torrents.
+                                hs.m.remove("ut_pex");
+                                hs.m.remove("ut_holepunch");
+                            }
                             let their_metadata_id = hs.m.get("ut_metadata").copied();
                             let their_metadata_size = hs.metadata_size;
                             if let Some(p) = self.peers.get_mut(&id) {
@@ -1272,6 +1317,9 @@ impl Torrent {
                                     tracing::debug!(peer = %id, "Malformed ut_metadata message: {e}");
                                 }
                             }
+                        }
+                        EXT_ID_UT_PEX if self.info.private => {
+                            tracing::trace!(peer = %id, "Ignoring ut_pex message on private swarm (BEP 27)");
                         }
                         EXT_ID_UT_PEX => match synapse_wire::UtPexMessage::decode(&payload) {
                             Ok(pex_msg) => {
@@ -1299,6 +1347,9 @@ impl Torrent {
                                 tracing::debug!(peer = %id, "Malformed ut_pex message: {e}");
                             }
                         },
+                        EXT_ID_UT_HOLEPUNCH if self.info.private => {
+                            tracing::trace!(peer = %id, "Ignoring ut_holepunch message on private swarm (BEP 27)");
+                        }
                         EXT_ID_UT_HOLEPUNCH => {
                             match synapse_wire::HolepunchMessage::decode(payload) {
                                 Ok(hp_msg) => self.on_holepunch_message(id, hp_msg).await,
@@ -1545,10 +1596,14 @@ impl Torrent {
                 });
                 match allowed_cand {
                     Some(&idx) => {
+                        let piece_len = self.info.piece_len(idx);
+                        if !self.can_start_new_in_progress_piece(piece_len) {
+                            return;
+                        }
                         self.picker.mark_requested(idx);
                         self.in_progress
                             .entry(idx)
-                            .or_insert_with(|| InProgressPiece::new(self.info.piece_len(idx)));
+                            .or_insert_with(|| InProgressPiece::new(piece_len));
                         if on_parole {
                             self.exclusive_pieces.insert(idx, my_ip);
                         }
@@ -1581,13 +1636,17 @@ impl Torrent {
 
                 match chosen {
                     Some(idx) => {
+                        let piece_len = self.info.piece_len(idx);
+                        if !self.can_start_new_in_progress_piece(piece_len) {
+                            return;
+                        }
                         if let Some(p) = self.peers.get_mut(&id) {
                             p.last_requested_piece = Some(idx);
                         }
                         self.picker.mark_requested(idx);
                         self.in_progress
                             .entry(idx)
-                            .or_insert_with(|| InProgressPiece::new(self.info.piece_len(idx)));
+                            .or_insert_with(|| InProgressPiece::new(piece_len));
                         if on_parole {
                             self.exclusive_pieces.insert(idx, my_ip);
                         }
@@ -1699,7 +1758,7 @@ impl Torrent {
         }
         let start = begin as usize;
         let end = start + data.len();
-        if end > piece.buf.len() {
+        if end > piece.piece_len as usize {
             tracing::warn!(
                 peer = id,
                 index,
@@ -1709,6 +1768,7 @@ impl Torrent {
             self.try_request_more(id).await;
             return;
         }
+        piece.ensure_allocated();
         piece.buf[start..end].copy_from_slice(&data);
         piece.received_blocks.insert(begin);
         piece.contributors.insert(begin, source_ip);
@@ -1930,6 +1990,13 @@ impl Torrent {
             if synapse_meta::is_padding_file(&self.info.files[loc.file].path, None) {
                 continue;
             }
+            let rel_path = std::path::Path::new(&self.info.files[loc.file].path);
+            crate::fs::verify_no_symlinks_under(&self.download_dir, rel_path).map_err(|e| {
+                diskio::DiskError::Io {
+                    path: self.download_dir.join(rel_path),
+                    source: e,
+                }
+            })?;
             let normal_path = self.download_dir.join(&self.info.files[loc.file].path);
             let slice_len = loc.piece_range.len();
             let (target_path, target_offset, part_len) = self.part_file.resolve_write_location(
@@ -1972,6 +2039,13 @@ impl Torrent {
                 buf[loc.piece_range].fill(0);
                 continue;
             }
+            let rel_path = std::path::Path::new(&self.info.files[loc.file].path);
+            crate::fs::verify_no_symlinks_under(&self.download_dir, rel_path).map_err(|e| {
+                diskio::DiskError::Io {
+                    path: self.download_dir.join(rel_path),
+                    source: e,
+                }
+            })?;
             let normal_path = self.download_dir.join(&self.info.files[loc.file].path);
             let (target_path, target_offset) =
                 self.part_file
@@ -2065,6 +2139,23 @@ impl Torrent {
         peer.uploaded_to += length as u64;
 
         let download_dir = self.download_dir.clone();
+        for loc in &locations {
+            if !synapse_meta::is_padding_file(&self.info.files[loc.file].path, None)
+                && crate::fs::verify_no_symlinks_under(
+                    &download_dir,
+                    &self.info.files[loc.file].path,
+                )
+                .is_err()
+            {
+                drop(slot);
+                let _ = handle.try_send(Message::RejectRequest {
+                    index,
+                    begin,
+                    length,
+                });
+                return;
+            }
+        }
         let file_paths: Vec<BlockReadSlice> = locations
             .into_iter()
             .map(|loc| {
@@ -2232,11 +2323,15 @@ impl Torrent {
                     })
                     .await;
             }
-            UtMetadataMessage::Data { piece, data, .. } => {
+            UtMetadataMessage::Data {
+                piece,
+                total_size,
+                data,
+            } => {
                 let Some(fetcher) = self.metadata_fetcher.as_mut() else {
                     return;
                 };
-                match fetcher.add_piece(piece, data) {
+                match fetcher.add_piece_with_total_size(piece, total_size, data) {
                     Ok(Some(info)) => {
                         tracing::info!(name = %info.name, hash = %hex::encode(info.hash), "Magnet metadata resolved via ut_metadata");
                         if let Some(tx) = self.on_metadata_resolved.take() {
@@ -2246,9 +2341,12 @@ impl Torrent {
                     }
                     Ok(None) => {}
                     Err(e) => {
-                        // The fetcher has reset itself, so the next source starts clean. Drop
-                        // this peer (it sent a bad chunk, or the completing one) and re-ask
+                        // Reset if no valid pieces are held yet so the next source starts clean.
+                        // Drop this peer (it sent a bad chunk, or the completing one) and re-ask
                         // the remaining peers that advertised the metadata extension.
+                        if fetcher.pieces_received == 0 {
+                            fetcher.reset();
+                        }
                         tracing::warn!(peer = %id, "ut_metadata assembly failed: {e}");
                         self.on_disconnected(id);
                         let sources: Vec<(PeerId, u8, u32)> = self
@@ -2271,6 +2369,29 @@ impl Torrent {
             }
             UtMetadataMessage::Reject { piece } => {
                 tracing::debug!(peer = %id, piece, "Peer rejected ut_metadata request");
+                if !self.metadata_resolved {
+                    if let Some(fetcher) = self.metadata_fetcher.as_mut() {
+                        if fetcher.pieces_received == 0 {
+                            fetcher.reset();
+                            let sources: Vec<(PeerId, u8, u32)> = self
+                                .peers
+                                .iter()
+                                .filter(|(&pid, _)| pid != id)
+                                .filter_map(|(&pid, p)| {
+                                    Some((
+                                        pid,
+                                        *p.peer_extensions.get("ut_metadata")?,
+                                        p.peer_metadata_size?,
+                                    ))
+                                })
+                                .collect();
+                            for (pid, ext, size) in sources {
+                                self.maybe_request_metadata(pid, Some(ext), Some(size))
+                                    .await;
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -2468,9 +2589,11 @@ impl Torrent {
         }
 
         self.webseed.as_mut().unwrap().on_success(seed_idx);
+        let piece_len = buf.len() as u32;
         self.in_progress.insert(
             index,
             InProgressPiece {
+                piece_len,
                 buf,
                 received_blocks: HashSet::new(),
                 expected_blocks: 0,
@@ -2640,13 +2763,7 @@ impl Torrent {
             }
 
             for idx in timed_out_pieces {
-                let piece_still_in_flight = self
-                    .peers
-                    .values()
-                    .any(|p| p.in_flight.keys().any(|&(piece_idx, _)| piece_idx == idx));
-                if !piece_still_in_flight && !self.picker.have(idx) {
-                    self.picker.mark_missing(idx);
-                }
+                self.cleanup_abandoned_piece(idx);
             }
 
             for peer_id in active_peers {
@@ -2783,6 +2900,10 @@ impl Torrent {
         let Some(file) = self.info.files.get(file_idx) else {
             return;
         };
+        if let Err(e) = crate::fs::verify_no_symlinks_under(&self.download_dir, &file.path) {
+            tracing::error!(name = %self.info.name, file_idx, "part-file migration refused symlink path: {e}");
+            return;
+        }
         let real_path = Arc::new(self.download_dir.join(&file.path));
         let file_len = file.length;
         let part_path = Arc::new(self.part_file.part_file_path().to_path_buf());
@@ -2891,9 +3012,18 @@ impl Torrent {
             let tx = res_tx.clone();
 
             let mut read_slices = Vec::with_capacity(locations.len());
+            let mut symlink_blocked = false;
             for loc in locations {
                 if synapse_meta::is_padding_file(&info.files[loc.file].path, None) {
                     read_slices.push((None, loc.piece_range));
+                } else if crate::fs::verify_no_symlinks_under(
+                    &self.download_dir,
+                    &info.files[loc.file].path,
+                )
+                .is_err()
+                {
+                    symlink_blocked = true;
+                    break;
                 } else {
                     let normal_path = self.download_dir.join(&info.files[loc.file].path);
                     let (target_path, target_offset) = self.part_file.resolve_read_location(
@@ -2910,6 +3040,10 @@ impl Torrent {
                         loc.piece_range,
                     ));
                 }
+            }
+            if symlink_blocked {
+                let _ = tx.send((idx, false, None)).await;
+                continue;
             }
 
             let expected_v1 = info
@@ -3039,6 +3173,39 @@ impl Torrent {
         if new_dir == self.download_dir {
             return;
         }
+        if !new_dir.is_absolute()
+            || new_dir
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            tracing::error!(
+                name = %self.info.name,
+                to = %new_dir.display(),
+                "set_location: rejecting non-absolute or '..'-containing destination path"
+            );
+            return;
+        }
+        if let Ok(meta) = tokio::fs::symlink_metadata(&new_dir).await {
+            if meta.file_type().is_symlink() {
+                tracing::error!(
+                    name = %self.info.name,
+                    to = %new_dir.display(),
+                    "set_location: rejecting symlink destination directory"
+                );
+                return;
+            }
+        }
+        if let Ok(meta) = tokio::fs::symlink_metadata(&self.download_dir).await {
+            if meta.file_type().is_symlink() {
+                tracing::error!(
+                    name = %self.info.name,
+                    from = %self.download_dir.display(),
+                    "set_location: rejecting symlink source directory"
+                );
+                return;
+            }
+        }
+
         tracing::info!(name = %self.info.name, from = %self.download_dir.display(), to = %new_dir.display(), "moving torrent data");
 
         if let Err(e) = tokio::fs::create_dir_all(&new_dir).await {
@@ -3046,36 +3213,80 @@ impl Torrent {
             return;
         }
 
-        let mut moved: Vec<(PathBuf, PathBuf)> = Vec::new();
-        for file in &self.info.files {
-            let src = self.download_dir.join(&file.path);
-            let dst = new_dir.join(&file.path);
+        // Only move files when the torrent has verified at least one piece; an unverified
+        // torrent must not relocate preexisting host files out of download_dir.
+        let has_verified_data = self.picker.completed_count() > 0
+            || self
+                .bitfield
+                .read()
+                .as_ref()
+                .is_some_and(|b| b.count_ones() > 0);
 
-            if !tokio::fs::try_exists(&src).await.unwrap_or(false) {
-                continue; // not downloaded yet (or already gone) — nothing to move
-            }
-            if let Some(parent) = dst.parent() {
-                if let Err(e) = tokio::fs::create_dir_all(parent).await {
-                    tracing::error!(name = %self.info.name, "set_location: failed to create {}: {}, rolling back", parent.display(), e);
+        let mut moved: Vec<(PathBuf, PathBuf)> = Vec::new();
+        if has_verified_data {
+            for file in &self.info.files {
+                if let Err(e) = crate::fs::verify_no_symlinks_under(&self.download_dir, &file.path)
+                {
+                    tracing::error!(name = %self.info.name, "set_location: unsafe source file path {}: {}, rolling back", file.path.display(), e);
                     Self::rollback_moves(&moved).await;
                     return;
                 }
-            }
-            if let Err(rename_err) = tokio::fs::rename(&src, &dst).await {
-                if let Err(copy_err) = tokio::fs::copy(&src, &dst).await {
-                    tracing::error!(
-                        name = %self.info.name,
-                        "set_location: failed to move {} (rename: {}, copy: {}), rolling back",
-                        src.display(), rename_err, copy_err
-                    );
+                if let Err(e) = crate::fs::verify_no_symlinks_under(&new_dir, &file.path) {
+                    tracing::error!(name = %self.info.name, "set_location: unsafe destination file path {}: {}, rolling back", file.path.display(), e);
                     Self::rollback_moves(&moved).await;
                     return;
                 }
-                if let Err(e) = tokio::fs::remove_file(&src).await {
-                    tracing::warn!(name = %self.info.name, "set_location: copied {} but couldn't remove original {}: {}", dst.display(), src.display(), e);
+
+                let src = self.download_dir.join(&file.path);
+                let dst = new_dir.join(&file.path);
+
+                match tokio::fs::symlink_metadata(&src).await {
+                    Ok(meta) => {
+                        if !meta.file_type().is_file() {
+                            tracing::error!(name = %self.info.name, "set_location: source {} is not a regular file, rolling back", src.display());
+                            Self::rollback_moves(&moved).await;
+                            return;
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(e) => {
+                        tracing::error!(name = %self.info.name, "set_location: failed to stat {}: {}, rolling back", src.display(), e);
+                        Self::rollback_moves(&moved).await;
+                        return;
+                    }
                 }
+
+                if let Ok(dst_meta) = tokio::fs::symlink_metadata(&dst).await {
+                    if dst_meta.file_type().is_symlink() || dst_meta.file_type().is_dir() {
+                        tracing::error!(name = %self.info.name, "set_location: destination {} is a symlink or directory, rolling back", dst.display());
+                        Self::rollback_moves(&moved).await;
+                        return;
+                    }
+                }
+
+                if let Some(parent) = dst.parent() {
+                    if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                        tracing::error!(name = %self.info.name, "set_location: failed to create {}: {}, rolling back", parent.display(), e);
+                        Self::rollback_moves(&moved).await;
+                        return;
+                    }
+                }
+                if let Err(rename_err) = tokio::fs::rename(&src, &dst).await {
+                    if let Err(copy_err) = tokio::fs::copy(&src, &dst).await {
+                        tracing::error!(
+                            name = %self.info.name,
+                            "set_location: failed to move {} (rename: {}, copy: {}), rolling back",
+                            src.display(), rename_err, copy_err
+                        );
+                        Self::rollback_moves(&moved).await;
+                        return;
+                    }
+                    if let Err(e) = tokio::fs::remove_file(&src).await {
+                        tracing::warn!(name = %self.info.name, "set_location: copied {} but couldn't remove original {}: {}", dst.display(), src.display(), e);
+                    }
+                }
+                moved.push((src, dst));
             }
-            moved.push((src, dst));
         }
 
         self.download_dir = new_dir.clone();
@@ -3131,6 +3342,18 @@ impl Torrent {
                 }
             }
             synapse_wire::HolepunchMessage::Connect { peer } => {
+                let Some(source_ip) = self.peers.get(&id).map(|p| p.peer_info.addr.ip()) else {
+                    return;
+                };
+                if !crate::pex::holepunch_address_allowed(peer, source_ip) {
+                    tracing::debug!(
+                        from_peer = %id,
+                        %peer,
+                        %source_ip,
+                        "Rejecting disallowed ut_holepunch Connect peer address"
+                    );
+                    return;
+                }
                 tracing::debug!(peer = %peer, "Received ut_holepunch Connect rendezvous directive; dialing peer via uTP");
                 if let Some(ref tx) = self.on_peers_discovered {
                     let _ = tx.try_send(vec![peer]);
@@ -3620,8 +3843,8 @@ impl Torrent {
         let files = self.info.files.clone();
         for (file_idx, file) in files.iter().enumerate() {
             if let Some(cached_path) = resolver.find_local_file(&file.path) {
-                if let Ok(meta) = tokio::fs::metadata(&cached_path).await {
-                    if meta.len() == file.length {
+                if let Ok(meta) = tokio::fs::symlink_metadata(&cached_path).await {
+                    if meta.file_type().is_file() && meta.len() == file.length {
                         if let Some((start_p, end_p)) = self.info.piece_range_for_file(file_idx) {
                             for p in start_p..=end_p {
                                 if !self.picker.have(p) {

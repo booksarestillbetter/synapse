@@ -83,9 +83,34 @@ impl MetadataFetcher {
         missing
     }
 
+    /// Processes a `ut_metadata` `Data` payload that includes the sender's `total_size` field.
+    /// Rejects zero or oversized `total_size` values, and if no pieces have been accepted yet,
+    /// allows a peer delivering actual piece data to supersede an unfulfilled size declaration
+    /// from an earlier peer.
+    pub fn add_piece_with_total_size(
+        &mut self,
+        piece_idx: u32,
+        total_size: u32,
+        data: Bytes,
+    ) -> Result<Option<Info>, &'static str> {
+        if total_size == 0 || total_size > MAX_METADATA_SIZE {
+            return Err("invalid or oversized metadata total_size");
+        }
+        if self.total_size.is_none() {
+            self.set_metadata_size(total_size);
+        } else if self.total_size != Some(total_size) && self.pieces_received == 0 {
+            self.reset();
+            self.set_metadata_size(total_size);
+        }
+        self.add_piece(piece_idx, data)
+    }
+
     /// Adds a received metadata piece chunk. If this completes the metadata,
     /// verifies the SHA-1 hash against `info_hash` and returns the parsed `Info`.
     pub fn add_piece(&mut self, piece_idx: u32, data: Bytes) -> Result<Option<Info>, &'static str> {
+        if self.total_size.is_none() {
+            return Err("metadata size not initialized");
+        }
         let idx = piece_idx as usize;
         if idx >= self.pieces.len() {
             return Err("metadata piece index out of bounds");
@@ -257,5 +282,32 @@ mod tests {
         let mut blind = MetadataFetcher::new(truncated);
         blind.set_metadata_size(raw.len() as u32);
         assert!(blind.add_piece(0, Bytes::from(raw)).is_err());
+    }
+
+    #[test]
+    fn test_metadata_fetcher_recovers_from_poisoned_size_when_honest_peer_sends_data() {
+        let (raw_metadata, info_hash) = build_dummy_info_dict("honest.iso");
+        let mut fetcher = MetadataFetcher::new(info_hash);
+
+        // Dishonest peer declares a wrong size in handshake and never sends valid pieces.
+        assert!(fetcher.set_metadata_size(1_000_000));
+        assert_eq!(fetcher.total_size, Some(1_000_000));
+
+        // Oversized total_size in a Data message is rejected.
+        assert!(fetcher
+            .add_piece_with_total_size(0, MAX_METADATA_SIZE + 1, Bytes::from(vec![0; 16]))
+            .is_err());
+
+        // Honest peer delivers actual Data with the true total_size; fetcher recovers and verifies.
+        let info = fetcher
+            .add_piece_with_total_size(
+                0,
+                raw_metadata.len() as u32,
+                Bytes::from(raw_metadata.clone()),
+            )
+            .unwrap()
+            .expect("honest peer metadata should resolve");
+        assert_eq!(info.name, "honest.iso");
+        assert_eq!(info.hash, info_hash);
     }
 }

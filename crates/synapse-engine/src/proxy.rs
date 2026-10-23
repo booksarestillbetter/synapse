@@ -59,6 +59,15 @@ impl ProxySettings {
         };
         format!("{scheme}://{auth}{host}:{}", self.port)
     }
+
+    /// Returns the proxy URL for tracker/HTTP traffic when `proxy_http` or `force_proxy` is set.
+    pub fn tracker_proxy_url(&self) -> Option<String> {
+        if self.proxy_http || self.force_proxy {
+            Some(self.url())
+        } else {
+            None
+        }
+    }
 }
 
 fn encode_userinfo(s: &str) -> String {
@@ -79,10 +88,7 @@ static GLOBAL: RwLock<Option<ProxySettings>> = RwLock::new(None);
 /// Installs (or clears) the process-wide proxy, including the one `safe_http` uses.
 pub fn set_global(settings: Option<ProxySettings>) {
     synapse_tracker::safe_http::set_proxy(
-        settings
-            .as_ref()
-            .filter(|s| s.proxy_http)
-            .map(ProxySettings::url),
+        settings.as_ref().and_then(ProxySettings::tracker_proxy_url),
     );
     *GLOBAL.write().unwrap_or_else(|e| e.into_inner()) = settings;
 }
@@ -93,17 +99,25 @@ pub fn global() -> Option<ProxySettings> {
 
 /// True when peer connections must not use UDP (uTP): a proxy carries them, and it carries TCP.
 pub fn peers_use_proxy() -> bool {
-    global().is_some_and(|p| p.proxy_peer_connections)
+    global().is_some_and(|p| p.proxy_peer_connections || p.force_proxy)
 }
 
 pub fn force_proxy() -> bool {
     global().is_some_and(|p| p.force_proxy)
 }
 
-/// Opens a TCP connection to a peer, through the proxy when peer connections are proxied.
+/// Opens a TCP connection to a peer, through the proxy when peer connections are proxied
+/// or when `force_proxy` is enabled.
 pub async fn connect_peer(addr: SocketAddr) -> std::io::Result<TcpStream> {
-    match global().filter(|p| p.proxy_peer_connections) {
-        Some(proxy) => connect_via(&proxy, addr).await,
+    match global().filter(|p| p.proxy_peer_connections || p.force_proxy) {
+        Some(proxy) => {
+            if proxy.host.trim().is_empty() || proxy.port == 0 {
+                return Err(proxy_error(
+                    "proxy or force_proxy is enabled without a valid proxy host and port",
+                ));
+            }
+            connect_via(&proxy, addr).await
+        }
         None => TcpStream::connect(addr).await,
     }
 }

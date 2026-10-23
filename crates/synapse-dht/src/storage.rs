@@ -72,22 +72,33 @@ pub fn compute_immutable_target(value: &[u8]) -> [u8; 20] {
 pub fn compute_mutable_target(public_key: &[u8; 32], salt: Option<&[u8]>) -> [u8; 20] {
     let mut hasher = Sha1::new();
     hasher.update(public_key);
-    if let Some(s) = salt {
+    if let Some(s) = salt.filter(|s| !s.is_empty()) {
         hasher.update(s);
     }
     hasher.finalize().into()
 }
 
 /// Formats the raw byte payload that must be signed for a BEP 44 mutable item.
+/// Per BEP 44, zero-length salt values are omitted from the signed buffer.
 pub fn format_sign_payload(salt: Option<&[u8]>, seq: u64, value_bencode: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
-    if let Some(s) = salt {
+    if let Some(s) = salt.filter(|s| !s.is_empty()) {
         out.extend_from_slice(format!("4:salt{}:", s.len()).as_bytes());
         out.extend_from_slice(s);
     }
     out.extend_from_slice(format!("3:seqi{}e1:v", seq).as_bytes());
     out.extend_from_slice(value_bencode);
     out
+}
+
+/// Verifies an Ed25519 signature over `payload` using strict verification.
+pub fn verify_ed25519(public_key: &[u8; 32], payload: &[u8], sig: &[u8; 64]) -> bool {
+    let Ok(verifying_key) = VerifyingKey::from_bytes(public_key) else {
+        return false;
+    };
+    verifying_key
+        .verify_strict(payload, &Signature::from_bytes(sig))
+        .is_ok()
 }
 
 pub struct DhtStorage {

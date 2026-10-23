@@ -14,6 +14,7 @@ use tokio_stream::StreamExt;
 async fn test_grpc_add_and_remove_torrent_with_swarm_engine() {
     let disk = Arc::new(DiskEngine::auto().await);
     let swarm = Arc::new(SwarmEngine::new(disk, [0x01; 20]));
+    swarm.settings().write().download_dir = std::path::PathBuf::from("/tmp/downloads");
     let event_bus = Arc::new(EventBus::new(256));
     let service = SynapseService::new(event_bus.clone()).with_swarm_engine(swarm.clone());
 
@@ -104,6 +105,7 @@ async fn test_grpc_add_and_remove_torrent_with_swarm_engine() {
 async fn test_grpc_subscribe_alerts() {
     let disk = Arc::new(DiskEngine::auto().await);
     let swarm = Arc::new(SwarmEngine::new(disk, [0x02; 20]));
+    swarm.settings().write().download_dir = std::path::PathBuf::from("/tmp/downloads");
     let event_bus = Arc::new(EventBus::new(256));
     let service = SynapseService::new(event_bus.clone()).with_swarm_engine(swarm.clone());
 

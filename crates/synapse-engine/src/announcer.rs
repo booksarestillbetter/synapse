@@ -6,7 +6,7 @@
 //! randomized startup jitter, bounds concurrency, and handles exponential backoff.
 
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -20,7 +20,43 @@ use synapse_tracker::{AnnounceRequest, CanaryCircuitBreaker, Event};
 
 use crate::circuit_breaker::PeerCircuitBreaker;
 use crate::peer::{connect_with_options, PeerEvent};
+use crate::pex;
 use crate::swarm::SwarmStats;
+
+/// Best-effort check of whether `tracker_url`'s host is itself on a private/loopback
+/// network, used only to classify peer addresses the tracker hands back (see
+/// `filter_tracker_peers`) -- NOT a security boundary for the tracker fetch itself,
+/// which `synapse_tracker::safe_http` already gates independently. Resolution failure
+/// or timeout returns `None`, which `filter_tracker_peers` treats as "public tracker"
+/// (the strict default), so a DNS hiccup can only make filtering stricter, never looser.
+async fn tracker_source_ip(tracker_url: &url::Url) -> Option<IpAddr> {
+    let host = tracker_url.host_str()?;
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return Some(ip);
+    }
+    let port = tracker_url.port().unwrap_or(80);
+    let addrs = tokio::time::timeout(
+        Duration::from_secs(2),
+        tokio::net::lookup_host((host, port)),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    addrs.map(|a| a.ip()).next()
+}
+
+/// Drops peer addresses a tracker response must never be allowed to steer us toward
+/// dialling: loopback/link-local/private-range targets, unless the tracker we asked is
+/// itself on that kind of network (a genuine private/self-hosted tracker). A malicious
+/// or compromised public tracker returning `127.0.0.1:<port>` or `192.168.x.x:<port>`
+/// peer entries cannot otherwise make us probe our own internal network on its behalf.
+fn filter_tracker_peers(peers: Vec<SocketAddr>, tracker_source: Option<IpAddr>) -> Vec<SocketAddr> {
+    let source = tracker_source.unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+    peers
+        .into_iter()
+        .filter(|addr| pex::pex_address_allowed(*addr, source))
+        .collect()
+}
 
 /// Most tracker URLs taken from a torrent's own announce list.
 const MAX_TRACKERS_PER_TORRENT: usize = 50;
@@ -200,6 +236,11 @@ impl Announcer {
     ) -> Result<synapse_tracker::ScrapeResponse, synapse_tracker::TrackerError> {
         match tracker_url.scheme() {
             "http" | "https" => synapse_tracker::http::scrape(tracker_url, info_hashes).await,
+            "udp" if crate::proxy::global().is_some_and(|p| p.proxy_http || p.force_proxy) => {
+                Err(synapse_tracker::TrackerError::InvalidUrl(
+                    "UDP trackers are not used while a proxy is configured",
+                ))
+            }
             "udp" => {
                 let host = tracker_url
                     .host_str()
@@ -350,7 +391,10 @@ impl Announcer {
                 }
 
                 let (peers_res, interval_res, report) = match tracker_url.scheme() {
-                    "udp" if crate::proxy::global().is_some_and(|p| p.proxy_http) => {
+                    "udp"
+                        if crate::proxy::global()
+                            .is_some_and(|p| p.proxy_http || p.force_proxy) =>
+                    {
                         // UDP cannot go through the proxy, and sending it directly would give
                         // away our address.
                         let rep = TrackerReport {
@@ -469,7 +513,10 @@ impl Announcer {
                                                 resp.interval
                                             );
                                             interval = Some(resp.interval);
-                                            peers.extend(resp.peers.iter().copied());
+                                            peers.extend(filter_tracker_peers(
+                                                resp.peers,
+                                                Some(resolved_addr.ip()),
+                                            ));
                                             let rep = TrackerReport {
                                                 url: tracker_url.to_string(),
                                                 status: "Announced".into(),
@@ -605,7 +652,8 @@ impl Announcer {
                                         votes.insert(url_str.clone(), ip);
                                     }
                                 }
-                                peers.extend(resp.peers.iter().copied());
+                                let tracker_source = tracker_source_ip(&tracker_url).await;
+                                peers.extend(filter_tracker_peers(resp.peers, tracker_source));
                                 let rep = TrackerReport {
                                     url: tracker_url.to_string(),
                                     status: "Announced".into(),
@@ -1148,7 +1196,15 @@ impl AnnounceScheduler {
             let mut existing: HashSet<SocketAddr> = meta.candidate_peers.iter().copied().collect();
             let mut new_peers = Vec::new();
             for addr in peers {
+                let ip = addr.ip();
+                let invalid_ip = ip.is_unspecified()
+                    || ip.is_multicast()
+                    || match ip {
+                        std::net::IpAddr::V4(v4) => v4.is_broadcast() || v4.octets()[0] == 0,
+                        std::net::IpAddr::V6(_) => false,
+                    };
                 if addr.port() != 0
+                    && !invalid_ip
                     && !existing.contains(&addr)
                     && !meta.active_dials.contains(&addr)
                     && self.announcer.circuit_breaker.can_connect(&addr)

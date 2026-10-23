@@ -1,6 +1,75 @@
-//! Filesystem utilities, including real-time available disk space queries.
+//! Filesystem utilities, including real-time available disk space queries
+//! and symlink-safe relative path validation.
 
-use std::path::Path;
+use std::io;
+use std::path::{Component, Path};
+
+/// Verifies that `base` itself is not a symlink (if it exists), that `rel` contains
+/// only normal relative components (no `..`, `.`, root, or prefix), and that no
+/// existing prefix component under `base.join(rel)` is a symlink.
+pub fn verify_no_symlinks_under(base: &Path, rel: &Path) -> io::Result<()> {
+    if rel.as_os_str().is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "relative path must not be empty",
+        ));
+    }
+
+    match std::fs::symlink_metadata(base) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("base path {:?} is a symlink", base),
+            ));
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+
+    let mut cur = base.to_path_buf();
+    let mut saw_component = false;
+    for comp in rel.components() {
+        match comp {
+            Component::Normal(part) => {
+                if part.is_empty() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "empty path component",
+                    ));
+                }
+                saw_component = true;
+                cur.push(part);
+                match std::fs::symlink_metadata(&cur) {
+                    Ok(meta) if meta.file_type().is_symlink() => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("refusing to follow symlink at {:?}", cur),
+                        ));
+                    }
+                    Ok(_) => {}
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("disallowed path component in {:?}", rel),
+                ));
+            }
+        }
+    }
+
+    if !saw_component {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "relative path contained no normal components",
+        ));
+    }
+
+    Ok(())
+}
 
 /// Queries the available disk space in bytes for unprivileged users on the filesystem
 /// containing `path`. If `path` does not exist, it traverses upward to find the nearest

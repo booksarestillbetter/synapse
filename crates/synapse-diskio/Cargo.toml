@@ -16,6 +16,9 @@ tracing = { workspace = true }
 io-uring = "0.6"
 rustix = { version = "0.38", features = ["fs"] }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "test-util"] }
 tempfile = "3"

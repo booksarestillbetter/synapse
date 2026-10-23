@@ -4,6 +4,7 @@
 //! a LAN indexer; redirects from a public origin to a private one are still refused by
 //! [`synapse_tracker::safe_http`]. Results are RSS/Atom feeds, read with the BEP 36 parser.
 
+use std::path::{Component, Path};
 use std::time::Duration;
 
 use parking_lot::RwLock;
@@ -11,6 +12,7 @@ use synapse_meta::bep18::{SearchEngine, MAX_DESCRIPTION_BYTES};
 use synapse_meta::feed::{parse_torrent_feed, FeedItem};
 use synapse_meta::SearchItem;
 use synapse_tracker::safe_http::{fetch, FetchOptions, LocalPolicy};
+use tokio::io::AsyncReadExt;
 
 /// Engines kept, results read per engine, and how long a search may take.
 const MAX_ENGINES: usize = 16;
@@ -18,12 +20,12 @@ const MAX_RESULTS_PER_ENGINE: usize = 200;
 const MAX_RESULT_BYTES: usize = 2 * 1024 * 1024;
 const SEARCH_TIMEOUT: Duration = Duration::from_secs(15);
 
-fn options(max_body: usize) -> FetchOptions {
+fn options(max_body: usize, policy: LocalPolicy) -> FetchOptions {
     FetchOptions {
         timeout: SEARCH_TIMEOUT,
         max_body,
         user_agent: concat!("Synapse/", env!("CARGO_PKG_VERSION")),
-        local: LocalPolicy::AllowAny,
+        local: policy,
         range: None,
     }
 }
@@ -48,7 +50,7 @@ impl SearchManager {
     pub async fn add_source(&self, source: &str) -> Result<SearchEngine, String> {
         let text = if source.starts_with("http://") || source.starts_with("https://") {
             let url = url::Url::parse(source).map_err(|e| format!("bad URL: {e}"))?;
-            let fetched = fetch(&url, &options(MAX_DESCRIPTION_BYTES))
+            let fetched = fetch(&url, &options(MAX_DESCRIPTION_BYTES, LocalPolicy::Deny))
                 .await
                 .map_err(|e| format!("could not fetch the description: {e}"))?;
             if !(200..300).contains(&fetched.status) {
@@ -56,7 +58,27 @@ impl SearchManager {
             }
             String::from_utf8_lossy(&fetched.body).into_owned()
         } else {
-            let bytes = tokio::fs::read(source)
+            let path = Path::new(source);
+            if path.components().any(|c| matches!(c, Component::ParentDir)) {
+                return Err(
+                    "parent directory traversal ('..') is not allowed in source path".into(),
+                );
+            }
+            let meta = tokio::fs::symlink_metadata(path)
+                .await
+                .map_err(|e| format!("could not stat {source}: {e}"))?;
+            if !meta.file_type().is_file() {
+                return Err(format!("{source} is not a regular file"));
+            }
+            if meta.len() > MAX_DESCRIPTION_BYTES as u64 {
+                return Err("description is too large".into());
+            }
+            let file = tokio::fs::File::open(path)
+                .await
+                .map_err(|e| format!("could not open {source}: {e}"))?;
+            let mut bytes = Vec::with_capacity(meta.len() as usize);
+            file.take((MAX_DESCRIPTION_BYTES + 1) as u64)
+                .read_to_end(&mut bytes)
                 .await
                 .map_err(|e| format!("could not read {source}: {e}"))?;
             if bytes.len() > MAX_DESCRIPTION_BYTES {
@@ -121,7 +143,7 @@ impl SearchManager {
 
 async fn query_engine(engine: &SearchEngine, query: &str) -> Result<Vec<SearchItem>, String> {
     let url = engine.search_url(query).map_err(|e| e.to_string())?;
-    let fetched = fetch(&url, &options(MAX_RESULT_BYTES))
+    let fetched = fetch(&url, &options(MAX_RESULT_BYTES, LocalPolicy::AllowAny))
         .await
         .map_err(|e| format!("request failed: {e}"))?;
     if !(200..300).contains(&fetched.status) {

@@ -55,16 +55,14 @@ mkdir -p /var/lib/synapse/session /data/downloads /media/queue 2>/dev/null || tr
 # Prepare command invocation: only pass -c if CONFIG_PATH is a verified existing file
 CMD_EXEC="/usr/local/bin/synapsed"
 if [ -n "$CONFIG_PATH" ] && [ -f "$CONFIG_PATH" ]; then
-    SET_CONFIG="-c $CONFIG_PATH"
-else
-    SET_CONFIG=""
+    set -- -c "$CONFIG_PATH" "$@"
 fi
 
 # If running as root (container default), handle UID/GID mapping and drop privileges
 if [ "$(id -u)" = "0" ]; then
     if [ "$PUID" = "0" ] || [ "$PUID" = "root" ]; then
         echo "Running Synapse as root with config: ${CONFIG_PATH:-built-in defaults}"
-        exec $CMD_EXEC $SET_CONFIG "$@"
+        exec "$CMD_EXEC" "$@"
     fi
 
     # Adjust synapse group GID if necessary
@@ -79,13 +77,15 @@ if [ "$(id -u)" = "0" ]; then
         usermod -o -u "$PUID" synapse 2>/dev/null || true
     fi
 
-    # Ensure ownership of session dir and local config
+    # Ensure ownership of session dir and logs (never /etc/synapse or /usr/share/synapse)
     chown -R "$PUID:$PGID" /var/lib/synapse 2>/dev/null || true
-    if [ -n "$CONFIG_PATH" ] && [ -f "$CONFIG_PATH" ]; then
-        chown "$PUID:$PGID" "$CONFIG_PATH" 2>/dev/null || true
+    if [ -d /var/log/synapse ]; then
+        chown -R "$PUID:$PGID" /var/log/synapse 2>/dev/null || true
     fi
     if [ -d /etc/synapse ]; then
-        chown -R "$PUID:$PGID" /etc/synapse 2>/dev/null || true
+        chmod 755 /etc/synapse 2>/dev/null || true
+        [ -f /etc/synapse/synapse.toml ] && chmod 644 /etc/synapse/synapse.toml 2>/dev/null || true
+        [ -f /etc/synapse/on-complete.sh ] && chmod 755 /etc/synapse/on-complete.sh 2>/dev/null || true
     fi
 
     # Ensure queue staging directory is accessible by PUID:PGID
@@ -95,9 +95,9 @@ if [ "$(id -u)" = "0" ]; then
     fi
 
     echo "Running Synapse as UID $PUID (GID $PGID) with config: ${CONFIG_PATH:-built-in defaults}"
-    exec gosu "$PUID:$PGID" $CMD_EXEC $SET_CONFIG "$@"
+    exec gosu "$PUID:$PGID" "$CMD_EXEC" "$@"
 else
     # Container was started with an explicit non-root user (e.g., docker run --user ...)
     echo "Running Synapse as user $(id -u):$(id -g) with config: ${CONFIG_PATH:-built-in defaults}"
-    exec $CMD_EXEC $SET_CONFIG "$@"
+    exec "$CMD_EXEC" "$@"
 fi

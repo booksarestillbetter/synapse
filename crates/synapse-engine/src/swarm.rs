@@ -672,7 +672,14 @@ impl SwarmEngine {
         let peer_id = crate::peer::with_synapse_prefix(peer_id);
         let listen_port = Arc::new(RwLock::new(0));
         let circuit_breaker = Arc::new(PeerCircuitBreaker::default());
-        let nat_manager = Arc::new(RwLock::new(crate::nat::NatManager::new(true)));
+        // Off by default: NAT-PMP/UPnP/PCP discovery broadcasts on the LAN the instant
+        // `start_listener` runs. The real daemon always calls `.with_nat_enabled(config
+        // .network.enable_nat)` right after construction (main.rs), so this default never
+        // reaches it either way — but every test that just wants a listener, with nothing to
+        // do with port mapping, used to get real LAN traffic as an unannounced side effect of
+        // calling `SwarmEngine::new()`. Opt in explicitly (as `portmap_e2e.rs` does) if a test
+        // actually exercises NAT discovery.
+        let nat_manager = Arc::new(RwLock::new(crate::nat::NatManager::new(false)));
         let settings = Arc::new(RwLock::new(DynamicSessionSettings::default()));
         let announcer = Arc::new(
             Announcer::new(peer_id, listen_port.clone(), circuit_breaker.clone())

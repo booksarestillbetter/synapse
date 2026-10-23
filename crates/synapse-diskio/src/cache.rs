@@ -4,6 +4,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+
 struct Entry {
     file: Arc<File>,
     used: bool,
@@ -56,12 +59,19 @@ impl FileCache {
         }
         // `.truncate(false)` is explicit: this file may already hold partially-downloaded
         // piece data from a previous run, and silently truncating it would lose data.
-        let file = OpenOptions::new()
+        let mut open_opts = OpenOptions::new();
+        open_opts
             .read(true)
             .write(true)
             .create(true)
-            .truncate(false)
-            .open(path)?;
+            .truncate(false);
+        // `O_NOFOLLOW` closes the TOCTOU window between a caller's symlink check (e.g.
+        // `verify_no_symlinks_under`) and this open: if the final path component is a
+        // symlink planted after that check, the open fails with ELOOP instead of
+        // following it. `O_CREAT|O_NOFOLLOW` still creates a missing regular file fine.
+        #[cfg(unix)]
+        open_opts.custom_flags(libc::O_NOFOLLOW);
+        let file = open_opts.open(path)?;
         if let Some(len) = file_len {
             preallocate(&file, len)?;
         }

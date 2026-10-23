@@ -212,8 +212,11 @@ impl UtMetadataMessage {
     }
 
     pub fn decode(payload: &[u8]) -> Result<Self, WireError> {
-        let bencode = decode_buf_first(payload)
+        const MAX_METADATA_TOTAL_SIZE: u32 = 16 * 1024 * 1024;
+        let mut cursor = std::io::Cursor::new(payload);
+        let bencode = synapse_bencode::decode_first(&mut cursor)
             .map_err(|_| WireError::Protocol("malformed ut_metadata message bencode"))?;
+        let header_len = cursor.position() as usize;
 
         let mut dict = bencode.into_dict().ok_or(WireError::Protocol(
             "ut_metadata header must be a bencode dict",
@@ -224,43 +227,59 @@ impl UtMetadataMessage {
             .and_then(|v| v.into_int())
             .ok_or(WireError::Protocol("missing msg_type in ut_metadata"))?;
 
-        let piece = dict
+        let piece_i64 = dict
             .remove(b"piece".as_ref())
             .and_then(|v| v.into_int())
-            .ok_or(WireError::Protocol("missing piece index in ut_metadata"))?
-            as u32;
+            .ok_or(WireError::Protocol("missing piece index in ut_metadata"))?;
+        let piece = u32::try_from(piece_i64)
+            .map_err(|_| WireError::Protocol("invalid piece index in ut_metadata"))?;
 
         match msg_type {
-            0 => Ok(UtMetadataMessage::Request { piece }),
+            0 => {
+                if header_len != payload.len() {
+                    return Err(WireError::Protocol(
+                        "unexpected trailing bytes in ut_metadata request",
+                    ));
+                }
+                Ok(UtMetadataMessage::Request { piece })
+            }
             1 => {
-                let total_size = dict
+                let total_size_i64 = dict
                     .remove(b"total_size".as_ref())
                     .and_then(|v| v.into_int())
                     .ok_or(WireError::Protocol(
                         "missing total_size in ut_metadata data",
-                    ))? as u32;
+                    ))?;
+                let total_size = u32::try_from(total_size_i64)
+                    .ok()
+                    .filter(|&s| s > 0 && s <= MAX_METADATA_TOTAL_SIZE)
+                    .ok_or(WireError::Protocol(
+                        "invalid total_size in ut_metadata data",
+                    ))?;
 
-                // Find where the bencoded header ends to extract raw binary data payload
-                let mut header_buf = Vec::new();
-                // Re-encode dictionary to get exact header length
-                let mut test_dict = BTreeMap::new();
-                test_dict.insert(b"msg_type".to_vec(), BEncode::Int(1));
-                test_dict.insert(b"piece".to_vec(), BEncode::Int(piece as i64));
-                test_dict.insert(b"total_size".to_vec(), BEncode::Int(total_size as i64));
-                BEncode::Dict(test_dict).encode(&mut header_buf).unwrap();
-
-                let header_len = header_buf.len();
-                if payload.len() < header_len {
+                if payload.len() <= header_len {
                     return Err(WireError::Protocol("ut_metadata data payload too short"));
                 }
                 let data = Bytes::copy_from_slice(&payload[header_len..]);
+                if data.is_empty() || data.len() > UT_METADATA_PIECE_LEN {
+                    return Err(WireError::Protocol(
+                        "ut_metadata data chunk length out of bounds",
+                    ));
+                }
                 Ok(UtMetadataMessage::Data {
                     piece,
                     total_size,
                     data,
                 })
             }
-            2 => Ok(UtMetadataMessage::Reject { piece }),
+            2 => {
+                if header_len != payload.len() {
+                    return Err(WireError::Protocol(
+                        "unexpected trailing bytes in ut_metadata reject",
+                    ));
+                }
+                Ok(UtMetadataMessage::Reject { piece })
+            }
             _ => Err(WireError::Protocol("unknown ut_metadata msg_type")),
         }
     }
@@ -542,5 +561,53 @@ mod tests {
             p.extend_from_slice(bad_list);
             assert!(TrHashPiece::decode(&p).is_err(), "{bad_list:?}");
         }
+    }
+
+    #[test]
+    fn test_ut_metadata_extra_keys_and_negative_bounds() {
+        // Data header containing an extra unknown dictionary key must still locate the exact
+        // binary payload start via Cursor position rather than re-encoding only 3 known keys.
+        let mut dict = BTreeMap::new();
+        dict.insert(
+            b"extra_key".to_vec(),
+            BEncode::String(b"padding_val".to_vec()),
+        );
+        dict.insert(b"msg_type".to_vec(), BEncode::Int(1));
+        dict.insert(b"piece".to_vec(), BEncode::Int(0));
+        dict.insert(b"total_size".to_vec(), BEncode::Int(11));
+        let mut payload = Vec::new();
+        BEncode::Dict(dict).encode(&mut payload).unwrap();
+        payload.extend_from_slice(b"hello_world");
+
+        let decoded = UtMetadataMessage::decode(&payload).unwrap();
+        assert_eq!(
+            decoded,
+            UtMetadataMessage::Data {
+                piece: 0,
+                total_size: 11,
+                data: Bytes::from_static(b"hello_world"),
+            }
+        );
+
+        // Negative piece index must be rejected
+        assert!(UtMetadataMessage::decode(b"d8:msg_typei0e5:piecei-1ee").is_err());
+        // Piece index exceeding u32::MAX must be rejected
+        assert!(UtMetadataMessage::decode(b"d8:msg_typei0e5:piecei4294967296ee").is_err());
+        // Negative or zero or > 16 MiB total_size must be rejected
+        assert!(
+            UtMetadataMessage::decode(b"d8:msg_typei1e5:piecei0e10:total_sizei-1eeabc").is_err()
+        );
+        assert!(
+            UtMetadataMessage::decode(b"d8:msg_typei1e5:piecei0e10:total_sizei0eeabc").is_err()
+        );
+        assert!(
+            UtMetadataMessage::decode(b"d8:msg_typei1e5:piecei0e10:total_sizei16777217eeabc")
+                .is_err()
+        );
+        // Empty data payload or > 16 KiB data payload must be rejected
+        assert!(UtMetadataMessage::decode(b"d8:msg_typei1e5:piecei0e10:total_sizei10ee").is_err());
+        let mut oversized = b"d8:msg_typei1e5:piecei0e10:total_sizei32768ee".to_vec();
+        oversized.extend(vec![b'a'; 16385]);
+        assert!(UtMetadataMessage::decode(&oversized).is_err());
     }
 }

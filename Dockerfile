@@ -25,7 +25,9 @@ COPY example_config.toml /etc/synapse/synapse.toml.default
 
 RUN useradd --system --create-home --home-dir /var/lib/synapse synapse \
     && mkdir -p /data/downloads /var/lib/synapse/session /etc/synapse /media \
-    && chown -R synapse:synapse /data /var/lib/synapse /etc/synapse /media /usr/share/synapse
+    && chown -R synapse:synapse /data /var/lib/synapse /media \
+    && chmod 755 /etc/synapse /usr/share/synapse \
+    && chmod 644 /etc/synapse/synapse.toml.default /etc/synapse.default.toml /usr/share/synapse/synapse.toml.default
 
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh

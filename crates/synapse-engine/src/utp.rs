@@ -749,20 +749,13 @@ impl UtpSocketManager {
     }
 
     async fn handle_inbound_syn(&self, syn_pkt: UtpPacket, remote_addr: SocketAddr) {
-        self.pending_syn_count.fetch_add(1, Ordering::Relaxed);
+        if self.connections.read().len() >= self.syn_flood_limit.max(512) {
+            debug!(addr = %remote_addr, "Dropping inbound uTP SYN: connection table limit reached");
+            return;
+        }
         let conn = UtpConnection::new_incoming(&syn_pkt);
         let (pkt_tx, pkt_rx) = mpsc::channel(256);
         let (outbound_tx, outbound_rx) = mpsc::channel(64);
-
-        // Register in connection table
-        {
-            let mut table = self.connections.write();
-            table.insert((remote_addr, conn.recv_conn_id), pkt_tx);
-        }
-
-        // Immediately send STATE (ACK) to complete handshake
-        let state_pkt = conn.build_state_packet();
-        let _ = self.socket.send_to(&state_pkt.encode(), remote_addr).await;
 
         let read_state = Arc::new(Mutex::new(StreamReadState::default()));
         let write_state = Arc::new(Mutex::new(StreamWriteState::default()));
@@ -780,6 +773,26 @@ impl UtpSocketManager {
             shutdown_notify: shutdown_notify.clone(),
             closed: closed.clone(),
         };
+
+        if self.accept_tx.try_send((stream, remote_addr)).is_err() {
+            debug!(
+                addr = %remote_addr,
+                "Dropping inbound uTP SYN: accept backlog channel is full or closed"
+            );
+            return;
+        }
+
+        self.pending_syn_count.fetch_add(1, Ordering::Relaxed);
+
+        // Register in connection table
+        {
+            let mut table = self.connections.write();
+            table.insert((remote_addr, conn.recv_conn_id), pkt_tx);
+        }
+
+        // Immediately send STATE (ACK) to complete handshake
+        let state_pkt = conn.build_state_packet();
+        let _ = self.socket.send_to(&state_pkt.encode(), remote_addr).await;
 
         let pending_syn = self.pending_syn_count.clone();
         let socket = self.socket.clone();
@@ -806,8 +819,6 @@ impl UtpSocketManager {
             )
             .await;
         });
-
-        let _ = self.accept_tx.send((stream, remote_addr)).await;
     }
 }
 

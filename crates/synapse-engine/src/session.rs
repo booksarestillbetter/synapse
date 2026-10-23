@@ -143,23 +143,47 @@ impl SessionStore {
             arr
         } else {
             let key_path = session_dir.join("session.key");
-            if key_path.exists() {
-                let mut f = File::open(&key_path)?;
-                let mut buf = [0u8; 32];
-                f.read_exact(&mut buf)?;
-                buf
-            } else {
-                let generated = ChaCha20Poly1305::generate_key(&mut OsRng);
-                let key_bytes: [u8; 32] = generated.into();
-                let mut f = File::create(&key_path)?;
-                f.write_all(&key_bytes)?;
-                f.sync_all()?;
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ = fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600));
+            match fs::symlink_metadata(&key_path) {
+                Ok(meta) => {
+                    if !meta.file_type().is_file() {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "session.key must be a regular file, not a symlink",
+                        ));
+                    }
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        let _ = fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600));
+                    }
+                    let mut f = File::open(&key_path)?;
+                    let mut buf = [0u8; 32];
+                    f.read_exact(&mut buf)?;
+                    buf
                 }
-                key_bytes
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    let generated = ChaCha20Poly1305::generate_key(&mut OsRng);
+                    let key_bytes: [u8; 32] = generated.into();
+                    #[cfg(unix)]
+                    let mut f = {
+                        use std::os::unix::fs::OpenOptionsExt;
+                        fs::OpenOptions::new()
+                            .write(true)
+                            .create_new(true)
+                            .mode(0o600)
+                            .custom_flags(libc::O_NOFOLLOW)
+                            .open(&key_path)?
+                    };
+                    #[cfg(not(unix))]
+                    let mut f = fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&key_path)?;
+                    f.write_all(&key_bytes)?;
+                    f.sync_all()?;
+                    key_bytes
+                }
+                Err(e) => return Err(e),
             }
         };
 
@@ -348,7 +372,21 @@ impl SessionStore {
                 migrated_count
             );
             let migrated_dir = session_dir.join("torrents.migrated");
-            let _ = fs::rename(&torrents_dir, &migrated_dir);
+            if fs::rename(&torrents_dir, &migrated_dir).is_ok() {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = fs::set_permissions(&migrated_dir, fs::Permissions::from_mode(0o700));
+                    if let Ok(entries) = fs::read_dir(&migrated_dir) {
+                        for entry in entries.flatten() {
+                            let _ = fs::set_permissions(
+                                entry.path(),
+                                fs::Permissions::from_mode(0o600),
+                            );
+                        }
+                    }
+                }
+            }
         }
     }
 }

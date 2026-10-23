@@ -243,9 +243,7 @@ pub fn parse_igd_description(
         ) else {
             continue;
         };
-        if !(service_type.contains(":WANIPConnection:")
-            || service_type.contains(":WANPPPConnection:"))
-        {
+        if !is_allowed_upnp_service_type(service_type) {
             continue;
         }
         let Ok(url) = base.join(control) else {
@@ -256,6 +254,16 @@ pub fn parse_igd_description(
         }
     }
     None
+}
+
+const ALLOWED_UPNP_SERVICE_TYPES: &[&str] = &[
+    "urn:schemas-upnp-org:service:WANIPConnection:1",
+    "urn:schemas-upnp-org:service:WANIPConnection:2",
+    "urn:schemas-upnp-org:service:WANPPPConnection:1",
+];
+
+fn is_allowed_upnp_service_type(service_type: &str) -> bool {
+    ALLOWED_UPNP_SERVICE_TYPES.contains(&service_type)
 }
 
 fn soap_envelope(service_type: &str, action: &str, args: &str) -> String {
@@ -409,6 +417,9 @@ pub async fn load_igd_service(location: &Url, gateway_ip: IpAddr) -> Result<Upnp
 }
 
 async fn soap_call(service: &UpnpService, action: &str, body: String) -> Result<String, String> {
+    if !is_allowed_upnp_service_type(&service.service_type) {
+        return Err("disallowed UPnP serviceType".into());
+    }
     let client = http_client()?;
     let resp = client
         .post(service.control_url.clone())
@@ -817,5 +828,19 @@ mod tests {
         );
         assert_eq!(parse_soap_error_code("<s:Fault><detail><UPnPError><errorCode>718</errorCode></UPnPError></detail></s:Fault>"), Some(718));
         assert_eq!(parse_soap_error_code("<ok/>"), None);
+    }
+
+    #[test]
+    fn igd_description_rejects_injected_service_type() {
+        let gw: IpAddr = "192.168.1.1".parse().unwrap();
+        let loc = url::Url::parse("http://192.168.1.1:5000/rootDesc.xml").unwrap();
+        let injected = DESCRIPTION.replace(
+            "urn:schemas-upnp-org:service:WANIPConnection:1",
+            "urn:schemas-upnp-org:service:WANIPConnection:1\"><injected/>\r\nX-Evil: 1",
+        );
+        assert!(
+            parse_igd_description(&injected, &loc, gw).is_none(),
+            "serviceType outside the strict URN allowlist must be rejected"
+        );
     }
 }

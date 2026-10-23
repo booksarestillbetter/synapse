@@ -104,21 +104,93 @@ pub enum TrackerError {
     InvalidUrl(&'static str),
 }
 
-/// Sanitizes tracker URLs for safe logging, masking passkeys and authentication tokens.
+fn percent_decode_ascii(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (
+                (bytes[i + 1] as char).to_digit(16),
+                (bytes[i + 2] as char).to_digit(16),
+            ) {
+                out.push(((hi << 4) | lo) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn is_sensitive_query_key(raw_key: &str) -> bool {
+    let decoded = percent_decode_ascii(raw_key).to_ascii_lowercase();
+    decoded.contains("pass")
+        || decoded.contains("auth")
+        || decoded.contains("key")
+        || decoded.contains("token")
+        || decoded.contains("secret")
+        || decoded.contains("session")
+        || decoded.contains("signature")
+        || matches!(
+            decoded.as_str(),
+            "pid" | "pk" | "uid" | "hash" | "sig" | "ak" | "id"
+        )
+}
+
+fn is_passkey_path_segment(seg: &str) -> bool {
+    let decoded = percent_decode_ascii(seg);
+    let lower = decoded.to_ascii_lowercase();
+    if matches!(
+        lower.as_str(),
+        "" | "announce"
+            | "announce.php"
+            | "scrape"
+            | "scrape.php"
+            | "tracker"
+            | "torrents"
+            | "download"
+    ) {
+        return false;
+    }
+    decoded.len() >= 16
+        && decoded
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// Sanitizes tracker URLs for safe logging, masking passkeys, path tokens, userinfo, and authentication tokens.
 pub fn sanitize_tracker_url(url: &url::Url) -> String {
     let mut safe = url.clone();
+    let had_userinfo = !safe.username().is_empty() || safe.password().is_some();
+    if had_userinfo {
+        let _ = safe.set_username("REDACTED");
+        let _ = safe.set_password(None);
+    }
+
+    let path = safe.path().to_string();
+    if path.contains('/') {
+        let sanitized_segments: Vec<String> = path
+            .split('/')
+            .map(|seg| {
+                if is_passkey_path_segment(seg) {
+                    "[REDACTED]".to_string()
+                } else {
+                    seg.to_string()
+                }
+            })
+            .collect();
+        safe.set_path(&sanitized_segments.join("/"));
+    }
+
     if let Some(query) = safe.query() {
         let sanitized_query = query
             .split('&')
             .map(|pair| {
                 if let Some((k, _)) = pair.split_once('=') {
-                    let k_lower = k.to_lowercase();
-                    if k_lower.contains("pass")
-                        || k_lower.contains("auth")
-                        || k_lower.contains("key")
-                        || k_lower.contains("token")
-                        || k_lower.contains("secret")
-                    {
+                    if is_sensitive_query_key(k) {
                         format!("{k}=[REDACTED]")
                     } else {
                         pair.to_string()
@@ -131,7 +203,12 @@ pub fn sanitize_tracker_url(url: &url::Url) -> String {
             .join("&");
         safe.set_query(Some(&sanitized_query));
     }
-    safe.to_string()
+
+    let mut out = safe.to_string();
+    if had_userinfo {
+        out = out.replacen("://REDACTED@", "://[REDACTED]@", 1);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -149,5 +226,48 @@ mod privacy_tests {
         assert!(!sanitized.contains("secret1234567890abcdef"));
         assert!(sanitized.contains("passkey=[REDACTED]"));
         assert!(sanitized.contains("info_hash=123"));
+    }
+
+    #[test]
+    fn test_sanitize_tracker_url_masks_path_passkeys_userinfo_and_encoded_params() {
+        // 1. Path-based passkeys (/<passkey>/announce and /announce/<passkey>)
+        let u1 = Url::parse(
+            "https://tracker.example.org/0123456789abcdef0123456789abcdef/announce?info_hash=123",
+        )
+        .unwrap();
+        let s1 = sanitize_tracker_url(&u1);
+        assert!(!s1.contains("0123456789abcdef0123456789abcdef"), "{s1}");
+        assert!(s1.contains("/[REDACTED]/announce"), "{s1}");
+        assert!(s1.contains("info_hash=123"), "{s1}");
+
+        let u2 =
+            Url::parse("https://tracker.example.org/announce/fedcba9876543210fedcba9876543210")
+                .unwrap();
+        let s2 = sanitize_tracker_url(&u2);
+        assert!(!s2.contains("fedcba9876543210fedcba9876543210"), "{s2}");
+        assert!(s2.contains("/announce/[REDACTED]"), "{s2}");
+
+        // 2. URL userinfo
+        let u3 = Url::parse("http://alice:supersecret@tracker.example.org/announce").unwrap();
+        let s3 = sanitize_tracker_url(&u3);
+        assert!(!s3.contains("alice"), "{s3}");
+        assert!(!s3.contains("supersecret"), "{s3}");
+        assert!(s3.contains("[REDACTED]@tracker.example.org"), "{s3}");
+
+        // 3. Percent-encoded query parameter names and short param names (pid, pk, uid, sig, session)
+        let u4 = Url::parse(
+            "http://tracker.example.org/announce?p%61sskey=mysecret1&pid=mysecret2&pk=mysecret3&session_id=mysecret4&sig=mysecret5",
+        )
+        .unwrap();
+        let s4 = sanitize_tracker_url(&u4);
+        for secret in [
+            "mysecret1",
+            "mysecret2",
+            "mysecret3",
+            "mysecret4",
+            "mysecret5",
+        ] {
+            assert!(!s4.contains(secret), "leaked {secret} in {s4}");
+        }
     }
 }

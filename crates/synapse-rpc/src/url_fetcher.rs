@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use synapse_meta::Info;
 use synapse_tracker::safe_http::{FetchError, FetchOptions, LocalPolicy};
@@ -5,6 +6,13 @@ use url::Url;
 
 use synapse_meta::MAX_TORRENT_FILE_BYTES;
 const FETCH_TIMEOUT: Duration = Duration::from_secs(8);
+
+static ALLOW_LOCAL_FOR_TESTS: AtomicBool = AtomicBool::new(false);
+
+#[doc(hidden)]
+pub fn set_allow_local_for_tests(allow: bool) {
+    ALLOW_LOCAL_FOR_TESTS.store(allow, Ordering::SeqCst);
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum FetchTorrentError {
@@ -65,32 +73,8 @@ pub async fn fetch_or_parse_torrent(url_or_magnet: &str) -> Result<Info, FetchTo
             .map_err(|e| FetchTorrentError::Metadata(format!("Invalid magnet URI: {e}")));
     }
 
-    // 2. Local File Path Fast-Path
-    if !trimmed.starts_with("http://") && !trimmed.starts_with("https://") {
-        let resolved_path = if let Some(subpath) = trimmed.strip_prefix("~/") {
-            if let Some(home) = std::env::var_os("HOME") {
-                let mut p = std::path::PathBuf::from(home);
-                p.push(subpath);
-                p
-            } else {
-                std::path::PathBuf::from(trimmed)
-            }
-        } else {
-            std::path::PathBuf::from(trimmed)
-        };
-
-        if resolved_path.is_file() {
-            let bytes = read_torrent_file(&resolved_path).await?;
-            let bencode = synapse_bencode::decode(&mut bytes.as_slice()).map_err(|e| {
-                FetchTorrentError::BencodeDecode(format!("Invalid local bencode: {e}"))
-            })?;
-            return Info::from_bencode(bencode).map_err(|e| {
-                FetchTorrentError::Metadata(format!("Failed to parse local torrent metadata: {e}"))
-            });
-        }
-    }
-
-    // 2. HTTP/HTTPS URL Validation
+    // 2. HTTP/HTTPS URL Validation — local filesystem paths are strictly rejected here so
+    // URL-based API fields cannot be abused to read local files on the host.
     let parsed_url = Url::parse(trimmed)
         .map_err(|e| FetchTorrentError::InvalidUrl(format!("Malformed URL: {e}")))?;
 
@@ -110,14 +94,18 @@ pub async fn fetch_or_parse_torrent(url_or_magnet: &str) -> Result<Info, FetchTo
         ));
     }
 
-    // 3. SSRF-checked, size-capped fetch: at most 5 redirects, none from a public host to
-    // a local address, and the body is abandoned at the cap. The URL comes from the API
-    // caller, so a LAN indexer is allowed as the starting point.
+    // 3. SSRF-checked, size-capped fetch: at most 5 redirects, rejecting loopback/private/link-local
+    // addresses by default (`LocalPolicy::Deny`), and abandoning the body at the cap.
+    let local_policy = if ALLOW_LOCAL_FOR_TESTS.load(Ordering::SeqCst) {
+        LocalPolicy::AllowAny
+    } else {
+        LocalPolicy::Deny
+    };
     let opts = FetchOptions {
         timeout: FETCH_TIMEOUT,
         max_body: MAX_TORRENT_FILE_BYTES,
         user_agent: concat!("Synapse/", env!("CARGO_PKG_VERSION")),
-        local: LocalPolicy::AllowAny,
+        local: local_policy,
         range: None,
     };
     let fetched = synapse_tracker::safe_http::fetch(&parsed_url, &opts)
@@ -208,5 +196,38 @@ mod tests {
         let info = fetch_or_parse_torrent(magnet).await.expect("valid magnet");
         assert_eq!(info.name, "Ubuntu-24.04");
         assert_eq!(info.total_len, 0);
+    }
+
+    #[tokio::test]
+    async fn test_reject_local_file_path_in_fetch_or_parse_torrent() {
+        let dir =
+            std::env::temp_dir().join(format!("synapse-no-local-fetch-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let local_torrent = dir.join("secret.torrent");
+        std::fs::write(&local_torrent, b"d8:announce15:http://test.com4:infod6:lengthi1024e4:name8:test.iso12:piece lengthi262144e6:pieces20:01234567890123456789ee").unwrap();
+
+        let err = fetch_or_parse_torrent(local_torrent.to_str().unwrap())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, FetchTorrentError::InvalidUrl(_)));
+
+        let err = fetch_or_parse_torrent("/etc/passwd").await.unwrap_err();
+        assert!(matches!(err, FetchTorrentError::InvalidUrl(_)));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_reject_loopback_and_private_urls_by_default() {
+        set_allow_local_for_tests(false);
+        let err = fetch_or_parse_torrent("http://127.0.0.1:8080/test.torrent")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, FetchTorrentError::InvalidUrl(_)));
+
+        let err = fetch_or_parse_torrent("http://169.254.169.254/latest/meta-data/")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, FetchTorrentError::InvalidUrl(_)));
     }
 }

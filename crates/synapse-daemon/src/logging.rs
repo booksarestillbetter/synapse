@@ -153,8 +153,8 @@ where
             Level::DEBUG | Level::TRACE => 15, // Local0.Debug (16 * 8 + 7)
         };
 
-        let msg = visitor.message.unwrap_or_default();
-        let target = event.metadata().target();
+        let msg = sanitize_syslog_field(&visitor.message.unwrap_or_default());
+        let target = sanitize_syslog_field(event.metadata().target());
 
         // Format RFC 5424 syslog line: <PRI>1 TIMESTAMP HOSTNAME APP-NAME PROCID MSGID MSG
         let now = chrono_timestamp();
@@ -165,6 +165,12 @@ where
 
         let _ = self.sender.try_send(syslog_msg);
     }
+}
+
+/// Sanitizes CR, LF, and NUL characters from syslog fields so attacker-controlled strings
+/// (torrent names, peer client names, tracker errors) cannot forge multi-line syslog entries.
+pub fn sanitize_syslog_field(s: &str) -> String {
+    s.replace(['\r', '\n', '\0'], " ")
 }
 
 #[derive(Default)]
@@ -279,5 +285,15 @@ mod tests {
         assert_eq!(filter_directive(&config), "debug");
 
         std::env::remove_var("RUST_LOG");
+    }
+
+    #[test]
+    fn syslog_field_sanitization_strips_crlf_and_nul() {
+        let malicious = "EvilTorrent\r\n<11>1 2026-01-01T00:00:00Z localhost synapsed 1 lifecycle - Forged\0Line";
+        let sanitized = sanitize_syslog_field(malicious);
+        assert!(!sanitized.contains('\r'));
+        assert!(!sanitized.contains('\n'));
+        assert!(!sanitized.contains('\0'));
+        assert!(sanitized.contains("EvilTorrent  <11>1"));
     }
 }

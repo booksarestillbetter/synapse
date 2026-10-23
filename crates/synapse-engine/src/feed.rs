@@ -237,7 +237,7 @@ impl FeedManager {
             timeout: FEED_TIMEOUT,
             max_body: MAX_FEED_XML_BYTES,
             user_agent: concat!("Synapse/", env!("CARGO_PKG_VERSION")),
-            local: LocalPolicy::AllowAny,
+            local: LocalPolicy::Deny,
             range: None,
         };
 

@@ -23,10 +23,9 @@ use std::path::Path;
 use rsa::pkcs1v15::Pkcs1v15Sign;
 use rsa::pkcs8::DecodePublicKey;
 use rsa::RsaPublicKey;
-use sha1::Sha1;
-use sha2::{Sha256, Sha384, Sha512};
+use sha2::{Digest as _, Sha256, Sha384, Sha512};
 use synapse_bencode::BEncode;
-use x509_cert::der::{Decode, DecodePem, Encode};
+use x509_cert::der::{AnyRef, Decode, DecodePem, Encode, Tag, Tagged};
 use x509_cert::Certificate;
 
 /// Signatures looked at per torrent, and the largest certificate / signature accepted.
@@ -237,9 +236,8 @@ fn certificate_key(cert: &Certificate) -> Result<RsaPublicKey, String> {
     RsaPublicKey::from_public_key_der(&spki).map_err(|_| "certificate key is not RSA".to_string())
 }
 
-/// Verifies `signature` over `message` with `key`, trying the hashes BEP 35 leaves open.
+/// Verifies `signature` over `message` with `key` using SHA-256, SHA-384, or SHA-512 (SHA-1 is rejected).
 fn rsa_verify(key: &RsaPublicKey, message: &[u8], signature: &[u8]) -> bool {
-    use sha1::Digest as _;
     key.verify(
         Pkcs1v15Sign::new::<Sha256>(),
         &Sha256::digest(message),
@@ -248,20 +246,128 @@ fn rsa_verify(key: &RsaPublicKey, message: &[u8], signature: &[u8]) -> bool {
     .is_ok()
         || key
             .verify(
-                Pkcs1v15Sign::new::<Sha1>(),
-                &Sha1::digest(message),
+                Pkcs1v15Sign::new::<Sha384>(),
+                &Sha384::digest(message),
+                signature,
+            )
+            .is_ok()
+        || key
+            .verify(
+                Pkcs1v15Sign::new::<Sha512>(),
+                &Sha512::digest(message),
                 signature,
             )
             .is_ok()
 }
 
+/// Checks whether `cert` has `BasicConstraints` (`2.5.29.19`) with `cA == true` and, if
+/// `KeyUsage` (`2.5.29.15`) is present, has the `keyCertSign` bit set.
+fn is_ca_certificate(cert: &Certificate) -> bool {
+    let Some(exts) = &cert.tbs_certificate.extensions else {
+        return false;
+    };
+    let mut has_ca_basic_constraints = false;
+    for ext in exts {
+        match ext.extn_id.to_string().as_str() {
+            // id-ce-basicConstraints (2.5.29.19): SEQUENCE { cA BOOLEAN DEFAULT FALSE, ... }
+            "2.5.29.19" => {
+                let bytes = ext.extn_value.as_bytes();
+                let Ok(any) = AnyRef::from_der(bytes) else {
+                    return false;
+                };
+                if any.tag() != Tag::Sequence {
+                    return false;
+                }
+                // SEQUENCE { cA BOOLEAN DEFAULT FALSE, ... }
+                // In DER, if cA is present and true, the inner value starts with 0x01 (Tag::Boolean), 0x01 (len), non-zero (0xFF in DER).
+                let inner = any.value();
+                if inner.len() < 3 || inner[0] != 0x01 || inner[1] != 0x01 || inner[2] == 0x00 {
+                    return false;
+                }
+                has_ca_basic_constraints = true;
+            }
+            // id-ce-keyUsage (2.5.29.15): BIT STRING where bit 5 (0x04 in first content byte) is keyCertSign
+            "2.5.29.15" => {
+                let bytes = ext.extn_value.as_bytes();
+                let Ok(any) = AnyRef::from_der(bytes) else {
+                    return false;
+                };
+                if any.tag() != Tag::BitString {
+                    return false;
+                }
+                let raw = any.value();
+                // First byte is unused_bits count, second byte holds bits 0..7 (MSB first).
+                // Bit 5 is mask 0x04 (`0b0000_0100`).
+                if raw.len() < 2 || (raw[1] & 0x04) == 0 {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    has_ca_basic_constraints
+}
+
+/// Extracts all Common Name (`2.5.4.3`) values and SubjectAltName (`2.5.29.17`) dNSName values from `cert`.
+fn certificate_names(cert: &Certificate) -> Vec<String> {
+    let mut names = Vec::new();
+    for rdn in &cert.tbs_certificate.subject.0 {
+        for atv in rdn.0.iter() {
+            if atv.oid.to_string() == "2.5.4.3" {
+                if let Ok(s) = std::str::from_utf8(atv.value.value()) {
+                    names.push(s.to_string());
+                }
+            }
+        }
+    }
+    if let Some(exts) = &cert.tbs_certificate.extensions {
+        for ext in exts {
+            if ext.extn_id.to_string() == "2.5.29.17" {
+                let bytes = ext.extn_value.as_bytes();
+                if let Ok(any) = AnyRef::from_der(bytes) {
+                    if any.tag() == Tag::Sequence {
+                        let mut slice = any.value();
+                        while !slice.is_empty() {
+                            if let Ok(item) = AnyRef::from_der(slice) {
+                                let item_len = item.to_der().map(|v| v.len()).unwrap_or(0);
+                                if item_len == 0 || item_len > slice.len() {
+                                    break;
+                                }
+                                slice = &slice[item_len..];
+                                // dNSName is [2] IMPLICIT IA5String (context-specific tag 2 = 0x82)
+                                if u8::from(item.tag()) == 0x82 {
+                                    if let Ok(s) = std::str::from_utf8(item.value()) {
+                                        names.push(s.to_string());
+                                    }
+                                }
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    names
+}
+
+fn certificate_matches_signer_name(cert: &Certificate, signer_name: &str) -> bool {
+    certificate_names(cert).iter().any(|n| n == signer_name)
+}
+
 /// Whether `cert` is signed by `anchor`'s key, going by the certificate's own signature
-/// algorithm (RSA with SHA-1, SHA-256, SHA-384 or SHA-512).
+/// algorithm (RSA with SHA-256, SHA-384 or SHA-512; SHA-1 is rejected), and `anchor` is a valid CA.
 fn issued_by(cert: &Certificate, anchor: &Anchor) -> bool {
-    use sha1::Digest as _;
     let Some(anchor_cert) = &anchor.certificate else {
         return false;
     };
+    if !is_ca_certificate(anchor_cert) {
+        return false;
+    }
+    if cert.tbs_certificate.subject == cert.tbs_certificate.issuer {
+        return false;
+    }
     if cert.tbs_certificate.issuer != anchor_cert.tbs_certificate.subject {
         return false;
     }
@@ -272,11 +378,6 @@ fn issued_by(cert: &Certificate, anchor: &Anchor) -> bool {
         return false;
     };
     match cert.signature_algorithm.oid.to_string().as_str() {
-        "1.2.840.113549.1.1.5" => {
-            anchor
-                .key
-                .verify(Pkcs1v15Sign::new::<Sha1>(), &Sha1::digest(&tbs), sig)
-        }
         "1.2.840.113549.1.1.11" => {
             anchor
                 .key
@@ -329,17 +430,26 @@ impl TorrentSignature {
                 if !rsa_verify(&key, &message, &self.signature) {
                     return invalid("the signature does not match the torrent");
                 }
-                // The signature is genuine for this key; now: is the key one we trust?
+                let name_matches_cert = certificate_matches_signer_name(&cert, &self.name);
+                // The signature is genuine for this key; now: is the key one we trust, and does the
+                // signer identity match the certificate?
                 let trusted = trust.anchors.iter().any(|a| {
                     let same = a
                         .certificate
                         .as_ref()
-                        .is_some_and(|c| c.to_der().ok().as_deref() == Some(der.as_slice()));
-                    same || (is_anchor_current(a) && issued_by(&cert, a))
+                        .is_some_and(|c| c.to_der().ok().as_deref() == Some(der.as_slice()))
+                        && (name_matches_cert || a.name.as_deref().is_some_and(|n| n == self.name));
+                    let issued = name_matches_cert && is_anchor_current(a) && issued_by(&cert, a);
+                    same || issued
                 });
                 if trusted {
                     SignatureStatus::Trusted {
                         signer: self.name.clone(),
+                    }
+                } else if !name_matches_cert {
+                    SignatureStatus::Untrusted {
+                        reason: "valid signature, but the certificate subject does not match the signer name"
+                            .into(),
                     }
                 } else {
                     SignatureStatus::Untrusted {
@@ -413,9 +523,39 @@ mod tests {
                 signer: "com.example.signer".into()
             }
         );
-        // The SHA-1 variant is accepted too.
+        // The SHA-1 variant is rejected.
         let s1 = signature(Some("leaf.der"), "sig_sha1.bin", true);
-        assert!(s1.verify(&read("info.bin"), &store_with_ca()).is_trusted());
+        assert!(matches!(
+            s1.verify(&read("info.bin"), &store_with_ca()),
+            SignatureStatus::Invalid { .. }
+        ));
+    }
+
+    #[test]
+    fn leaf_certificate_cannot_act_as_ca_and_cn_mismatch_is_rejected() {
+        let leaf_cert = Certificate::from_der(&read("leaf.der")).unwrap();
+        let ca_cert = Certificate::from_der(&read("ca.der")).unwrap();
+        assert!(is_ca_certificate(&ca_cert));
+        assert!(!is_ca_certificate(&leaf_cert));
+
+        let mut leaf_store = TrustStore::new();
+        leaf_store
+            .add_certificate_der(Some("leaf-anchor".into()), &read("leaf.der"))
+            .unwrap();
+        assert!(!issued_by(&leaf_cert, &leaf_store.anchors[0]));
+        assert!(!issued_by(&ca_cert, &leaf_store.anchors[0]));
+
+        let mut wrong_name = signature(Some("leaf.der"), "sig_sha256.bin", true);
+        wrong_name.name = "com.evil.impersonator".into();
+        let status = wrong_name.verify(&read("info.bin"), &store_with_ca());
+        assert!(
+            !status.is_trusted(),
+            "expected untrusted/invalid, got {status:?}"
+        );
+        assert!(matches!(
+            status,
+            SignatureStatus::Untrusted { .. } | SignatureStatus::Invalid { .. }
+        ));
     }
 
     #[test]

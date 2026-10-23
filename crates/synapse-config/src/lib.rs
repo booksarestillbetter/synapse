@@ -18,6 +18,8 @@ pub enum ConfigError {
         path: PathBuf,
         source: toml::de::Error,
     },
+    #[error("invalid configuration: {0}")]
+    Validation(String),
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -434,6 +436,7 @@ pub struct WebConfig {
     pub listen_addr: Option<SocketAddr>,
     pub port: Option<u16>,
     pub web_root: Option<PathBuf>,
+    pub auth_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -726,7 +729,7 @@ impl Default for RpcConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            listen_addr: "0.0.0.0:50051".to_string(),
+            listen_addr: "127.0.0.1:50051".to_string(),
             auth_token: None,
         }
     }
@@ -881,7 +884,16 @@ pub fn expand_vars(raw: &str) -> String {
                         .or_else(|| default_val.map(|d| d.to_string()))
                         .unwrap_or_default();
 
-                    out.push_str(&resolved);
+                    // Strip characters that could break out of a TOML string literal or inject
+                    // new lines/tables/keys before `toml::from_str` parses the document.
+                    let sanitized: String = resolved
+                        .chars()
+                        .filter(|&ch| {
+                            !matches!(ch, '\n' | '\r' | '\0' | '"' | '\'') && !ch.is_control()
+                        })
+                        .collect();
+
+                    out.push_str(&sanitized);
                     cursor = end + 1;
                 } else {
                     cursor = i;
@@ -936,8 +948,37 @@ impl Config {
         };
 
         cfg.apply_env_overrides();
+        cfg.normalize();
         cfg.resolve_paths();
+        cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// Normalizes `auth_token` fields so empty or whitespace-only strings are treated as `None`.
+    pub fn normalize(&mut self) {
+        self.rpc.auth_token = self
+            .rpc
+            .auth_token
+            .take()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        self.http_api.auth_token = self
+            .http_api
+            .auth_token
+            .take()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        self.web.auth_token = self
+            .web
+            .auth_token
+            .take()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+    }
+
+    /// Validates configuration invariants (encryption mode, non-empty auth tokens).
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        validate_config(self)
     }
 
     /// Resolves relative disk paths against `[disk].root_dir` if configured.
@@ -1062,12 +1103,20 @@ impl Config {
         if let Ok(val) = std::env::var("SYNAPSE_RPC_LISTEN_ADDR") {
             self.rpc.listen_addr = val;
         }
-        if let Ok(val) = std::env::var("SYNAPSE_AUTH_TOKEN")
-            .or_else(|_| std::env::var("SYNAPSE_RPC_AUTH_TOKEN"))
-            .or_else(|_| std::env::var("SYNAPSE_HTTP_AUTH_TOKEN"))
-        {
-            self.rpc.auth_token = Some(val.clone());
-            self.http_api.auth_token = Some(val);
+        for var in [
+            "SYNAPSE_AUTH_TOKEN",
+            "SYNAPSE_RPC_AUTH_TOKEN",
+            "SYNAPSE_HTTP_AUTH_TOKEN",
+        ] {
+            if let Ok(val) = std::env::var(var) {
+                let trimmed = val.trim();
+                if !trimmed.is_empty() {
+                    self.rpc.auth_token = Some(trimmed.to_string());
+                    self.http_api.auth_token = Some(trimmed.to_string());
+                    self.web.auth_token = Some(trimmed.to_string());
+                    break;
+                }
+            }
         }
         if let Ok(val) = std::env::var("SYNAPSE_HTTP_ENABLED")
             .or_else(|_| std::env::var("SYNAPSE_HTTP_API_ENABLED"))
@@ -1254,6 +1303,37 @@ impl Config {
             }
         }
     }
+}
+
+/// Validates a [`Config`] instance against allowed encryption modes and non-empty auth tokens.
+pub fn validate_config(config: &Config) -> Result<(), ConfigError> {
+    let enc = config.network.encryption.trim().to_ascii_lowercase();
+    match enc.as_str() {
+        "prefer_encrypted" | "require_encrypted" | "disable_encryption" | "forced" | "prefer"
+        | "disabled" | "plaintext" | "none" | "required" | "strict" | "preferred"
+        | "forced_encrypted" | "plaintext_only" | "tolerated" => {}
+        other => {
+            return Err(ConfigError::Validation(format!(
+                "invalid network.encryption mode: {other:?}"
+            )));
+        }
+    }
+
+    for (field, token) in [
+        ("rpc.auth_token", &config.rpc.auth_token),
+        ("http_api.auth_token", &config.http_api.auth_token),
+        ("web.auth_token", &config.web.auth_token),
+    ] {
+        if let Some(ref t) = token {
+            if t.trim().is_empty() {
+                return Err(ConfigError::Validation(format!(
+                    "{field} must not be empty or whitespace-only"
+                )));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1565,5 +1645,82 @@ mod tests {
         assert_eq!(parsed.circuit_breaker.failure_threshold, 5);
         assert_eq!(parsed.circuit_breaker.initial_backoff_seconds, 15);
         assert_eq!(parsed.circuit_breaker.max_backoff_seconds, 300);
+    }
+
+    #[test]
+    fn test_default_rpc_listen_addr_is_loopback() {
+        let default_cfg = Config::default();
+        assert_eq!(default_cfg.rpc.listen_addr, "127.0.0.1:50051");
+    }
+
+    #[test]
+    fn test_validate_config_encryption_modes() {
+        for valid in [
+            "prefer_encrypted",
+            "require_encrypted",
+            "disable_encryption",
+            "forced",
+            "prefer",
+            "disabled",
+            "plaintext",
+            "none",
+            "required",
+            "strict",
+        ] {
+            let mut cfg = Config::default();
+            cfg.network.encryption = valid.to_string();
+            assert!(
+                validate_config(&cfg).is_ok(),
+                "expected encryption mode {valid:?} to be valid"
+            );
+        }
+
+        let mut bad = Config::default();
+        bad.network.encryption = "rot13".to_string();
+        assert!(matches!(
+            validate_config(&bad),
+            Err(ConfigError::Validation(_))
+        ));
+    }
+
+    #[test]
+    fn test_empty_auth_token_normalization_and_validation() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut cfg = Config::default();
+        cfg.rpc.auth_token = Some("   ".to_string());
+        assert!(matches!(
+            validate_config(&cfg),
+            Err(ConfigError::Validation(_))
+        ));
+
+        cfg.normalize();
+        assert_eq!(cfg.rpc.auth_token, None);
+        assert!(validate_config(&cfg).is_ok());
+
+        // Empty env var must not overwrite a valid token or set Some("")
+        cfg.rpc.auth_token = Some("real-token".to_string());
+        std::env::set_var("SYNAPSE_AUTH_TOKEN", "   ");
+        cfg.apply_env_overrides();
+        std::env::remove_var("SYNAPSE_AUTH_TOKEN");
+        assert_eq!(cfg.rpc.auth_token.as_deref(), Some("real-token"));
+    }
+
+    #[test]
+    fn test_expand_vars_prevents_toml_injection() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var(
+            "SYNAPSE_TEST_INJECT",
+            "safe\"\n[rpc]\nlisten_addr = \"0.0.0.0:9999\"\nauth_token = \"pwned",
+        );
+        let raw = r#"
+[disk]
+download_dir = "${SYNAPSE_TEST_INJECT}"
+"#;
+        let expanded = expand_vars(raw);
+        std::env::remove_var("SYNAPSE_TEST_INJECT");
+
+        let parsed: Config = toml::from_str(&expanded).expect("must remain valid TOML");
+        assert_eq!(parsed.rpc.listen_addr, "127.0.0.1:50051");
+        assert_eq!(parsed.rpc.auth_token, None);
     }
 }

@@ -75,9 +75,11 @@ async fn test_daemon_secure_url_torrent_ingestion_and_injection_defense() {
     });
 
     // 2. Start Synapse Daemon Engine and REST Control Plane
+    synapse_rpc::url_fetcher::set_allow_local_for_tests(true);
     let tmp = tempdir().unwrap();
     let disk = Arc::new(DiskEngine::auto().await);
     let swarm = Arc::new(SwarmEngine::new(disk, [0xEE; 20]));
+    swarm.settings().write().download_dir = tmp.path().to_path_buf();
 
     let daemon_app = synapse_rpc::create_http_router_with_auth(swarm.clone(), None);
     let daemon_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -218,4 +220,5 @@ async fn test_daemon_secure_url_torrent_ingestion_and_injection_defense() {
 
     // Ensure no corrupted swarms were added to the engine
     assert_eq!(swarm.list_torrents().len(), 3);
+    synapse_rpc::url_fetcher::set_allow_local_for_tests(false);
 }

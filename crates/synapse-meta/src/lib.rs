@@ -262,15 +262,68 @@ pub const MAX_COMPONENT_BYTES: usize = 255;
 /// characters (including NUL and terminal escape sequences), Unicode bidirectional
 /// overrides that let a name masquerade as another (`invoice\u{202E}fdp.exe`), and names
 /// longer than any filesystem accepts. Non-UTF-8 components are rejected too.
-fn component_is_safe(seg: &std::ffi::OsStr) -> bool {
+pub(crate) fn component_is_safe(seg: &std::ffi::OsStr) -> bool {
     let Some(s) = seg.to_str() else {
         return false;
     };
-    s.len() <= MAX_COMPONENT_BYTES
+    !s.is_empty()
+        && s != "."
+        && s != ".."
+        && !s.contains('/')
+        && !s.contains('\\')
+        && s.len() <= MAX_COMPONENT_BYTES
         && !s.chars().any(|c| {
             c.is_control()
                 || matches!(c, '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
         })
+}
+
+/// Validates that `name` is a safe single-component filename or directory name.
+pub fn validate_single_name(name: &str) -> bool {
+    component_is_safe(std::ffi::OsStr::new(name))
+        && path_is_safe(Path::new(name))
+        && Path::new(name).components().count() == 1
+}
+
+fn sanitize_magnet_display_name(raw_dn: Option<&str>, info_hash: &[u8; 20]) -> String {
+    let fallback = || -> String { info_hash.iter().map(|b| format!("{b:02x}")).collect() };
+    let Some(raw) = raw_dn else {
+        return fallback();
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed == "." || trimmed == ".." {
+        return fallback();
+    }
+    let mut cleaned: String = trimmed
+        .chars()
+        .filter(|&c| {
+            !c.is_control()
+                && !matches!(
+                    c,
+                    '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+                )
+        })
+        .map(|c| if c == '/' || c == '\\' { '_' } else { c })
+        .collect();
+    while cleaned.contains("..") {
+        cleaned = cleaned.replace("..", "_");
+    }
+    let cleaned = cleaned.trim().trim_matches('.');
+    let mut bounded = String::new();
+    for ch in cleaned.chars() {
+        if bounded.len() + ch.len_utf8() > MAX_COMPONENT_BYTES {
+            break;
+        }
+        bounded.push(ch);
+    }
+    if bounded.is_empty()
+        || bounded.chars().all(|c| c == '_' || c == '.')
+        || !validate_single_name(&bounded)
+    {
+        fallback()
+    } else {
+        bounded
+    }
 }
 
 pub fn bencode_to_string_lossy(b: BEncode) -> Option<String> {
@@ -802,11 +855,16 @@ impl Info {
             let name_str = i
                 .remove(b"name.utf-8".as_ref())
                 .or_else(|| i.remove(b"name".as_ref()))
-                .and_then(bencode_to_string_lossy)
-                .unwrap_or_else(|| "torrent".to_string());
+                .and_then(BEncode::into_string)
+                .ok_or(MetaError::InvalidName)?;
+            if name_str.is_empty() {
+                return Err(MetaError::InvalidName);
+            }
+            if !validate_single_name(&name_str) {
+                return Err(MetaError::UnsafeFilePath);
+            }
             let root_dir = PathBuf::from(&name_str);
-            v2::parse_file_tree(&file_tree, root_dir, &mut v2_files)
-                .map_err(|_| MetaError::InvalidFileDict)?;
+            v2::parse_file_tree(&file_tree, root_dir, &mut v2_files)?;
             if v2_files.is_empty() {
                 return Err(MetaError::NoFiles);
             }
@@ -847,21 +905,20 @@ impl Info {
                     .filter(|&p| p > 0 && u64::from(p) <= MAX_PIECE_LEN)
                     .ok_or(MetaError::InvalidPieceLength)?;
                 align_v2_files(&mut files, &mut file_roots, plen32, &name_str);
-                let plen = u64::try_from(piece_len)
-                    .ok()
-                    .filter(|&p| p > 0 && p <= MAX_PIECE_LEN)
-                    .ok_or(MetaError::InvalidPieceLength)?;
+                let plen = u64::from(plen32);
                 let mut tlen = 0u64;
                 for f in &files {
                     tlen = tlen
                         .checked_add(f.length)
                         .ok_or(MetaError::InvalidFileLength)?;
                 }
-                let count = (tlen.div_ceil(plen)) as u32;
-                if (count as u64) > MAX_PIECES {
+                let count_u64 = tlen.div_ceil(plen);
+                if count_u64 > MAX_PIECES {
                     return Err(MetaError::TooManyPieces);
                 }
-                (plen as u32, tlen, count, Vec::new())
+                let (plen, tlen) = validate_layout(piece_len, count_u64 as usize, &files, false)?;
+                let count = count_u64 as u32;
+                (plen, tlen, count, Vec::new())
             };
             (
                 files,
@@ -1128,11 +1185,16 @@ impl Info {
             let name_str = i
                 .remove(b"name.utf-8".as_ref())
                 .or_else(|| i.remove(b"name".as_ref()))
-                .and_then(bencode_to_string_lossy)
-                .unwrap_or_else(|| "torrent".to_string());
+                .and_then(BEncode::into_string)
+                .ok_or(MetaError::InvalidName)?;
+            if name_str.is_empty() {
+                return Err(MetaError::InvalidName);
+            }
+            if !validate_single_name(&name_str) {
+                return Err(MetaError::UnsafeFilePath);
+            }
             let root_dir = PathBuf::from(&name_str);
-            v2::parse_file_tree(&file_tree, root_dir, &mut v2_files)
-                .map_err(|_| MetaError::InvalidFileDict)?;
+            v2::parse_file_tree(&file_tree, root_dir, &mut v2_files)?;
             if v2_files.is_empty() {
                 return Err(MetaError::NoFiles);
             }
@@ -1173,21 +1235,20 @@ impl Info {
                     .filter(|&p| p > 0 && u64::from(p) <= MAX_PIECE_LEN)
                     .ok_or(MetaError::InvalidPieceLength)?;
                 align_v2_files(&mut files, &mut file_roots, plen32, &name_str);
-                let plen = u64::try_from(piece_len)
-                    .ok()
-                    .filter(|&p| p > 0 && p <= MAX_PIECE_LEN)
-                    .ok_or(MetaError::InvalidPieceLength)?;
+                let plen = u64::from(plen32);
                 let mut tlen = 0u64;
                 for f in &files {
                     tlen = tlen
                         .checked_add(f.length)
                         .ok_or(MetaError::InvalidFileLength)?;
                 }
-                let count = (tlen.div_ceil(plen)) as u32;
-                if (count as u64) > MAX_PIECES {
+                let count_u64 = tlen.div_ceil(plen);
+                if count_u64 > MAX_PIECES {
                     return Err(MetaError::TooManyPieces);
                 }
-                (plen as u32, tlen, count, Vec::new())
+                let (plen, tlen) = validate_layout(piece_len, count_u64 as usize, &files, false)?;
+                let count = count_u64 as u32;
+                (plen, tlen, count, Vec::new())
             };
             (
                 files,
@@ -1481,11 +1542,11 @@ impl Info {
             .collect();
         trackers.shuffle(&mut rand::thread_rng());
 
-        let name = url
+        let raw_dn = url
             .query_pairs()
             .find(|(k, _)| k == "dn")
-            .map(|(_, v)| v.into_owned())
-            .unwrap_or_default();
+            .map(|(_, v)| v.into_owned());
+        let name = sanitize_magnet_display_name(raw_dn.as_deref(), &hash);
 
         // BEP 53. A magnet is untrusted input: bound both the number of terms and the size of
         // the indices they can name, so `so=0-4294967295` cannot allocate without limit.
@@ -2449,5 +2510,79 @@ mod tests {
             "the info hash must survive persistence"
         );
         assert_eq!(back.to_info_dict_bytes(), info.to_info_dict_bytes());
+    }
+
+    #[test]
+    fn magnet_display_name_is_sanitized_against_path_traversal_and_control_chars() {
+        let hash_hex = "0123456789abcdef0123456789abcdef01234567";
+        for bad_dn in [
+            "../../etc/passwd",
+            "..\\..\\Windows\\System32",
+            "..",
+            ".",
+            "",
+            "/etc/shadow",
+            "foo/bar/baz.iso",
+            "evil\0name",
+            "line1\nline2",
+        ] {
+            let encoded: String = bad_dn.bytes().map(|b| format!("%{b:02X}")).collect();
+            let uri = format!("magnet:?xt=urn:btih:{hash_hex}&dn={encoded}");
+            let info = Info::from_magnet(&uri).unwrap();
+            assert!(
+                validate_single_name(&info.name),
+                "magnet name {:?} from {:?} did not pass validate_single_name",
+                info.name,
+                bad_dn
+            );
+            assert!(!info.name.contains(".."));
+            assert!(!info.name.contains('/'));
+            assert!(!info.name.contains('\\'));
+            assert!(!info.name.is_empty());
+        }
+    }
+
+    #[test]
+    fn v2_torrent_validates_name_and_piece_count_u32_overflow() {
+        // Pure v2 with piece count = (1u64 << 32) + 1 (would wrap to 1 if truncated to u32 first)
+        let piece_len = 16_384i64;
+        let overflow_len = ((1i64 << 32) + 1) * piece_len;
+        let bad_v2 = v2_torrent(&[("huge.bin", overflow_len)]);
+        assert_eq!(
+            Info::from_bencode(bad_v2).unwrap_err(),
+            MetaError::TooManyPieces
+        );
+
+        // Pure v2 with empty or traversal root name must be rejected
+        let mut tree = BTreeMap::new();
+        let leaf = BTreeMap::from([
+            (b"length".to_vec(), BEncode::Int(16_384)),
+            (b"pieces root".to_vec(), BEncode::String(vec![0x42; 32])),
+        ]);
+        tree.insert(
+            b"f.bin".to_vec(),
+            BEncode::Dict(BTreeMap::from([(b"".to_vec(), BEncode::Dict(leaf))])),
+        );
+        let empty_name_info = BTreeMap::from([
+            (b"meta version".to_vec(), BEncode::Int(2)),
+            (b"name".to_vec(), BEncode::String(b"".to_vec())),
+            (b"piece length".to_vec(), BEncode::Int(16_384)),
+            (b"file tree".to_vec(), BEncode::Dict(tree.clone())),
+        ]);
+        assert_eq!(
+            Info::from_bencode(wrap(empty_name_info)).unwrap_err(),
+            MetaError::InvalidName
+        );
+
+        let traversal_name_info = BTreeMap::from([
+            (b"meta version".to_vec(), BEncode::Int(2)),
+            (b"name".to_vec(), BEncode::String(b"../escape".to_vec())),
+            (b"piece length".to_vec(), BEncode::Int(16_384)),
+            (b"file tree".to_vec(), BEncode::Dict(tree)),
+        ]);
+        assert_eq!(
+            Info::from_bencode(wrap(traversal_name_info)).unwrap_err(),
+            MetaError::UnsafeFilePath
+        );
     }
 }

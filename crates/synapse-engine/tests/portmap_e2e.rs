@@ -230,6 +230,7 @@ async fn the_engine_maps_its_listen_port_through_the_gateway_and_uses_the_extern
     let gw = spawn_pcp_natpmp_gateway(true, 40123).await;
     let engine = Arc::new(
         SwarmEngine::new(Arc::new(DiskEngine::auto().await), [5u8; 20])
+            .with_nat_enabled(true)
             .with_nat_discovery(no_ssdp(vec![gw])),
     );
     let port = std::net::TcpListener::bind("127.0.0.1:0")

@@ -23,6 +23,7 @@ async fn start() -> (
 ) {
     let disk = Arc::new(DiskEngine::auto().await);
     let swarm = Arc::new(SwarmEngine::new(disk, [0x07; 20]));
+    swarm.settings().write().download_dir = std::path::PathBuf::from("/tmp/downloads");
     let service =
         SynapseService::new(Arc::new(EventBus::new(256))).with_swarm_engine(swarm.clone());
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

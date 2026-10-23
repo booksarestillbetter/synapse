@@ -823,14 +823,10 @@ async fn main() -> std::process::ExitCode {
     let event_bus = Arc::new(EventBus::new(4096));
     let flusher_bus = event_bus.clone();
     let _flusher_handle = flusher_bus.start_flusher(Duration::from_millis(100));
-    let auth_token = config
-        .http_api
-        .auth_token
-        .clone()
-        .or_else(|| config.rpc.auth_token.clone());
+    let (rpc_auth_token, web_auth_token) = resolve_auth_tokens(&config);
     let service = SynapseService::new(event_bus.clone())
         .with_swarm_engine(swarm.clone())
-        .with_auth_token(auth_token.clone());
+        .with_auth_token(rpc_auth_token.clone());
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
@@ -955,6 +951,14 @@ async fn main() -> std::process::ExitCode {
             }
         };
 
+        if !rpc_addr.ip().is_loopback() && rpc_auth_token.is_none() {
+            tracing::warn!(
+                target: LIFECYCLE_TARGET,
+                "⚠️  SECURITY WARNING: gRPC control plane is bound to non-loopback address {} without an auth_token!",
+                rpc_addr
+            );
+        }
+
         // `verify_auth` was previously defined but never invoked from any handler — every RPC
         // was reachable with no token at all regardless of config. A Tonic interceptor runs
         // ahead of every method on this service, so this is the one place that needs wiring
@@ -1010,8 +1014,16 @@ async fn main() -> std::process::ExitCode {
             http_addr.set_port(cli_port);
         }
 
+        if !http_addr.ip().is_loopback() && web_auth_token.is_none() {
+            tracing::warn!(
+                target: LIFECYCLE_TARGET,
+                "⚠️  SECURITY WARNING: HTTP API / Web UI is bound to non-loopback address {} without an auth_token!",
+                http_addr
+            );
+        }
+
         let http_engine = swarm.clone();
-        let http_auth = auth_token.clone();
+        let http_auth = web_auth_token.clone();
         let metrics_enabled = config.metrics.enabled;
         let web_config = config.web.clone();
         let mut http_shutdown = shutdown_rx.clone();
@@ -1192,7 +1204,7 @@ async fn main() -> std::process::ExitCode {
 
     tracing::info!(target: LIFECYCLE_TARGET, "🚀 Synapse 2.0 ready. Standing by for commands and swarm connections.");
 
-    wait_for_shutdown_or_reload(swarm.clone(), args.config.clone()).await;
+    wait_for_shutdown_or_reload(swarm.clone(), args.config.clone(), config).await;
 
     let _ = shutdown_tx.send(true);
 
@@ -1220,7 +1232,11 @@ async fn main() -> std::process::ExitCode {
     std::process::ExitCode::SUCCESS
 }
 
-async fn wait_for_shutdown_or_reload(swarm: Arc<SwarmEngine>, config_path: Option<PathBuf>) {
+async fn wait_for_shutdown_or_reload(
+    swarm: Arc<SwarmEngine>,
+    config_path: Option<PathBuf>,
+    mut current_config: Config,
+) {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{signal, SignalKind};
@@ -1250,8 +1266,16 @@ async fn wait_for_shutdown_or_reload(swarm: Arc<SwarmEngine>, config_path: Optio
                     let cfg_res = Config::load(config_path.as_deref());
                     match cfg_res {
                         Ok(new_cfg) => {
+                            for field in check_non_reloadable_security_changes(&current_config, &new_cfg) {
+                                tracing::warn!(
+                                    target: LIFECYCLE_TARGET,
+                                    "⚠️  Security-critical configuration field '{}' changed on SIGHUP; a full daemon restart is required for it to take effect",
+                                    field
+                                );
+                            }
                             let new_dynamic = settings_from_config(&new_cfg);
                             swarm.update_settings(new_dynamic);
+                            current_config = new_cfg;
                             tracing::info!(target: LIFECYCLE_TARGET, "✅ Configuration and rate limits reloaded successfully via SIGHUP");
                         }
                         Err(e) => {
@@ -1265,12 +1289,54 @@ async fn wait_for_shutdown_or_reload(swarm: Arc<SwarmEngine>, config_path: Optio
 
     #[cfg(not(unix))]
     {
+        let _ = (&swarm, &config_path, &mut current_config);
         if let Err(e) = tokio::signal::ctrl_c().await {
             tracing::error!(target: LIFECYCLE_TARGET, "Failed to listen for shutdown signal: {e}");
         } else {
             tracing::info!(target: LIFECYCLE_TARGET, "Received shutdown signal. Initiating graceful shutdown...");
         }
     }
+}
+
+fn resolve_auth_tokens(config: &Config) -> (Option<String>, Option<String>) {
+    let clean = |opt: &Option<String>| {
+        opt.as_ref()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+    let rpc_token = clean(&config.rpc.auth_token)
+        .or_else(|| clean(&config.http_api.auth_token))
+        .or_else(|| clean(&config.web.auth_token));
+    let web_token = clean(&config.http_api.auth_token)
+        .or_else(|| clean(&config.web.auth_token))
+        .or_else(|| clean(&config.rpc.auth_token));
+    (rpc_token, web_token)
+}
+
+fn check_non_reloadable_security_changes(old: &Config, new: &Config) -> Vec<&'static str> {
+    let mut changed = Vec::new();
+    let (old_rpc_tok, old_web_tok) = resolve_auth_tokens(old);
+    let (new_rpc_tok, new_web_tok) = resolve_auth_tokens(new);
+    if old_rpc_tok != new_rpc_tok {
+        changed.push("rpc.auth_token");
+    }
+    if old_web_tok != new_web_tok {
+        changed.push("http_api.auth_token");
+    }
+    if old.privacy.paranoid_mode != new.privacy.paranoid_mode {
+        changed.push("privacy.paranoid_mode");
+    }
+    if old.network.blocked_ip_ranges != new.network.blocked_ip_ranges
+        || old.network.ip_filter_file != new.network.ip_filter_file
+    {
+        changed.push("ip_filter");
+    }
+    if old.signing.trusted_signers_dir != new.signing.trusted_signers_dir
+        || old.signing.require_trusted_signature != new.signing.require_trusted_signature
+    {
+        changed.push("signing");
+    }
+    changed
 }
 
 async fn startup_self_check(
@@ -1422,5 +1488,42 @@ fn settings_from_config(config: &Config) -> synapse_engine::DynamicSessionSettin
         start_added_torrents: config.lifecycle.start_added_torrents,
         trash_original_torrent_files: config.lifecycle.trash_original_torrent_files,
         ..Default::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_auth_tokens_cascades_across_rpc_http_and_web() {
+        let mut cfg = Config::default();
+        cfg.web.auth_token = Some("web-secret".to_string());
+        let (rpc_tok, http_tok) = resolve_auth_tokens(&cfg);
+        assert_eq!(rpc_tok.as_deref(), Some("web-secret"));
+        assert_eq!(http_tok.as_deref(), Some("web-secret"));
+
+        // Empty/whitespace-only tokens are ignored rather than accepted as ""
+        let mut cfg2 = Config::default();
+        cfg2.rpc.auth_token = Some("   ".to_string());
+        cfg2.http_api.auth_token = Some("".to_string());
+        let (rpc_tok2, http_tok2) = resolve_auth_tokens(&cfg2);
+        assert!(rpc_tok2.is_none());
+        assert!(http_tok2.is_none());
+    }
+
+    #[test]
+    fn check_non_reloadable_security_changes_detects_auth_and_privacy_drift() {
+        let initial = Config::default();
+        let mut reloaded = initial.clone();
+        assert!(check_non_reloadable_security_changes(&initial, &reloaded).is_empty());
+
+        reloaded.rpc.auth_token = Some("new-token".to_string());
+        reloaded.privacy.paranoid_mode = true;
+        let warnings = check_non_reloadable_security_changes(&initial, &reloaded);
+        assert_eq!(warnings.len(), 3);
+        assert!(warnings.iter().any(|w| w.contains("rpc.auth_token")));
+        assert!(warnings.iter().any(|w| w.contains("http_api.auth_token")));
+        assert!(warnings.iter().any(|w| w.contains("privacy.paranoid_mode")));
     }
 }

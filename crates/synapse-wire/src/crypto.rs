@@ -14,10 +14,18 @@ pub enum EncryptionMode {
 }
 
 impl EncryptionMode {
+    #[allow(non_upper_case_globals)]
+    pub const DisableEncryption: Self = Self::PlaintextOnly;
+
     pub fn from_str_opt(s: &str) -> Self {
-        match s {
-            "plaintext_only" | "disabled" => EncryptionMode::PlaintextOnly,
-            "require_encrypted" | "forced" => EncryptionMode::ForcedEncrypted,
+        match s.trim().to_ascii_lowercase().as_str() {
+            "plaintext_only" | "disable_encryption" | "disabled" | "plaintext" | "none" => {
+                EncryptionMode::PlaintextOnly
+            }
+            "require_encrypted" | "forced" | "required" | "strict" | "forced_encrypted" => {
+                EncryptionMode::ForcedEncrypted
+            }
+            "prefer_encrypted" | "prefer" | "enabled" => EncryptionMode::PreferEncrypted,
             _ => EncryptionMode::PreferEncrypted,
         }
     }
@@ -806,5 +814,58 @@ mod tests {
             mse_handshake_receiver(server_raw, EncryptionMode::ForcedEncrypted, |_| None).await;
         assert!(server_err.is_err());
         client_task.await.unwrap();
+    }
+
+    #[test]
+    fn test_encryption_mode_from_str_opt_all_aliases_and_case_insensitivity() {
+        for s in [
+            "require_encrypted",
+            "forced",
+            "required",
+            "strict",
+            "FORCED",
+            "  Required  ",
+            "STRICT",
+        ] {
+            assert_eq!(
+                EncryptionMode::from_str_opt(s),
+                EncryptionMode::ForcedEncrypted,
+                "failed for {s}"
+            );
+        }
+
+        for s in [
+            "prefer_encrypted",
+            "prefer",
+            "enabled",
+            "PREFER",
+            "  Enabled ",
+        ] {
+            assert_eq!(
+                EncryptionMode::from_str_opt(s),
+                EncryptionMode::PreferEncrypted,
+                "failed for {s}"
+            );
+        }
+
+        for s in [
+            "plaintext_only",
+            "disable_encryption",
+            "disabled",
+            "plaintext",
+            "none",
+            "DISABLED",
+            "  Plaintext  ",
+        ] {
+            assert_eq!(
+                EncryptionMode::from_str_opt(s),
+                EncryptionMode::PlaintextOnly,
+                "failed for {s}"
+            );
+            assert_eq!(
+                EncryptionMode::from_str_opt(s),
+                EncryptionMode::DisableEncryption
+            );
+        }
     }
 }

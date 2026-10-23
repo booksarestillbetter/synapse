@@ -35,8 +35,8 @@ use crate::proto::{
 use crate::routing::{self, Node, NodeV6, RoutingTable, RoutingTableV6};
 use crate::sample::{DhtScrapeResponse, SampleInfohashesResponse};
 use crate::storage::{
-    compute_immutable_target, compute_mutable_target, DhtItem, DhtStorage, StorageError,
-    MAX_ITEM_VALUE_LEN, MAX_SALT_LEN,
+    compute_immutable_target, compute_mutable_target, format_sign_payload, verify_ed25519, DhtItem,
+    DhtStorage, StorageError, MAX_ITEM_VALUE_LEN, MAX_SALT_LEN,
 };
 
 const QUERY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -466,7 +466,12 @@ impl DhtHandle {
     ) -> Result<(Vec<u8>, Option<GetItem>), DhtError> {
         let msg = self.query(addr, None, Query::Get { target, seq }).await?;
         match msg.body {
-            Body::Response(Response::Get { token, item, .. }) => Ok((token, Some(item))),
+            Body::Response(Response::Get { token, item, .. }) => {
+                if !verify_get_item(target, seq, &item) {
+                    return Err(DhtError::Malformed);
+                }
+                Ok((token, Some(item)))
+            }
             Body::Response(Response::GetPeers { token, .. }) => Ok((token, None)),
             Body::Response(_) => Err(DhtError::Malformed),
             Body::Error { message, .. } => Err(DhtError::Remote(message)),
@@ -778,6 +783,33 @@ fn expect_response(
     }
 }
 
+/// Validates a BEP 44 `get` response item against `target` and optional `min_seq`.
+fn verify_get_item(target: [u8; 20], min_seq: Option<u64>, item: &GetItem) -> bool {
+    if item.v.len() > MAX_ITEM_VALUE_LEN {
+        return false;
+    }
+    match (item.k, item.sig, item.seq) {
+        (None, None, None) => compute_immutable_target(&item.v) == target,
+        (Some(k), Some(sig), Some(item_seq)) => {
+            if min_seq.is_some_and(|s| item_seq < s) {
+                return false;
+            }
+            // When salt is absent (`compute_mutable_target(&k, None) == target`), verify the
+            // Ed25519 signature immediately. When a non-empty salt was used to derive `target`,
+            // the caller (e.g. `TorrentUpdatePointer`) knows `salt` and verifies the signature
+            // over `(salt, seq, v)`.
+            if compute_mutable_target(&k, None) == target {
+                let payload = format_sign_payload(None, item_seq, &item.v);
+                if !verify_ed25519(&k, &payload, &sig) {
+                    return false;
+                }
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
 async fn run(
     id_cell: Arc<std::sync::RwLock<NodeId>>,
     socket_v4: Option<Arc<UdpTransport>>,
@@ -941,10 +973,14 @@ fn apply_vote(
     tracing::info!(
         "DHT: external address agreed as {consensus}; adopting BEP 42 node id derived from it"
     );
+    let enforce_v4 = routing.enforce_node_id();
+    let enforce_v6 = routing_v6.enforce_node_id();
     let old4 = routing.closest(our_id, usize::MAX);
     let old6 = routing_v6.closest(our_id, usize::MAX);
     *routing = RoutingTable::new(new_id);
+    routing.set_enforce_node_id(enforce_v4);
     *routing_v6 = RoutingTableV6::new(new_id);
+    routing_v6.set_enforce_node_id(enforce_v6);
     for n in old4 {
         routing.seen(n.id, n.addr, n.last_seen);
     }
@@ -1434,10 +1470,14 @@ fn handle_put(
     }
 }
 
+const MAX_PEERS_PER_IPV6_PREFIX_64: usize = 2;
+const MAX_PEERS_PER_IPV6_PREFIX_48: usize = 8;
+
 /// Records `addr` as a peer of `info_hash`, within the storage caps: at most
 /// `MAX_ANNOUNCED_TORRENTS` torrents (a new one evicts the torrent with the fewest peers,
-/// so popular swarms survive a flood of fake ones) and `MAX_PEERS_PER_TORRENT` peers each
-/// (a new one replaces the oldest).
+/// so popular swarms survive a flood of fake ones), per-prefix caps for IPv6 (`/64` and `/48`)
+/// to prevent a single IPv6 allocation from flooding a swarm, and `MAX_PEERS_PER_TORRENT`
+/// peers each with address-family balance (so an IPv6 flood cannot evict all IPv4 peers).
 fn store_announce(
     announced: &mut HashMap<[u8; 20], Vec<AnnouncedPeer>>,
     info_hash: [u8; 20],
@@ -1460,13 +1500,71 @@ fn store_announce(
         p.seed = seed;
         return;
     }
-    if list.len() >= MAX_PEERS_PER_TORRENT {
-        if let Some(oldest) = list
+
+    // Enforce IPv6 /64 and /48 prefix caps so an attacker with a /48 or /64 cannot flood a swarm.
+    if let SocketAddr::V6(v6) = addr {
+        let octs = v6.ip().octets();
+        let prefix64 = &octs[..8];
+        let prefix48 = &octs[..6];
+
+        let count64 = list
             .iter()
-            .enumerate()
-            .min_by_key(|(_, p)| p.announced_at)
-            .map(|(i, _)| i)
-        {
+            .filter(|p| matches!(p.addr, SocketAddr::V6(existing) if existing.ip().octets()[..8] == *prefix64))
+            .count();
+        if count64 >= MAX_PEERS_PER_IPV6_PREFIX_64 {
+            if let Some(oldest_in_64) = list
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| matches!(p.addr, SocketAddr::V6(existing) if existing.ip().octets()[..8] == *prefix64))
+                .min_by_key(|(_, p)| p.announced_at)
+                .map(|(i, _)| i)
+            {
+                list.swap_remove(oldest_in_64);
+            }
+        } else {
+            let count48 = list
+                .iter()
+                .filter(|p| matches!(p.addr, SocketAddr::V6(existing) if existing.ip().octets()[..6] == *prefix48))
+                .count();
+            if count48 >= MAX_PEERS_PER_IPV6_PREFIX_48 {
+                if let Some(oldest_in_48) = list
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, p)| matches!(p.addr, SocketAddr::V6(existing) if existing.ip().octets()[..6] == *prefix48))
+                    .min_by_key(|(_, p)| p.announced_at)
+                    .map(|(i, _)| i)
+                {
+                    list.swap_remove(oldest_in_48);
+                }
+            }
+        }
+    }
+
+    if list.len() >= MAX_PEERS_PER_TORRENT {
+        let is_v6 = addr.is_ipv6();
+        let same_family_count = list.iter().filter(|p| p.addr.is_ipv6() == is_v6).count();
+        // Reserve up to half the table for each address family when both are present so one
+        // family cannot completely evict the other.
+        let evict_idx = if same_family_count >= MAX_PEERS_PER_TORRENT / 2 {
+            list.iter()
+                .enumerate()
+                .filter(|(_, p)| p.addr.is_ipv6() == is_v6)
+                .min_by_key(|(_, p)| p.announced_at)
+                .map(|(i, _)| i)
+        } else {
+            list.iter()
+                .enumerate()
+                .filter(|(_, p)| p.addr.is_ipv6() != is_v6)
+                .min_by_key(|(_, p)| p.announced_at)
+                .map(|(i, _)| i)
+        }
+        .or_else(|| {
+            list.iter()
+                .enumerate()
+                .min_by_key(|(_, p)| p.announced_at)
+                .map(|(i, _)| i)
+        });
+        if let Some(oldest) = evict_idx {
             list.swap_remove(oldest);
         }
     }
@@ -2078,5 +2176,136 @@ mod tests {
         let dead = addr(127, 0, 0, 1, 1);
         let result = a.ping(dead).await;
         assert!(matches!(result, Err(DhtError::Timeout)));
+    }
+
+    #[test]
+    fn bep44_get_item_verification_rejects_forged_immutable_and_mutable_items() {
+        use ed25519_dalek::{Signer, SigningKey};
+
+        // 1. Immutable item: valid SHA-1 passes, mismatched SHA-1 fails.
+        let v = b"11:hello world".to_vec();
+        let target = compute_immutable_target(&v);
+        let good_imm = GetItem {
+            v: v.clone(),
+            k: None,
+            sig: None,
+            seq: None,
+        };
+        assert!(verify_get_item(target, None, &good_imm));
+        let forged_imm = GetItem {
+            v: b"11:tampered!!".to_vec(),
+            k: None,
+            sig: None,
+            seq: None,
+        };
+        assert!(!verify_get_item(target, None, &forged_imm));
+
+        // 2. Mutable item (no salt): valid Ed25519 signature passes, forged signature fails.
+        let sk = SigningKey::from_bytes(&[0x77; 32]);
+        let pk = sk.verifying_key().to_bytes();
+        let mut_target = compute_mutable_target(&pk, None);
+        let payload = format_sign_payload(None, 5, &v);
+        let sig = sk.sign(&payload).to_bytes();
+
+        let good_mut = GetItem {
+            v: v.clone(),
+            k: Some(pk),
+            sig: Some(sig),
+            seq: Some(5),
+        };
+        assert!(verify_get_item(mut_target, Some(5), &good_mut));
+        assert!(!verify_get_item(mut_target, Some(6), &good_mut));
+
+        let mut bad_mut = good_mut.clone();
+        bad_mut.sig = Some([0xAB; 64]);
+        assert!(!verify_get_item(mut_target, None, &bad_mut));
+    }
+
+    #[test]
+    fn ipv6_announce_prefix_caps_and_address_family_balance() {
+        let mut announced: HashMap<[u8; 20], Vec<AnnouncedPeer>> = HashMap::new();
+        let h = [0x55u8; 20];
+        let t0 = Instant::now();
+
+        // 1. Announce 10 peers from the same /64 (`2001:db8:1:1::/64`): capped at MAX_PEERS_PER_IPV6_PREFIX_64 (2).
+        for i in 0..10u16 {
+            store_announce(
+                &mut announced,
+                h,
+                addr6([0x2001, 0x0db8, 1, 1, 0, 0, 0, i + 1], 6881),
+                t0 + Duration::from_millis(u64::from(i)),
+                false,
+            );
+        }
+        assert_eq!(announced[&h].len(), MAX_PEERS_PER_IPV6_PREFIX_64);
+
+        // 2. Announce peers across 10 different /64s within the same /48 (`2001:db8:1::/48`):
+        // capped at MAX_PEERS_PER_IPV6_PREFIX_48 (8).
+        for subnet in 0..10u16 {
+            store_announce(
+                &mut announced,
+                h,
+                addr6([0x2001, 0x0db8, 1, subnet + 10, 0, 0, 0, 1], 6881),
+                t0 + Duration::from_millis(100 + u64::from(subnet)),
+                false,
+            );
+        }
+        assert_eq!(announced[&h].len(), MAX_PEERS_PER_IPV6_PREFIX_48);
+
+        // 3. Seed 50 IPv4 peers, then flood with 600 distinct-/48 IPv6 peers:
+        // IPv4 peers must NOT be evicted because IPv6 is capped at half the table when IPv4 is present.
+        let mut mixed: HashMap<[u8; 20], Vec<AnnouncedPeer>> = HashMap::new();
+        for i in 0..50u8 {
+            store_announce(
+                &mut mixed,
+                h,
+                addr(40, i, 1, 1, 6881),
+                t0 + Duration::from_millis(u64::from(i)),
+                false,
+            );
+        }
+        for i in 0..600u16 {
+            store_announce(
+                &mut mixed,
+                h,
+                addr6([0x2600, i + 1, i + 1, 1, 0, 0, 0, 1], 6881),
+                t0 + Duration::from_secs(10) + Duration::from_millis(u64::from(i)),
+                false,
+            );
+        }
+        let v4_remaining = mixed[&h].iter().filter(|p| p.addr.is_ipv4()).count();
+        assert_eq!(
+            v4_remaining, 50,
+            "IPv6 flood must not evict existing IPv4 peers below half capacity"
+        );
+    }
+
+    #[test]
+    fn apply_vote_preserves_enforce_node_id_flag() {
+        let old_id = [0x11u8; 20];
+        let cell = Arc::new(std::sync::RwLock::new(old_id));
+        let mut our_id = old_id;
+        let mut routing = RoutingTable::new(old_id);
+        let mut routing_v6 = RoutingTableV6::new(old_id);
+        routing.set_enforce_node_id(true);
+        routing_v6.set_enforce_node_id(true);
+
+        let (mut v4, mut v6) = (IpVoter::new(), IpVoter::new());
+        let me: std::net::IpAddr = "203.0.113.77".parse().unwrap();
+        for n in 0..8u8 {
+            let mut vote = Some((public_v4(n), me));
+            apply_vote(
+                &mut vote,
+                &mut v4,
+                &mut v6,
+                &cell,
+                &mut our_id,
+                &mut routing,
+                &mut routing_v6,
+            );
+        }
+        assert_ne!(our_id, old_id);
+        assert!(routing.enforce_node_id());
+        assert!(routing_v6.enforce_node_id());
     }
 }

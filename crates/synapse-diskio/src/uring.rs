@@ -287,17 +287,14 @@ fn run_ring(mut ring: IoUring, rx: std_mpsc::Receiver<(Job, OpResponder)>, max_o
                     // `retry_op` (and its buffer/file) is inserted into `pending` before
                     // this SQE is pushed, and is only dropped after the matching CQE is
                     // reaped in a future pass through this same loop.
-                    let push_result = unsafe { ring.submission().push(&entry) };
-                    if push_result.is_err() {
-                        fail_responder(
-                            retry_op.responder,
-                            retry_op.path,
-                            io::Error::other(
-                                "io_uring submission queue full (short-completion retry)",
-                            ),
-                        );
-                    } else {
-                        pending.insert(retry_id, retry_op);
+                    let push_result = unsafe { push_entry(&mut ring, &entry) };
+                    match push_result {
+                        Ok(()) => {
+                            pending.insert(retry_id, retry_op);
+                        }
+                        Err(e) => {
+                            fail_responder(retry_op.responder, retry_op.path, e);
+                        }
                     }
                 }
             }
@@ -389,16 +386,34 @@ fn submit_job(
     // after this SQE's CQE has been reaped in `complete_op`. The pointers this entry
     // carries (into `op`'s buffer) therefore stay valid for as long as the kernel might
     // hold them.
-    let push_result = unsafe { ring.submission().push(&entry) };
-    if push_result.is_err() {
-        fail_responder(
-            op.responder,
-            op.path,
-            io::Error::other("io_uring submission queue full"),
-        );
+    if let Err(e) = unsafe { push_entry(ring, &entry) } {
+        fail_responder(op.responder, op.path, e);
         return;
     }
     pending.insert(id, op);
+}
+
+/// Pushes `entry` onto `ring`'s submission queue, flushing first (`ring.submit()`) if
+/// the queue is already at its fixed `queue_depth` capacity.
+///
+/// Draining a burst of more than `queue_depth` queued jobs in one pass (see
+/// `run_ring`) would otherwise fail every push past the limit with `QueueFull`,
+/// since the userspace SQ ring is a fixed-size buffer. `submit()` hands every queued
+/// SQE to the kernel via `io_uring_enter` and frees their slots for reuse immediately
+/// -- independent of whether the kernel has *completed* them yet -- so retrying the
+/// push right after is expected to succeed.
+///
+/// # Safety
+/// Same invariant as a direct `ring.submission().push()`: any buffer or file
+/// descriptor `entry` references must remain valid and untouched until its CQE is
+/// reaped.
+unsafe fn push_entry(ring: &mut IoUring, entry: &io_uring::squeue::Entry) -> io::Result<()> {
+    if ring.submission().is_full() {
+        ring.submit()?;
+    }
+    ring.submission()
+        .push(entry)
+        .map_err(|_| io::Error::other("io_uring submission queue full"))
 }
 
 fn fail_responder(responder: OpResponder, path: PathBuf, source: io::Error) {

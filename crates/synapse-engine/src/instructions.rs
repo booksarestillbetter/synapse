@@ -87,8 +87,31 @@ impl FileOp {
     }
 
     fn apply(self, src: &Path, dst: &Path) -> std::io::Result<()> {
+        let src_meta = std::fs::symlink_metadata(src)?;
+        if !src_meta.file_type().is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("source {:?} is not a regular file", src),
+            ));
+        }
         if let Some(parent) = dst.parent() {
+            if let Ok(pmeta) = std::fs::symlink_metadata(parent) {
+                if pmeta.file_type().is_symlink() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("destination parent {:?} is a symlink", parent),
+                    ));
+                }
+            }
             std::fs::create_dir_all(parent)?;
+        }
+        if let Ok(dst_meta) = std::fs::symlink_metadata(dst) {
+            if dst_meta.file_type().is_symlink() || dst_meta.file_type().is_dir() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("destination {:?} is a symlink or directory", dst),
+                ));
+            }
         }
         match self {
             FileOp::Hardlink => StagingPlugin::link_or_copy(src, dst),
@@ -116,11 +139,30 @@ pub struct InstructionsWebhookPlugin {
 
 impl InstructionsWebhookPlugin {
     pub fn new(config: InstructionsConfig) -> Self {
-        let http = reqwest::Client::builder()
-            .timeout(config.timeout)
-            .build()
-            .unwrap_or_default();
+        let mut builder = reqwest::Client::builder().timeout(config.timeout);
+        if let Some(p) = crate::proxy::global().filter(|p| p.proxy_http || p.force_proxy) {
+            if let Ok(proxy) = reqwest::Proxy::all(p.url()) {
+                builder = builder.proxy(proxy);
+            }
+        }
+        let http = builder.build().unwrap_or_default();
         Self { http, config }
+    }
+
+    fn client_for_request(&self) -> Result<reqwest::Client, String> {
+        if let Some(p) = crate::proxy::global().filter(|p| p.proxy_http || p.force_proxy) {
+            if p.host.trim().is_empty() || p.port == 0 {
+                return Err("proxy is enabled but has an empty host or zero port".to_string());
+            }
+            let proxy = reqwest::Proxy::all(p.url()).map_err(|e| e.to_string())?;
+            reqwest::Client::builder()
+                .timeout(self.config.timeout)
+                .proxy(proxy)
+                .build()
+                .map_err(|e| e.to_string())
+        } else {
+            Ok(self.http.clone())
+        }
     }
 
     fn authed(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
@@ -130,10 +172,8 @@ impl InstructionsWebhookPlugin {
         }
     }
 
-    async fn classify(
-        &self,
-        event: &TorrentCompletedEvent,
-    ) -> Result<ClassifyResponse, reqwest::Error> {
+    async fn classify(&self, event: &TorrentCompletedEvent) -> Result<ClassifyResponse, String> {
+        let client = self.client_for_request()?;
         let url = format!(
             "{}/api/sync/classify",
             self.config.url.trim_end_matches('/')
@@ -147,12 +187,15 @@ impl InstructionsWebhookPlugin {
             trackers: &event.trackers,
             total_bytes: event.total_bytes,
         };
-        let req = self.authed(self.http.post(&url).json(&body));
+        let req = self.authed(client.post(&url).json(&body));
         req.send()
-            .await?
-            .error_for_status()?
+            .await
+            .map_err(|e| e.to_string())?
+            .error_for_status()
+            .map_err(|e| e.to_string())?
             .json::<ClassifyResponse>()
             .await
+            .map_err(|e| e.to_string())
     }
 
     async fn notify(
@@ -162,6 +205,16 @@ impl InstructionsWebhookPlugin {
         target_dir: &str,
         final_path: &str,
     ) {
+        let client = match self.client_for_request() {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(
+                    "completion_instructions: notify-download skipped due to proxy config error: {}",
+                    e
+                );
+                return;
+            }
+        };
         let url = format!(
             "{}/api/sync/notify-download",
             self.config.url.trim_end_matches('/')
@@ -174,7 +227,7 @@ impl InstructionsWebhookPlugin {
             queue,
             target_dir,
         };
-        let req = self.authed(self.http.post(&url).json(&body));
+        let req = self.authed(client.post(&url).json(&body));
         if let Err(e) = req.send().await {
             // Non-fatal: file placement already happened by the time this runs, this is just
             // telling the server about it for its own event log / notifications.
@@ -193,16 +246,46 @@ impl InstructionsWebhookPlugin {
         target_dir: &Path,
         op: FileOp,
     ) -> std::io::Result<PathBuf> {
+        if !target_dir.is_absolute()
+            || target_dir
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "target_dir {:?} must be an absolute path without '..'",
+                    target_dir
+                ),
+            ));
+        }
+        if let Ok(meta) = std::fs::symlink_metadata(target_dir) {
+            if meta.file_type().is_symlink() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("target_dir {:?} is a symlink", target_dir),
+                ));
+            }
+        }
+
+        let source_root = Path::new(&event.download_dir);
+        let name_rel = Path::new(&event.name);
+        crate::fs::verify_no_symlinks_under(target_dir, name_rel)?;
         std::fs::create_dir_all(target_dir)?;
-        let dest_root = target_dir.join(&event.name);
+        let dest_root = target_dir.join(name_rel);
 
         if event.files.is_empty() {
-            let src = Path::new(&event.download_dir).join(&event.name);
+            crate::fs::verify_no_symlinks_under(source_root, name_rel)?;
+            crate::fs::verify_no_symlinks_under(target_dir, name_rel)?;
+            let src = source_root.join(name_rel);
             op.apply(&src, &dest_root)?;
         } else {
             for f in &event.files {
-                let src = Path::new(&event.download_dir).join(&f.path);
-                let dst = target_dir.join(&f.path);
+                let f_path = Path::new(&f.path);
+                crate::fs::verify_no_symlinks_under(source_root, f_path)?;
+                crate::fs::verify_no_symlinks_under(target_dir, f_path)?;
+                let src = source_root.join(f_path);
+                let dst = target_dir.join(f_path);
                 if src.exists() {
                     op.apply(&src, &dst)?;
                 }

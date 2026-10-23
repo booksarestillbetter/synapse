@@ -21,6 +21,7 @@ pub struct ApiState {
     pub engine: Arc<SwarmEngine>,
     pub auth_token: Option<String>,
     pub web_config: synapse_config::WebConfig,
+    pub base_download_dir: std::path::PathBuf,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]
@@ -171,10 +172,13 @@ pub fn create_http_router_all(
     metrics_enabled: bool,
     web_config: synapse_config::WebConfig,
 ) -> Router {
+    let base_download_dir = engine.settings().read().download_dir.clone();
+    let auth_token = auth_token.filter(|t| !t.trim().is_empty());
     let state = ApiState {
         engine,
         auth_token,
         web_config: web_config.clone(),
+        base_download_dir,
     };
 
     let protected = Router::new()
@@ -347,19 +351,210 @@ fn parse_info_hash_hex(s: &str) -> Option<[u8; 20]> {
     hex::decode(s).ok()?.try_into().ok()
 }
 
+/// Constant-time byte slice comparison that rejects empty secrets/tokens and avoids
+/// length or byte-position timing side-channels.
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    let max_len = a.len().max(b.len());
+    let mut diff = a.len() ^ b.len();
+    for i in 0..max_len {
+        let byte_a = a.get(i).copied().unwrap_or(0);
+        let byte_b = b.get(i).copied().unwrap_or(0);
+        diff |= (byte_a ^ byte_b) as usize;
+    }
+    diff == 0
+}
+
+fn canonicalize_with_nonexistent_tail(
+    path: &std::path::Path,
+) -> Result<std::path::PathBuf, String> {
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|e| format!("failed to determine current directory: {e}"))?
+            .join(path)
+    };
+
+    let mut existing = abs.as_path();
+    let mut tail_components = Vec::new();
+    while !existing.exists() {
+        if let Some(name) = existing.file_name() {
+            tail_components.push(name.to_os_string());
+        } else {
+            break;
+        }
+        if let Some(parent) = existing.parent() {
+            existing = parent;
+        } else {
+            break;
+        }
+    }
+
+    let mut canonical = if existing.exists() {
+        std::fs::canonicalize(existing)
+            .map_err(|e| format!("failed to canonicalize path '{}': {e}", existing.display()))?
+    } else {
+        abs
+    };
+
+    for comp in tail_components.into_iter().rev() {
+        canonical.push(comp);
+    }
+    Ok(canonical)
+}
+
+/// Validates that `candidate` resolves strictly within `base` (no `..` traversal, no NUL bytes,
+/// and no symlinks escaping `base`).
+pub fn validate_path_under_base(
+    base: &std::path::Path,
+    candidate: &std::path::Path,
+) -> Result<std::path::PathBuf, String> {
+    let raw = candidate.as_os_str().to_string_lossy();
+    if raw.trim().is_empty() {
+        return Err("path must not be empty".to_string());
+    }
+    if raw.contains('\0') {
+        return Err("path must not contain NUL bytes".to_string());
+    }
+    for comp in candidate.components() {
+        if matches!(comp, std::path::Component::ParentDir) {
+            return Err(
+                "path must not contain '..' parent directory traversal components".to_string(),
+            );
+        }
+    }
+
+    let canonical_base = canonicalize_with_nonexistent_tail(base)?;
+    let joined = if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else {
+        canonical_base.join(candidate)
+    };
+
+    // Walk components of `joined` to detect any symlink along the path (including a dangling leaf
+    // symlink) that points outside `canonical_base`.
+    let mut cur = std::path::PathBuf::new();
+    for comp in joined.components() {
+        cur.push(comp.as_os_str());
+        if let Ok(meta) = std::fs::symlink_metadata(&cur) {
+            if meta.file_type().is_symlink() {
+                let target = std::fs::canonicalize(&cur).map_err(|_| {
+                    "symlink target inside download directory cannot be resolved".to_string()
+                })?;
+                if cur.starts_with(&canonical_base) && !target.starts_with(&canonical_base) {
+                    return Err("symlink escapes the configured download directory".to_string());
+                }
+            }
+        }
+    }
+
+    let resolved = canonicalize_with_nonexistent_tail(&joined)?;
+    if !resolved.starts_with(&canonical_base) {
+        return Err("the path must be inside the download directory".to_string());
+    }
+    Ok(resolved)
+}
+
+pub fn is_safe_single_component_name(name: &str) -> bool {
+    let trimmed = name.trim();
+    if trimmed.is_empty()
+        || trimmed == "."
+        || trimmed == ".."
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains('\0')
+    {
+        return false;
+    }
+    let mut comps = std::path::Path::new(name).components();
+    matches!(comps.next(), Some(std::path::Component::Normal(_))) && comps.next().is_none()
+}
+
+fn verify_same_origin_csrf(req: &Request) -> Result<(), StatusCode> {
+    use axum::http::Method;
+    if !matches!(
+        *req.method(),
+        Method::POST | Method::PUT | Method::PATCH | Method::DELETE
+    ) {
+        return Ok(());
+    }
+
+    if let Some(sec_fetch) = req
+        .headers()
+        .get("sec-fetch-site")
+        .and_then(|v| v.to_str().ok())
+    {
+        if sec_fetch.eq_ignore_ascii_case("cross-site") {
+            return Err(StatusCode::FORBIDDEN);
+        }
+    }
+
+    let origin_or_referer = req
+        .headers()
+        .get(header::ORIGIN)
+        .or_else(|| req.headers().get(header::REFERER))
+        .and_then(|v| v.to_str().ok());
+
+    if let Some(raw_url) = origin_or_referer {
+        let trimmed = raw_url.trim();
+        if trimmed.eq_ignore_ascii_case("null") {
+            return Err(StatusCode::FORBIDDEN);
+        }
+        let parsed = url::Url::parse(trimmed).map_err(|_| StatusCode::FORBIDDEN)?;
+        let origin_host = parsed.host_str().ok_or(StatusCode::FORBIDDEN)?;
+        let origin_authority = match parsed.port() {
+            Some(p) => format!("{origin_host}:{p}"),
+            None => origin_host.to_string(),
+        };
+
+        if let Some(host_hdr) = req
+            .headers()
+            .get(header::HOST)
+            .and_then(|v| v.to_str().ok())
+        {
+            let host_trimmed = host_hdr.trim();
+            let host_only = host_trimmed
+                .rsplit_once(':')
+                .map(|(h, _)| h)
+                .unwrap_or(host_trimmed);
+            if !origin_authority.eq_ignore_ascii_case(host_trimmed)
+                && !origin_host.eq_ignore_ascii_case(host_only)
+            {
+                return Err(StatusCode::FORBIDDEN);
+            }
+        } else if !matches!(origin_host, "localhost" | "127.0.0.1" | "[::1]" | "::1") {
+            return Err(StatusCode::FORBIDDEN);
+        }
+    }
+
+    Ok(())
+}
+
 async fn require_auth(
     State(state): State<ApiState>,
     req: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
+    verify_same_origin_csrf(&req)?;
+
     let Some(ref expected) = state.auth_token else {
         return Ok(next.run(req).await);
     };
+    let expected_trimmed = expected.trim();
+    if expected_trimmed.is_empty() {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
     let authorized = req
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .map(|v| v.strip_prefix("Bearer ").unwrap_or(v).trim() == expected)
+        .map(|v| {
+            let provided = v.strip_prefix("Bearer ").unwrap_or(v).trim();
+            constant_time_eq(provided.as_bytes(), expected_trimmed.as_bytes())
+        })
         .unwrap_or(false);
     if !authorized {
         return Err(StatusCode::UNAUTHORIZED);
@@ -480,12 +675,45 @@ async fn get_session_settings_handler(
 async fn update_session_settings_handler(
     State(state): State<ApiState>,
     Json(payload): Json<synapse_engine::SessionSettingsUpdate>,
-) -> Json<UpdateSessionSettingsResponse> {
+) -> Result<Json<UpdateSessionSettingsResponse>, (StatusCode, Json<UpdateSessionSettingsResponse>)>
+{
+    if let Some(ref dl_dir) = payload.download_dir {
+        if !dl_dir.trim().is_empty() {
+            if let Err(msg) = validate_path_under_base(
+                &state.base_download_dir,
+                std::path::Path::new(dl_dir.trim()),
+            ) {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    Json(UpdateSessionSettingsResponse {
+                        success: false,
+                        warnings: vec![format!("download_dir rejected: {msg}")],
+                    }),
+                ));
+            }
+        }
+    }
+    if let Some(ref inc_dir) = payload.incomplete_dir {
+        if !inc_dir.trim().is_empty() {
+            if let Err(msg) = validate_path_under_base(
+                &state.base_download_dir,
+                std::path::Path::new(inc_dir.trim()),
+            ) {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    Json(UpdateSessionSettingsResponse {
+                        success: false,
+                        warnings: vec![format!("incomplete_dir rejected: {msg}")],
+                    }),
+                ));
+            }
+        }
+    }
     let warnings = state.engine.update_session_settings(payload);
-    Json(UpdateSessionSettingsResponse {
+    Ok(Json(UpdateSessionSettingsResponse {
         success: true,
         warnings,
-    })
+    }))
 }
 
 async fn session_stats_handler(State(state): State<ApiState>) -> Json<serde_json::Value> {
@@ -523,7 +751,7 @@ async fn list_torrents_handler(
 ) -> Json<serde_json::Value> {
     let page = query.page.unwrap_or(1).max(1);
     let limit = query.limit.unwrap_or(50).max(1);
-    let offset = (page - 1) * limit;
+    let offset = page.saturating_sub(1).saturating_mul(limit);
 
     let filter = query
         .state
@@ -717,26 +945,19 @@ async fn create_torrent_handler(
         )
     };
     // Only content already under the download directory: this endpoint must not become a way to
-    // probe arbitrary files on the host.
-    let base = state.engine.settings().read().download_dir.clone();
-    let base = std::fs::canonicalize(&base).map_err(|e| {
-        fail(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("download directory unavailable: {e}"),
-        )
-    })?;
-    let requested = std::path::PathBuf::from(&req.path);
-    let requested = if requested.is_absolute() {
-        requested
-    } else {
-        base.join(requested)
-    };
-    let path = std::fs::canonicalize(&requested)
-        .map_err(|e| fail(StatusCode::NOT_FOUND, format!("{}: {e}", req.path)))?;
-    if !path.starts_with(&base) {
+    // probe arbitrary files on the host. Check path containment BEFORE testing file existence so
+    // any out-of-bounds path uniformly returns 403 FORBIDDEN (eliminating a file-existence oracle).
+    let path = validate_path_under_base(&state.base_download_dir, std::path::Path::new(&req.path))
+        .map_err(|_| {
+            fail(
+                StatusCode::FORBIDDEN,
+                "the path must be inside the download directory".into(),
+            )
+        })?;
+    if !path.exists() {
         return Err(fail(
-            StatusCode::FORBIDDEN,
-            "the path must be inside the download directory".into(),
+            StatusCode::NOT_FOUND,
+            format!("{}: path does not exist", req.path),
         ));
     }
     let version = match req.version.as_deref().unwrap_or("v1") {
@@ -848,11 +1069,26 @@ async fn add_torrent_handler(
     State(state): State<ApiState>,
     Json(payload): Json<AddTorrentRequest>,
 ) -> Result<Json<ActionResponse>, (StatusCode, Json<ActionResponse>)> {
-    let dir = payload
+    let dir = match payload
         .download_dir
-        .filter(|d| !d.trim().is_empty())
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| state.engine.settings().read().download_dir.clone());
+        .as_deref()
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
+    {
+        Some(custom_dir) => {
+            validate_path_under_base(&state.base_download_dir, std::path::Path::new(custom_dir))
+                .map_err(|msg| {
+                    (
+                        StatusCode::FORBIDDEN,
+                        Json(ActionResponse {
+                            success: false,
+                            message: format!("download_dir rejected: {msg}"),
+                        }),
+                    )
+                })?
+        }
+        None => state.engine.settings().read().download_dir.clone(),
+    };
 
     let info = if let Some(ref url) = payload.url {
         match crate::url_fetcher::fetch_or_parse_torrent(url).await {
@@ -1008,20 +1244,38 @@ async fn delete_torrent_handler(
     let mut hash = [0u8; 20];
     hash.copy_from_slice(&hash_bytes);
 
-    let target_path = if let Some(handle) = state.engine.get_torrent(&hash) {
+    let target_info = if let Some(handle) = state.engine.get_torrent(&hash) {
         let stats = handle.stats.read();
-        Some(std::path::PathBuf::from(&stats.download_dir).join(&stats.name))
+        Some((stats.download_dir.clone(), stats.name.clone()))
     } else {
         None
     };
 
     if state.engine.remove_torrent(&hash) {
         if query.delete_data.unwrap_or(false) {
-            if let Some(path) = target_path {
-                if path.is_dir() {
-                    let _ = std::fs::remove_dir_all(&path);
-                } else if path.is_file() {
-                    let _ = std::fs::remove_file(&path);
+            if let Some((dl_dir_str, torrent_name)) = target_info {
+                if is_safe_single_component_name(&torrent_name) {
+                    if let (Ok(canonical_base), Ok(canonical_dl_dir)) = (
+                        canonicalize_with_nonexistent_tail(&state.base_download_dir),
+                        validate_path_under_base(
+                            &state.base_download_dir,
+                            std::path::Path::new(&dl_dir_str),
+                        ),
+                    ) {
+                        let candidate = canonical_dl_dir.join(&torrent_name);
+                        if candidate != canonical_dl_dir
+                            && candidate != canonical_base
+                            && candidate.starts_with(&canonical_base)
+                        {
+                            if let Ok(meta) = std::fs::symlink_metadata(&candidate) {
+                                if meta.file_type().is_symlink() || meta.file_type().is_file() {
+                                    let _ = std::fs::remove_file(&candidate);
+                                } else if meta.file_type().is_dir() {
+                                    let _ = std::fs::remove_dir_all(&candidate);
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1219,11 +1473,26 @@ async fn upload_torrent_handler(
         )
     })?;
 
-    let dir = query
+    let dir = match query
         .download_dir
-        .filter(|d| !d.trim().is_empty())
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| state.engine.settings().read().download_dir.clone());
+        .as_deref()
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
+    {
+        Some(custom_dir) => {
+            validate_path_under_base(&state.base_download_dir, std::path::Path::new(custom_dir))
+                .map_err(|msg| {
+                    (
+                        StatusCode::FORBIDDEN,
+                        Json(ActionResponse {
+                            success: false,
+                            message: format!("download_dir rejected: {msg}"),
+                        }),
+                    )
+                })?
+        }
+        None => state.engine.settings().read().download_dir.clone(),
+    };
 
     if let Err(message) = state.engine.check_signature_policy(&info) {
         return Err((
@@ -1285,7 +1554,16 @@ async fn set_location_handler(
     let mut hash = [0u8; 20];
     hash.copy_from_slice(&hash_bytes);
 
-    if state.engine.set_location(&hash, &payload.new_download_dir) {
+    let validated = validate_path_under_base(
+        &state.base_download_dir,
+        std::path::Path::new(payload.new_download_dir.trim()),
+    )
+    .map_err(|_| StatusCode::FORBIDDEN)?;
+
+    if state
+        .engine
+        .set_location(&hash, &validated.to_string_lossy())
+    {
         Ok(Json(ActionResponse {
             success: true,
             message: "Location updated".to_string(),
@@ -1604,5 +1882,207 @@ mod tests {
         assert_eq!(session_json["upload_limit_pretty"], "1 Gbps");
         assert_eq!(session_json["alt_speed_down_bytes"], 125_000_000);
         assert_eq!(session_json["alt_speed_down_pretty"], "1 Gbps");
+    }
+
+    #[test]
+    fn test_constant_time_eq_rejects_empty_and_mismatched_tokens() {
+        assert!(!constant_time_eq(b"", b""));
+        assert!(!constant_time_eq(b"secret", b""));
+        assert!(!constant_time_eq(b"", b"secret"));
+        assert!(!constant_time_eq(b"secret", b"secret-longer"));
+        assert!(!constant_time_eq(b"secret1", b"secret2"));
+        assert!(constant_time_eq(
+            b"super-secret-token",
+            b"super-secret-token"
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_csrf_rejects_cross_site_origin_and_sec_fetch_site() {
+        let disk = Arc::new(diskio::DiskEngine::auto().await);
+        let engine = Arc::new(SwarmEngine::new(disk, [0u8; 20]));
+        let app = create_http_router_with_auth(engine, Some("valid-token".into()));
+
+        // 1. Sec-Fetch-Site: cross-site on state-changing request -> 403 FORBIDDEN
+        let req_cross_site = Request::builder()
+            .method("PATCH")
+            .uri("/api/v1/session")
+            .header("Authorization", "Bearer valid-token")
+            .header("Sec-Fetch-Site", "cross-site")
+            .header("Content-Type", "application/json")
+            .body(Body::from(r#"{"alt_speed_enabled": true}"#))
+            .unwrap();
+        let resp = app.clone().oneshot(req_cross_site).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        // 2. Mismatched Origin vs Host on POST -> 403 FORBIDDEN
+        let req_bad_origin = Request::builder()
+            .method("POST")
+            .uri("/api/v1/torrents")
+            .header("Authorization", "Bearer valid-token")
+            .header("Host", "127.0.0.1:9090")
+            .header("Origin", "https://evil.example.com")
+            .header("Content-Type", "application/json")
+            .body(Body::from(
+                r#"{"magnet": "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567"}"#,
+            ))
+            .unwrap();
+        let resp = app.clone().oneshot(req_bad_origin).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        // 3. Matching Origin vs Host -> allowed (200 OK)
+        let req_good_origin = Request::builder()
+            .method("PATCH")
+            .uri("/api/v1/session")
+            .header("Authorization", "Bearer valid-token")
+            .header("Host", "127.0.0.1:9090")
+            .header("Origin", "http://127.0.0.1:9090")
+            .header("Content-Type", "application/json")
+            .body(Body::from(r#"{"alt_speed_enabled": false}"#))
+            .unwrap();
+        let resp = app.oneshot(req_good_origin).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_path_containment_and_uniform_403_in_create_torrent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base_dir = tmp.path().join("downloads");
+        std::fs::create_dir_all(&base_dir).unwrap();
+
+        let disk = Arc::new(diskio::DiskEngine::auto().await);
+        let engine = Arc::new(SwarmEngine::new(disk, [0u8; 20]));
+        engine.settings().write().download_dir = base_dir.clone();
+        let app = create_http_router(engine.clone());
+
+        // 1. Out-of-bounds existing path (/etc) and non-existent path (/nonexistent_secret_xyz)
+        // must BOTH return 403 FORBIDDEN (no file-existence oracle).
+        for probe in ["/etc", "/nonexistent_secret_xyz_12345", "../outside"] {
+            let req = Request::builder()
+                .method("POST")
+                .uri("/api/v1/torrents/create")
+                .header("Content-Type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({ "path": probe })).unwrap(),
+                ))
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::FORBIDDEN,
+                "expected 403 FORBIDDEN for out-of-bounds path {probe}"
+            );
+        }
+
+        // 2. Non-existent path strictly INSIDE download_dir returns 404 NOT_FOUND
+        let inside_missing = base_dir.join("missing_file.iso");
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/torrents/create")
+            .header("Content-Type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(
+                    &serde_json::json!({ "path": inside_missing.to_string_lossy() }),
+                )
+                .unwrap(),
+            ))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        // 3. Symlink inside download_dir pointing outside download_dir returns 403 FORBIDDEN
+        #[cfg(unix)]
+        {
+            let outside_target = tmp.path().join("outside_secret.txt");
+            std::fs::write(&outside_target, b"secret").unwrap();
+            let symlink_inside = base_dir.join("escape_link.txt");
+            std::os::unix::fs::symlink(&outside_target, &symlink_inside).unwrap();
+
+            let req = Request::builder()
+                .method("POST")
+                .uri("/api/v1/torrents/create")
+                .header("Content-Type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(
+                        &serde_json::json!({ "path": symlink_inside.to_string_lossy() }),
+                    )
+                    .unwrap(),
+                ))
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        }
+
+        // 4. PATCH /api/v1/session with download_dir escaping base_dir -> 403 FORBIDDEN
+        let req_patch_escape = Request::builder()
+            .method("PATCH")
+            .uri("/api/v1/session")
+            .header("Content-Type", "application/json")
+            .body(Body::from(r#"{"download_dir": "/etc"}"#))
+            .unwrap();
+        let resp = app.clone().oneshot(req_patch_escape).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        // 5. POST /api/v1/torrents with download_dir escaping base_dir -> 403 FORBIDDEN
+        let req_add_escape = Request::builder()
+            .method("POST")
+            .uri("/api/v1/torrents")
+            .header("Content-Type", "application/json")
+            .body(Body::from(r#"{"magnet": "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567", "download_dir": "../escape"}"#))
+            .unwrap();
+        let resp = app.oneshot(req_add_escape).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn test_delete_torrent_delete_data_refuses_unsafe_names_and_symlinks() {
+        assert!(!is_safe_single_component_name(""));
+        assert!(!is_safe_single_component_name("."));
+        assert!(!is_safe_single_component_name(".."));
+        assert!(!is_safe_single_component_name("../etc"));
+        assert!(!is_safe_single_component_name("foo/bar"));
+        assert!(!is_safe_single_component_name("foo\\bar"));
+        assert!(!is_safe_single_component_name("foo\0bar"));
+        assert!(is_safe_single_component_name("ubuntu-24.04.iso"));
+
+        #[cfg(unix)]
+        {
+            let tmp = tempfile::tempdir().unwrap();
+            let base_dir = tmp.path().join("downloads");
+            let outside_dir = tmp.path().join("outside_victim");
+            std::fs::create_dir_all(&base_dir).unwrap();
+            std::fs::create_dir_all(&outside_dir).unwrap();
+            let victim_file = outside_dir.join("keep_me.txt");
+            std::fs::write(&victim_file, b"important data").unwrap();
+
+            // Place a symlink inside base_dir named after the torrent pointing to outside_dir
+            let symlink_path = base_dir.join("evil-torrent");
+            std::os::unix::fs::symlink(&outside_dir, &symlink_path).unwrap();
+
+            let disk = Arc::new(diskio::DiskEngine::auto().await);
+            let engine = Arc::new(SwarmEngine::new(disk, [0u8; 20]));
+            engine.settings().write().download_dir = base_dir.clone();
+            let app = create_http_router(engine.clone());
+
+            let info = synapse_meta::Info::from_magnet(
+                "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=evil-torrent",
+            )
+            .unwrap();
+            engine.add_torrent(Arc::new(info), base_dir.clone(), None);
+
+            let req = Request::builder()
+                .method("DELETE")
+                .uri("/api/v1/torrents/0123456789abcdef0123456789abcdef01234567?delete_data=true")
+                .body(Body::empty())
+                .unwrap();
+            let resp = app.oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+
+            // The symlink itself may be unlinked, but the outside directory and its files MUST survive!
+            assert!(
+                victim_file.exists(),
+                "delete_data=true must never follow a directory symlink to delete outside files"
+            );
+        }
     }
 }

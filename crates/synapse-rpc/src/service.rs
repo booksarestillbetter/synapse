@@ -16,6 +16,7 @@ pub struct SynapseService {
     active_summaries: Arc<DashMap<String, TorrentSummary>>,
     session_stats: Arc<parking_lot::RwLock<SessionStatsUpdate>>,
     swarm_engine: Option<Arc<synapse_engine::SwarmEngine>>,
+    base_download_dir: Option<std::path::PathBuf>,
     auth_token: Option<String>,
     sync_tick: Arc<std::sync::atomic::AtomicU64>,
 }
@@ -43,6 +44,7 @@ impl SynapseService {
             active_summaries: Arc::new(DashMap::new()),
             session_stats: Arc::new(parking_lot::RwLock::new(default_stats)),
             swarm_engine: None,
+            base_download_dir: None,
             sync_tick: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             auth_token: None,
         }
@@ -51,22 +53,32 @@ impl SynapseService {
     pub fn with_swarm_engine(mut self, engine: Arc<synapse_engine::SwarmEngine>) -> Self {
         let free_space = engine.free_disk_space_bytes();
         self.session_stats.write().free_disk_space_bytes = free_space;
+        self.base_download_dir = Some(engine.settings().read().download_dir.clone());
         self.swarm_engine = Some(engine);
         self
     }
 
     pub fn with_auth_token(mut self, auth_token: Option<String>) -> Self {
-        self.auth_token = auth_token;
+        self.auth_token = auth_token.filter(|t| !t.trim().is_empty());
         self
     }
 
     #[allow(clippy::result_large_err)]
     pub fn verify_auth<T>(&self, request: &Request<T>) -> Result<(), Status> {
         if let Some(ref expected) = self.auth_token {
+            let expected_trimmed = expected.trim();
+            if expected_trimmed.is_empty() {
+                return Err(Status::unauthenticated(
+                    "Invalid or missing authorization token",
+                ));
+            }
             if let Some(auth_header) = request.metadata().get("authorization") {
                 if let Ok(val) = auth_header.to_str() {
                     let token = val.strip_prefix("Bearer ").unwrap_or(val).trim();
-                    if token == expected {
+                    if crate::http_api::constant_time_eq(
+                        token.as_bytes(),
+                        expected_trimmed.as_bytes(),
+                    ) {
                         return Ok(());
                     }
                 }
@@ -76,6 +88,30 @@ impl SynapseService {
             ));
         }
         Ok(())
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn validate_dir_path(&self, raw: &str) -> Result<std::path::PathBuf, Status> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() || trimmed.contains('\0') {
+            return Err(Status::permission_denied(
+                "path must not be empty or contain NUL bytes",
+            ));
+        }
+        let candidate = std::path::Path::new(trimmed);
+        for comp in candidate.components() {
+            if matches!(comp, std::path::Component::ParentDir) {
+                return Err(Status::permission_denied(
+                    "path must not contain '..' parent directory traversal",
+                ));
+            }
+        }
+        if let Some(ref base) = self.base_download_dir {
+            crate::http_api::validate_path_under_base(base, candidate)
+                .map_err(Status::permission_denied)
+        } else {
+            Ok(candidate.to_path_buf())
+        }
     }
 
     pub fn upsert_torrent(&self, summary: TorrentSummary) {
@@ -355,6 +391,7 @@ impl SynapseControl for SynapseService {
         &self,
         request: Request<SubscribeTorrentsRequest>,
     ) -> Result<Response<Self::SubscribeTorrentsStream>, Status> {
+        self.verify_auth(&request)?;
         let req = request.into_inner();
         let chunk_size = if req.chunk_size == 0 {
             500
@@ -423,8 +460,9 @@ impl SynapseControl for SynapseService {
 
     async fn subscribe_session_stats(
         &self,
-        _request: Request<SessionStatsRequest>,
+        request: Request<SessionStatsRequest>,
     ) -> Result<Response<Self::SubscribeSessionStatsStream>, Status> {
+        self.verify_auth(&request)?;
         let stats_lock = self.session_stats.clone();
         let stream = async_stream::stream! {
             let mut interval = tokio::time::interval(std::time::Duration::from_millis(1000));
@@ -449,12 +487,13 @@ impl SynapseControl for SynapseService {
         &self,
         request: Request<TorrentDetailRequest>,
     ) -> Result<Response<Self::SubscribeTorrentDetailStream>, Status> {
+        self.verify_auth(&request)?;
         let req = request.into_inner();
         let hash = req.hash;
         let interval_ms = if req.refresh_interval_ms == 0 {
             1000
         } else {
-            req.refresh_interval_ms as u64
+            (req.refresh_interval_ms as u64).max(100)
         };
         let swarm_opt = self.swarm_engine.clone();
 
@@ -626,6 +665,7 @@ impl SynapseControl for SynapseService {
         &self,
         request: Request<SubscribeAlertsRequest>,
     ) -> Result<Response<Self::SubscribeAlertsStream>, Status> {
+        self.verify_auth(&request)?;
         let req = request.into_inner();
         let filter_hash = req.info_hash.and_then(|h| {
             let trimmed = h.trim();
@@ -689,7 +729,31 @@ impl SynapseControl for SynapseService {
         &self,
         request: Request<AddTorrentRequest>,
     ) -> Result<Response<AddTorrentResponse>, Status> {
+        self.verify_auth(&request)?;
         let req = request.into_inner();
+        let dl_dir = match req
+            .download_dir
+            .as_deref()
+            .map(str::trim)
+            .filter(|d| !d.is_empty())
+        {
+            Some(custom_dir) => {
+                let validated = self.validate_dir_path(custom_dir)?;
+                validated.to_string_lossy().into_owned()
+            }
+            None => self
+                .swarm_engine
+                .as_ref()
+                .map(|s| {
+                    s.settings()
+                        .read()
+                        .download_dir
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .unwrap_or_else(|| "/downloads".into()),
+        };
+
         let (hash, name, total_size, info_opt) = match req.source {
             Some(add_torrent_request::Source::MagnetUri(uri)) => {
                 if let Ok(info) = synapse_meta::Info::from_magnet(&uri) {
@@ -761,7 +825,20 @@ impl SynapseControl for SynapseService {
                 }
             }
             Some(add_torrent_request::Source::FilePath(path)) => {
-                match crate::url_fetcher::read_torrent_file(std::path::Path::new(&path)).await {
+                let p = std::path::Path::new(&path);
+                let has_parent_dir = p
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir));
+                let is_torrent_ext = p
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| e.eq_ignore_ascii_case("torrent"));
+                if path.contains('\0') || has_parent_dir || !is_torrent_ext {
+                    return Err(Status::permission_denied(
+                        "FilePath must be a valid .torrent path without '..' traversal",
+                    ));
+                }
+                match crate::url_fetcher::read_torrent_file(p).await {
                     Ok(bytes) => {
                         if let Ok(bencode) = synapse_bencode::decode_buf(&bytes) {
                             if let Ok(info) = synapse_meta::Info::from_bencode(bencode) {
@@ -800,22 +877,6 @@ impl SynapseControl for SynapseService {
             }
             _ => ("unknown_hash".to_string(), "Unknown".to_string(), 0, None),
         };
-
-        let dl_dir = req
-            .download_dir
-            .filter(|d| !d.trim().is_empty())
-            .unwrap_or_else(|| {
-                self.swarm_engine
-                    .as_ref()
-                    .map(|s| {
-                        s.settings()
-                            .read()
-                            .download_dir
-                            .to_string_lossy()
-                            .into_owned()
-                    })
-                    .unwrap_or_else(|| "/downloads".into())
-            });
 
         let start_paused = req.start_paused.unwrap_or_else(|| {
             self.swarm_engine
@@ -891,6 +952,7 @@ impl SynapseControl for SynapseService {
         &self,
         request: Request<RemoveTorrentRequest>,
     ) -> Result<Response<CommandResponse>, Status> {
+        self.verify_auth(&request)?;
         let req = request.into_inner();
         if let Ok(bytes) = hex::decode(&req.hash) {
             if bytes.len() == 20 {
@@ -913,6 +975,7 @@ impl SynapseControl for SynapseService {
         &self,
         request: Request<TorrentHashRequest>,
     ) -> Result<Response<CommandResponse>, Status> {
+        self.verify_auth(&request)?;
         let raw_hash = request.into_inner().hash;
         let hash = raw_hash.to_lowercase();
         if let Ok(bytes) = hex::decode(&hash) {
@@ -950,6 +1013,7 @@ impl SynapseControl for SynapseService {
         &self,
         request: Request<TorrentHashRequest>,
     ) -> Result<Response<CommandResponse>, Status> {
+        self.verify_auth(&request)?;
         let raw_hash = request.into_inner().hash;
         let hash = raw_hash.to_lowercase();
         if let Ok(bytes) = hex::decode(&hash) {
@@ -984,6 +1048,7 @@ impl SynapseControl for SynapseService {
         &self,
         request: Request<TorrentHashRequest>,
     ) -> Result<Response<CommandResponse>, Status> {
+        self.verify_auth(&request)?;
         let hash = request.into_inner().hash;
         if let Ok(bytes) = hex::decode(&hash) {
             if bytes.len() == 20 {
@@ -1012,6 +1077,7 @@ impl SynapseControl for SynapseService {
         &self,
         request: Request<FilePriorityRequest>,
     ) -> Result<Response<CommandResponse>, Status> {
+        self.verify_auth(&request)?;
         let req = request.into_inner();
         if let Ok(bytes) = hex::decode(&req.hash) {
             if bytes.len() == 20 {
@@ -1032,18 +1098,21 @@ impl SynapseControl for SynapseService {
         &self,
         request: Request<SetLocationRequest>,
     ) -> Result<Response<CommandResponse>, Status> {
+        self.verify_auth(&request)?;
         let req = request.into_inner();
+        let validated = self.validate_dir_path(&req.new_download_dir)?;
+        let validated_str = validated.to_string_lossy().into_owned();
         if let Ok(bytes) = hex::decode(&req.hash) {
             if bytes.len() == 20 {
                 let mut arr = [0u8; 20];
                 arr.copy_from_slice(&bytes);
                 if let Some(ref swarm) = self.swarm_engine {
-                    swarm.set_location(&arr, &req.new_download_dir);
+                    swarm.set_location(&arr, &validated_str);
                 }
             }
         }
         if let Some(mut item) = self.active_summaries.get_mut(&req.hash) {
-            item.download_dir = req.new_download_dir;
+            item.download_dir = validated_str;
         }
         Ok(Response::new(CommandResponse {
             success: true,
@@ -1055,6 +1124,7 @@ impl SynapseControl for SynapseService {
         &self,
         request: Request<RateLimitsRequest>,
     ) -> Result<Response<CommandResponse>, Status> {
+        self.verify_auth(&request)?;
         let req = request.into_inner();
         if let Some(ref swarm) = self.swarm_engine {
             swarm.set_rate_limits(
@@ -1070,8 +1140,9 @@ impl SynapseControl for SynapseService {
 
     async fn get_session_stats(
         &self,
-        _request: Request<SessionStatsRequest>,
+        request: Request<SessionStatsRequest>,
     ) -> Result<Response<SessionStatsUpdate>, Status> {
+        self.verify_auth(&request)?;
         if let Some(ref engine) = self.swarm_engine {
             let swarms = engine.list_torrents();
             let total = swarms.len() as u32;
@@ -1178,6 +1249,16 @@ impl SynapseControl for SynapseService {
         };
 
         let req = request.into_inner();
+        if let Some(ref dl_dir) = req.download_dir {
+            if !dl_dir.trim().is_empty() {
+                self.validate_dir_path(dl_dir)?;
+            }
+        }
+        if let Some(ref inc_dir) = req.incomplete_dir {
+            if !inc_dir.trim().is_empty() {
+                self.validate_dir_path(inc_dir)?;
+            }
+        }
         let update = synapse_engine::SessionSettingsUpdate {
             download_limit_enabled: req.download_limit_enabled,
             download_limit_bytes: req.download_limit_bytes,
@@ -1237,8 +1318,9 @@ impl SynapseControl for SynapseService {
 
     async fn get_capabilities(
         &self,
-        _request: Request<Empty>,
+        request: Request<Empty>,
     ) -> Result<Response<CapabilitiesResponse>, Status> {
+        self.verify_auth(&request)?;
         Ok(Response::new(CapabilitiesResponse {
             version: env!("CARGO_PKG_VERSION").to_string(),
             features: [
@@ -1256,8 +1338,9 @@ impl SynapseControl for SynapseService {
 
     async fn list_circuit_breakers(
         &self,
-        _request: Request<Empty>,
+        request: Request<Empty>,
     ) -> Result<Response<CircuitBreakerListResponse>, Status> {
+        self.verify_auth(&request)?;
         let Some(ref engine) = self.swarm_engine else {
             return Ok(Response::new(CircuitBreakerListResponse {
                 breakers: vec![],
@@ -1438,5 +1521,247 @@ mod tracker_host_tests {
         assert!(hosts
             .iter()
             .all(|h| !h.contains("PASSKEY") && !h.contains("zzz")));
+    }
+
+    #[tokio::test]
+    async fn all_23_grpc_endpoints_reject_unauthenticated_requests_when_token_is_set() {
+        use super::*;
+        use tonic::Code;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let disk = Arc::new(diskio::DiskEngine::auto().await);
+        let engine = Arc::new(synapse_engine::SwarmEngine::new(disk, [0x11; 20]));
+        engine.settings().write().download_dir = tmp.path().to_path_buf();
+
+        let service = SynapseService::new(Arc::new(EventBus::new(16)))
+            .with_swarm_engine(engine)
+            .with_auth_token(Some("top-secret-grpc-token".to_string()));
+
+        // Verify all 23 RPC handlers reject unauthenticated calls with Code::Unauthenticated
+        assert_eq!(
+            service
+                .subscribe_torrents(Request::new(SubscribeTorrentsRequest::default()))
+                .await
+                .err()
+                .unwrap()
+                .code(),
+            Code::Unauthenticated
+        );
+        assert_eq!(
+            service
+                .subscribe_session_stats(Request::new(SessionStatsRequest::default()))
+                .await
+                .err()
+                .unwrap()
+                .code(),
+            Code::Unauthenticated
+        );
+        assert_eq!(
+            service
+                .subscribe_torrent_detail(Request::new(TorrentDetailRequest::default()))
+                .await
+                .err()
+                .unwrap()
+                .code(),
+            Code::Unauthenticated
+        );
+        assert_eq!(
+            service
+                .subscribe_alerts(Request::new(SubscribeAlertsRequest::default()))
+                .await
+                .err()
+                .unwrap()
+                .code(),
+            Code::Unauthenticated
+        );
+        assert_eq!(
+            service
+                .add_torrent(Request::new(AddTorrentRequest::default()))
+                .await
+                .unwrap_err()
+                .code(),
+            Code::Unauthenticated
+        );
+        assert_eq!(
+            service
+                .remove_torrent(Request::new(RemoveTorrentRequest::default()))
+                .await
+                .unwrap_err()
+                .code(),
+            Code::Unauthenticated
+        );
+        assert_eq!(
+            service
+                .pause_torrent(Request::new(TorrentHashRequest::default()))
+                .await
+                .unwrap_err()
+                .code(),
+            Code::Unauthenticated
+        );
+        assert_eq!(
+            service
+                .resume_torrent(Request::new(TorrentHashRequest::default()))
+                .await
+                .unwrap_err()
+                .code(),
+            Code::Unauthenticated
+        );
+        assert_eq!(
+            service
+                .recheck_torrent(Request::new(TorrentHashRequest::default()))
+                .await
+                .unwrap_err()
+                .code(),
+            Code::Unauthenticated
+        );
+        assert_eq!(
+            service
+                .set_file_priority(Request::new(FilePriorityRequest::default()))
+                .await
+                .unwrap_err()
+                .code(),
+            Code::Unauthenticated
+        );
+        assert_eq!(
+            service
+                .set_location(Request::new(SetLocationRequest::default()))
+                .await
+                .unwrap_err()
+                .code(),
+            Code::Unauthenticated
+        );
+        assert_eq!(
+            service
+                .set_rate_limits(Request::new(RateLimitsRequest::default()))
+                .await
+                .unwrap_err()
+                .code(),
+            Code::Unauthenticated
+        );
+        assert_eq!(
+            service
+                .get_session_stats(Request::new(SessionStatsRequest::default()))
+                .await
+                .unwrap_err()
+                .code(),
+            Code::Unauthenticated
+        );
+        assert_eq!(
+            service
+                .get_session_settings(Request::new(SessionSettingsRequest::default()))
+                .await
+                .unwrap_err()
+                .code(),
+            Code::Unauthenticated
+        );
+        assert_eq!(
+            service
+                .update_session_settings(Request::new(UpdateSessionSettingsRequest::default()))
+                .await
+                .unwrap_err()
+                .code(),
+            Code::Unauthenticated
+        );
+        assert_eq!(
+            service
+                .get_capabilities(Request::new(Empty::default()))
+                .await
+                .unwrap_err()
+                .code(),
+            Code::Unauthenticated
+        );
+        assert_eq!(
+            service
+                .list_circuit_breakers(Request::new(Empty::default()))
+                .await
+                .unwrap_err()
+                .code(),
+            Code::Unauthenticated
+        );
+        assert_eq!(
+            service
+                .force_circuit_breaker_action(Request::new(CircuitBreakerActionRequest::default()))
+                .await
+                .unwrap_err()
+                .code(),
+            Code::Unauthenticated
+        );
+        assert_eq!(
+            service
+                .move_in_queue(Request::new(MoveInQueueRequest::default()))
+                .await
+                .unwrap_err()
+                .code(),
+            Code::Unauthenticated
+        );
+        assert_eq!(
+            service
+                .set_sequential_download(Request::new(SequentialDownloadRequest::default()))
+                .await
+                .unwrap_err()
+                .code(),
+            Code::Unauthenticated
+        );
+        assert_eq!(
+            service
+                .reannounce_torrents(Request::new(TorrentHashesRequest::default()))
+                .await
+                .unwrap_err()
+                .code(),
+            Code::Unauthenticated
+        );
+        assert_eq!(
+            service
+                .replace_trackers(Request::new(ReplaceTrackersRequest::default()))
+                .await
+                .unwrap_err()
+                .code(),
+            Code::Unauthenticated
+        );
+        assert_eq!(
+            service
+                .reload_ip_filter(Request::new(Empty::default()))
+                .await
+                .unwrap_err()
+                .code(),
+            Code::Unauthenticated
+        );
+
+        // Verify valid bearer token succeeds
+        let mut authed_req = Request::new(Empty::default());
+        authed_req.metadata_mut().insert(
+            "authorization",
+            "Bearer top-secret-grpc-token".parse().unwrap(),
+        );
+        assert!(service.get_capabilities(authed_req).await.is_ok());
+
+        // Verify path traversal on set_location and FilePath is rejected with PermissionDenied
+        let mut bad_loc = Request::new(SetLocationRequest {
+            hash: "0123456789abcdef0123456789abcdef01234567".into(),
+            new_download_dir: "/etc".into(),
+            move_existing_files: false,
+        });
+        bad_loc.metadata_mut().insert(
+            "authorization",
+            "Bearer top-secret-grpc-token".parse().unwrap(),
+        );
+        assert_eq!(
+            service.set_location(bad_loc).await.unwrap_err().code(),
+            Code::PermissionDenied
+        );
+
+        let mut bad_file = Request::new(AddTorrentRequest {
+            source: Some(add_torrent_request::Source::FilePath("/etc/passwd".into())),
+            download_dir: None,
+            start_paused: None,
+        });
+        bad_file.metadata_mut().insert(
+            "authorization",
+            "Bearer top-secret-grpc-token".parse().unwrap(),
+        );
+        assert_eq!(
+            service.add_torrent(bad_file).await.unwrap_err().code(),
+            Code::PermissionDenied
+        );
     }
 }

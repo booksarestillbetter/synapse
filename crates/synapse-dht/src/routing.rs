@@ -104,6 +104,10 @@ impl RoutingTable {
         self.enforce_node_id = enforce;
     }
 
+    pub fn enforce_node_id(&self) -> bool {
+        self.enforce_node_id
+    }
+
     pub fn our_id(&self) -> NodeId {
         self.our_id
     }
@@ -294,6 +298,10 @@ impl RoutingTableV6 {
 
     pub fn set_enforce_node_id(&mut self, enforce: bool) {
         self.enforce_node_id = enforce;
+    }
+
+    pub fn enforce_node_id(&self) -> bool {
+        self.enforce_node_id
     }
 
     pub fn our_id(&self) -> NodeId {

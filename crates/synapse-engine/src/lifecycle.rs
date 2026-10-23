@@ -112,16 +112,32 @@ impl StagingPlugin {
             return Ok(None);
         }
 
-        if files.is_empty() || files.len() == 1 {
-            // Single-file torrent
-            let src = source_dir.join(name);
-            let dst = staging_root.join(name);
+        if files.is_empty() {
+            // Legacy/empty-files fallback
+            let rel = Path::new(name);
+            crate::fs::verify_no_symlinks_under(source_dir, rel)?;
+            crate::fs::verify_no_symlinks_under(staging_root, rel)?;
+            let src = source_dir.join(rel);
+            let dst = staging_root.join(rel);
+            Self::link_or_copy(&src, &dst)?;
+            Ok(Some(dst))
+        } else if files.len() == 1 {
+            // Single-file torrent (may still have a nested relative path)
+            let rel = &files[0].path;
+            crate::fs::verify_no_symlinks_under(source_dir, rel)?;
+            crate::fs::verify_no_symlinks_under(staging_root, rel)?;
+            let src = source_dir.join(rel);
+            let dst = staging_root.join(rel);
             Self::link_or_copy(&src, &dst)?;
             Ok(Some(dst))
         } else {
             // Multi-file torrent
-            let target_root = staging_root.join(name);
+            let name_rel = Path::new(name);
+            crate::fs::verify_no_symlinks_under(staging_root, name_rel)?;
+            let target_root = staging_root.join(name_rel);
             for file in files {
+                crate::fs::verify_no_symlinks_under(source_dir, &file.path)?;
+                crate::fs::verify_no_symlinks_under(staging_root, &file.path)?;
                 let src = source_dir.join(&file.path);
                 let dst = staging_root.join(&file.path);
                 if src.exists() {
@@ -136,12 +152,40 @@ impl StagingPlugin {
     /// (`EXDEV`) — crate-visible so `instructions::InstructionsWebhookPlugin` can reuse the same
     /// link-or-copy semantics for its own "post_cmd said hardlink" case instead of duplicating it.
     pub(crate) fn link_or_copy(src: &Path, dst: &Path) -> std::io::Result<()> {
+        let src_meta = fs::symlink_metadata(src)?;
+        if !src_meta.file_type().is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("source {:?} is not a regular file", src),
+            ));
+        }
+
         if let Some(parent) = dst.parent() {
+            if let Ok(pmeta) = fs::symlink_metadata(parent) {
+                if pmeta.file_type().is_symlink() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("destination parent {:?} is a symlink", parent),
+                    ));
+                }
+            }
             fs::create_dir_all(parent)?;
         }
-        if dst.exists() {
-            let _ = fs::remove_file(dst);
+
+        match fs::symlink_metadata(dst) {
+            Ok(dst_meta) => {
+                if dst_meta.file_type().is_symlink() || dst_meta.file_type().is_dir() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("destination {:?} is a symlink or directory", dst),
+                    ));
+                }
+                fs::remove_file(dst)?;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
         }
+
         match fs::hard_link(src, dst) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {

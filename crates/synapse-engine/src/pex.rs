@@ -22,6 +22,7 @@ fn is_never_dialable(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
             v4.is_unspecified()
+                || v4.octets()[0] == 0
                 || v4.is_loopback()
                 || v4.is_multicast()
                 || v4.is_broadcast()
@@ -36,10 +37,12 @@ fn is_never_dialable(ip: IpAddr) -> bool {
     }
 }
 
-/// Whether `ip` is in a private/unique-local range (RFC 1918, fc00::/7).
+/// Whether `ip` is in a private/unique-local/CGNAT range (RFC 1918, RFC 6598 100.64.0.0/10, fc00::/7).
 fn is_private_range(ip: IpAddr) -> bool {
     match ip {
-        IpAddr::V4(v4) => v4.is_private(),
+        IpAddr::V4(v4) => {
+            v4.is_private() || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xc0) == 64)
+        }
         IpAddr::V6(v6) => (v6.segments()[0] & 0xfe00) == 0xfc00,
     }
 }
@@ -48,11 +51,25 @@ fn is_private_range(ip: IpAddr) -> bool {
 /// Public addresses are always fine; private ranges only when the sender is itself on a
 /// private/loopback network (a genuine LAN swarm), so a remote peer cannot steer us into
 /// dialling addresses on our own internal network.
-fn pex_address_allowed(addr: SocketAddr, source: IpAddr) -> bool {
+pub fn pex_address_allowed(addr: SocketAddr, source: IpAddr) -> bool {
     if addr.port() == 0 || is_never_dialable(addr.ip()) {
         return false;
     }
     !is_private_range(addr.ip()) || is_private_range(source) || source.is_loopback()
+}
+
+/// Decides whether a peer address learned via BEP 55 holepunch `Connect` from `source` may
+/// be dialled. Never allows remote/public peers to steer us into dialling loopback, RFC 1918,
+/// link-local, unspecified, multicast, broadcast, or port 0. Allows loopback only when the
+/// rendezvous peer `source` is itself on loopback (local test harness).
+pub fn holepunch_address_allowed(addr: SocketAddr, source: IpAddr) -> bool {
+    if addr.port() == 0 {
+        return false;
+    }
+    if addr.ip().is_loopback() {
+        return source.is_loopback();
+    }
+    pex_address_allowed(addr, source)
 }
 
 pub struct PexManager {

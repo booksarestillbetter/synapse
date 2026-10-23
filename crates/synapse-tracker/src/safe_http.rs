@@ -103,9 +103,46 @@ pub fn is_public_ip(ip: IpAddr) -> bool {
                 || v6.is_multicast()
                 || (s[0] & 0xfe00) == 0xfc00 // unique local fc00::/7
                 || (s[0] & 0xffc0) == 0xfe80 // link local fe80::/10
-                || (s[0] == 0x2001 && s[1] == 0x0db8)) // documentation
+                || (s[0] == 0x2001 && s[1] == 0x0db8) // documentation 2001:db8::/32
+                || (s[0] == 0x0064 && s[1] == 0xff9b && s[2..6] == [0, 0, 0, 0]) // RFC 6052 NAT64 64:ff9b::/96
+                || (s[0] == 0x0064 && s[1] == 0xff9b && s[2] == 0x0001) // RFC 8215 Local-Use NAT64 64:ff9b:1::/48
+                || s[0..6] == [0, 0, 0, 0, 0, 0] // Deprecated IPv4-compatible ::/96
+                || (s[0] == 0x0100 && s[1..4] == [0, 0, 0])) // RFC 6666 Discard-Only 100::/64
         }
     }
+}
+
+/// Returns true if `host` is a known local/internal hostname (`localhost`, `.localhost`,
+/// `.local`, `.internal`, `.home.arpa`, `.lan`, or a single-label hostname without a dot).
+pub fn is_internal_hostname(host: &str) -> bool {
+    let h = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    if h.is_empty() {
+        return true;
+    }
+    if let Ok(ip) = h.parse::<IpAddr>() {
+        return !is_public_ip(ip);
+    }
+    h == "localhost"
+        || h.ends_with(".localhost")
+        || h.ends_with(".local")
+        || h.ends_with(".internal")
+        || h.ends_with(".home.arpa")
+        || h.ends_with(".lan")
+        || !h.contains('.')
+}
+
+/// Returns true only for proxy schemes that perform DNS resolution on the proxy server
+/// (`socks5h://`, `socks4a://`, `http://`, `https://`), not locally (`socks5://`, `socks4://`).
+fn proxy_resolves_dns_remotely(proxy_url: &str) -> bool {
+    let lower = proxy_url.trim().to_ascii_lowercase();
+    lower.starts_with("socks5h://")
+        || lower.starts_with("socks4a://")
+        || lower.starts_with("http://")
+        || lower.starts_with("https://")
 }
 
 fn is_public_v4(v4: Ipv4Addr) -> bool {
@@ -157,7 +194,13 @@ fn check_hop(
     origin_public: bool,
     local: LocalPolicy,
 ) -> Result<(), FetchError> {
-    if addrs.iter().all(|a| is_public_ip(a.ip())) {
+    let host_internal = url.host_str().is_none_or(is_internal_hostname);
+    let target_is_public = if addrs.is_empty() {
+        !host_internal
+    } else {
+        !host_internal && addrs.iter().all(|a| is_public_ip(a.ip()))
+    };
+    if target_is_public {
         return Ok(());
     }
     if origin_public {
@@ -196,13 +239,23 @@ pub async fn fetch(url: &Url, opts: &FetchOptions) -> Result<Fetched, FetchError
                 .parse::<IpAddr>()
                 .is_err()
         });
-        // Through a proxy a host name is the proxy's business to resolve.
-        let addrs = if proxy_url.is_some() && host_is_name {
+        let host_internal = current.host_str().is_none_or(is_internal_hostname);
+        let remote_dns_proxy = proxy_url
+            .as_deref()
+            .is_some_and(proxy_resolves_dns_remotely);
+        // Through a remote-DNS proxy (`socks5h://`, `http://`, `https://`), public hostnames
+        // are resolved by the proxy so we do not leak DNS queries locally. Local-DNS proxies
+        // (`socks5://`) and IP literals are still resolved locally and validated.
+        let addrs = if remote_dns_proxy && host_is_name {
             Vec::new()
         } else {
             resolve(&current).await?
         };
-        let public = addrs.iter().all(|a| is_public_ip(a.ip()));
+        let public = if addrs.is_empty() {
+            !host_internal
+        } else {
+            !host_internal && addrs.iter().all(|a| is_public_ip(a.ip()))
+        };
         let origin_is_public = *origin_public.get_or_insert(public);
         // The first hop has no "origin" to be redirected from: it is judged by the local
         // policy alone (origin_public is false when it is itself local).
@@ -317,6 +370,11 @@ mod tests {
             "ff02::1",
             "::ffff:127.0.0.1",
             "::ffff:10.0.0.1",
+            "64:ff9b::127.0.0.1",
+            "64:ff9b::a00:1",
+            "64:ff9b:1::1",
+            "::7f00:1",
+            "100::1",
         ] {
             assert!(!is_public_ip(ip(local)), "{local} should not be public");
         }
@@ -364,5 +422,44 @@ mod tests {
             SocketAddr::new(ip("10.0.0.1"), 80),
         ];
         assert!(check_hop(&u, &addrs, false, LocalPolicy::Deny).is_err());
+    }
+
+    #[test]
+    fn internal_hostnames_and_proxy_dns_policies_are_enforced() {
+        // Internal hostnames must be rejected under LocalPolicy::Deny even when `addrs` is empty
+        // (as happens when routing through a remote-DNS proxy).
+        for internal_url in [
+            "http://localhost/admin",
+            "http://sub.localhost/admin",
+            "http://printer.local/admin",
+            "http://metadata.internal/latest",
+            "http://router.home.arpa/status",
+            "http://nas.lan/api",
+            "http://intranet/secret",
+        ] {
+            let u = Url::parse(internal_url).unwrap();
+            assert!(
+                is_internal_hostname(u.host_str().unwrap()),
+                "{internal_url} should be classified as internal"
+            );
+            assert!(
+                check_hop(&u, &[], false, LocalPolicy::Deny).is_err(),
+                "{internal_url} must be blocked under LocalPolicy::Deny even with empty addrs"
+            );
+            assert!(
+                check_hop(&u, &[], true, LocalPolicy::AllowAny).is_err(),
+                "{internal_url} must be blocked on redirect from public origin"
+            );
+        }
+
+        let public_u = Url::parse("http://tracker.example.com/announce").unwrap();
+        assert!(!is_internal_hostname(public_u.host_str().unwrap()));
+        assert!(check_hop(&public_u, &[], false, LocalPolicy::Deny).is_ok());
+
+        // Only socks5h, socks4a, http, and https resolve DNS remotely.
+        assert!(proxy_resolves_dns_remotely("socks5h://127.0.0.1:9050"));
+        assert!(proxy_resolves_dns_remotely("http://127.0.0.1:8080"));
+        assert!(!proxy_resolves_dns_remotely("socks5://127.0.0.1:1080"));
+        assert!(!proxy_resolves_dns_remotely("socks4://127.0.0.1:1080"));
     }
 }
