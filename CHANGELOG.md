@@ -3,6 +3,12 @@
 All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [2.2.25] - 2026-10-27
+
+### Security
+
+Bumped several TLS-adjacent dependencies (`tokio`, `rustls`, `rustls-webpki`, `webpki-roots`) to pull in upstream fixes: a distrusted root CA whose intermediates' private keys are now public, a `Debug` impl that could leak TLS session secrets into logs, and an I/O-safety issue in `tokio`'s async file-descriptor wrapper. None of these were reachable through this project's own code paths, but all are fixed at the versions now pinned.
+
 ## [2.2.24] - 2026-10-27
 
 ### Fixed
