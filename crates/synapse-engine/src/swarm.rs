@@ -1474,10 +1474,19 @@ impl SwarmEngine {
         let engine_metadata = self.clone();
         let download_dir_metadata = download_dir.clone();
         let select_only = info.select_only.clone();
+        // The magnet's own `tr=` trackers (see `Info::from_magnet`, which stashes them in
+        // `url_list`): BEP 9 only transfers the bencoded "info" dict, which never carries
+        // announce URLs, so `resolved_info` always comes back with an empty `url_list`.
+        // Without carrying these over, the real download starts with zero trackers and no
+        // way to get more candidate peers once DHT/PEX/LSD dry up.
+        let magnet_trackers = info.url_list.clone();
         tokio::spawn(async move {
             if let Ok(mut resolved_info) = metadata_rx.await {
                 if resolved_info.select_only.is_none() {
                     resolved_info.select_only = select_only;
+                }
+                if resolved_info.url_list.is_empty() {
+                    resolved_info.url_list = magnet_trackers;
                 }
                 engine_metadata.resolve_magnet_metadata(download_dir_metadata, resolved_info);
             }
@@ -1841,6 +1850,19 @@ impl SwarmEngine {
         resume: Option<SwarmResumeOptions>,
     ) -> Arc<TorrentHandle> {
         let info_hash = info.hash;
+
+        // Re-adding a torrent that's already running (same info_hash) must be a no-op that
+        // hands back the existing handle, not a teardown-and-restart: `resolve_magnet_metadata`
+        // relies on this method still accepting a re-add for the same hash, but it always
+        // removes the placeholder entry from `self.torrents` first, so it never hits this guard.
+        if let Some(existing) = self.torrents.get(&info_hash) {
+            tracing::info!(
+                name = %info.name,
+                hash = %hex::encode(info_hash),
+                "torrent already added; ignoring duplicate add"
+            );
+            return existing.clone();
+        }
 
         let total_size = info.total_len;
         let name = info.name.clone();

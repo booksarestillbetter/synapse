@@ -3,6 +3,15 @@
 All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [2.2.24] - 2026-10-27
+
+### Fixed
+
+- **A slow or network-backed download directory could stall an entire torrent's swarm.** `finish_piece` awaited a completed piece's disk write inline, on the same per-torrent actor task that every connected peer's connection forwards messages to over one shared channel. A slow write backed that channel up, which blocked every peer's connection task on both its read and write sides — freezing all of that torrent's peers, not just the one that delivered the piece, for as long as the write took. The write now runs in a background task and reports back asynchronously, so the actor keeps servicing peers while it's in flight. The existing write-buffer backpressure limit (which throttles new requests once too many bytes are queued for disk) is unaffected and now actually gets a chance to run instead of being masked by this stall.
+- **Broadcasting to connected peers could stall the same way.** Sending `Have` on every piece completion, `Choke`/`Unchoke` during rechoking, and the initial handshake/bitfield to a newly connected peer all looped over every peer and awaited a best-effort send that can take up to 200ms when a peer's outbound buffer is congested. A handful of slow peers turned each of those into seconds of the actor doing nothing else, freezing every other peer in the swarm the same way the disk write did. These now use the non-blocking send already used elsewhere for this exact reason; a dropped `Have`/`Choke`/`Interested` is harmless and self-corrects on the next message.
+- **Re-adding a torrent that's already running tore it down and restarted it from scratch** instead of being a no-op. Adding the same magnet/`.torrent`/URL a second time now hands back the existing, already-progressing torrent unchanged rather than resetting its progress.
+- **A magnet-added torrent lost its own trackers once metadata finished resolving.** BEP 9 metadata exchange only carries the torrent's file list, not its announce URLs, and the handoff from the temporary metadata-fetching torrent to the real downloading one discarded the magnet's `tr=` trackers instead of carrying them forward — leaving the real download with zero trackers and no way to find more peers once DHT/PEX/LSD dried up.
+
 ## [2.2.23] - 2026-10-22
 
 ### Security

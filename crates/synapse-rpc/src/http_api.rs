@@ -1185,21 +1185,30 @@ async fn add_torrent_handler(
             }),
         ));
     }
+    let already_added = state.engine.get_torrent(&info.hash).is_some();
     let handle = state
         .engine
         .add_torrent(std::sync::Arc::new(info), dir, None);
     let hash = handle.stats.read().info_hash;
-    let start_added = state.engine.settings().read().start_added_torrents;
-    if payload.paused.unwrap_or(!start_added) {
-        state.engine.transition_to_cold(&hash);
+    // Only a genuinely new torrent should have the request's paused/start-added preference
+    // applied; re-adding one already running must leave its current state untouched.
+    if !already_added {
+        let start_added = state.engine.settings().read().start_added_torrents;
+        if payload.paused.unwrap_or(!start_added) {
+            state.engine.transition_to_cold(&hash);
+        }
     }
 
     Ok(Json(ActionResponse {
         success: true,
-        message: format!(
-            "Torrent added successfully with info_hash={}",
-            hex::encode(hash)
-        ),
+        message: if already_added {
+            format!("Torrent already added with info_hash={}", hex::encode(hash))
+        } else {
+            format!(
+                "Torrent added successfully with info_hash={}",
+                hex::encode(hash)
+            )
+        },
     }))
 }
 

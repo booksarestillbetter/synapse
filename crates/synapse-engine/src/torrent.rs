@@ -484,6 +484,12 @@ pub struct Torrent {
     /// `(peer asked, file root, first block)`. Only that peer's reply, and only if its proof
     /// checks out, is used.
     pending_block_audits: HashMap<(PeerId, [u8; 32], u32), BlockAudit>,
+    /// Completed pieces' disk writes, running in a background task (see `finish_piece`) so a
+    /// slow write (e.g. a network-mounted download dir) never blocks this actor's event loop --
+    /// and with it every peer connection's read/write, since each one forwards messages to this
+    /// actor over a bounded channel it shares with every other peer.
+    piece_write_tx: mpsc::Sender<(u32, diskio::Result<()>)>,
+    piece_write_rx: Option<mpsc::Receiver<(u32, diskio::Result<()>)>>,
 }
 
 impl Torrent {
@@ -534,6 +540,7 @@ impl Torrent {
             crate::part_file::PartFileManager::new(config.download_dir.clone(), config.info.hash);
         let (block_tree_tx, block_tree_rx) = mpsc::channel(4);
         let (merkle_tx, merkle_rx) = mpsc::channel(1);
+        let (piece_write_tx, piece_write_rx) = mpsc::channel(64);
         Torrent {
             info: config.info,
             download_dir: config.download_dir,
@@ -604,6 +611,8 @@ impl Torrent {
             part_file,
             alert_sender: config.alert_sender,
             pending_block_audits: HashMap::new(),
+            piece_write_tx,
+            piece_write_rx: Some(piece_write_rx),
         }
     }
 
@@ -714,6 +723,10 @@ impl Torrent {
             .merkle_rx
             .take()
             .expect("run consumes the receiver once");
+        let mut piece_write_rx = self
+            .piece_write_rx
+            .take()
+            .expect("run consumes the receiver once");
         loop {
             if self.metadata_resolved {
                 tracing::debug!(name = %self.info.name, "Metadata-only actor exiting after successful resolution");
@@ -780,6 +793,9 @@ impl Torrent {
                 }
                 Some((root, tree)) = block_tree_rx.recv() => {
                     self.on_block_tree_built(root, tree);
+                }
+                Some((index, result)) = piece_write_rx.recv() => {
+                    self.on_piece_write_complete(index, result).await;
                 }
                 _ = ticker.tick() => {
                     self.tick().await;
@@ -993,33 +1009,35 @@ impl Torrent {
                 .insert(synapse_wire::TR_HASHPIECE.to_string(), EXT_ID_TR_HASHPIECE);
         }
         let ext_hs = ext_hs_builder.encode();
-        handle
-            .send(Message::Extension {
-                id: 0,
-                payload: ext_hs,
-            })
-            .await;
+        // `try_send`, not `send().await`: these all run inline in `on_connected`, inside this
+        // actor's event loop (see `finish_piece` for why a blocking send here is a hazard --
+        // same actor, same shared loop, same "one congested peer stalls everyone" risk). A new
+        // connection's outbound queue is empty, so these essentially always queue immediately;
+        // dropping one on the rare congested case just means the peer learns our interest or
+        // bitfield slightly later, from a subsequent message, not a permanent desync.
+        handle.try_send(Message::Extension {
+            id: 0,
+            payload: ext_hs,
+        });
 
         // BEP 6 Fast Extension / Super-Seeding: If super-seeding, offer single piece; if seeding, send HaveAll, otherwise Bitfield
         if is_seeding {
             if let Some(ref mut ss) = self.super_seeder {
                 if let Some(p) = ss.assign_piece_to_peer(id) {
-                    handle.send(Message::Have(p)).await;
+                    handle.try_send(Message::Have(p));
                 }
             } else {
-                handle.send(Message::HaveAll).await;
+                handle.try_send(Message::HaveAll);
             }
         } else {
-            handle
-                .send(Message::Bitfield(Bytes::copy_from_slice(
-                    our_bitfield.as_bytes(),
-                )))
-                .await;
+            handle.try_send(Message::Bitfield(Bytes::copy_from_slice(
+                our_bitfield.as_bytes(),
+            )));
         }
 
         // BEP 6 Fast Extension: Send AllowedFast piece indices
         for piece_idx in allowed_fast_vec {
-            handle.send(Message::AllowedFast(piece_idx)).await;
+            handle.try_send(Message::AllowedFast(piece_idx));
         }
 
         // A pure-v2 magnet needs its piece layer from peers; ask as soon as one is here.
@@ -1450,10 +1468,10 @@ impl Torrent {
             (0..self.info.pieces()).any(|i| peer.has.has(i as usize) && !self.picker.have(i));
         if wants_something && !peer.am_interested {
             peer.am_interested = true;
-            peer.handle.send(Message::Interested).await;
+            peer.handle.try_send(Message::Interested);
         } else if !wants_something && peer.am_interested {
             peer.am_interested = false;
-            peer.handle.send(Message::Uninterested).await;
+            peer.handle.try_send(Message::Uninterested);
         }
     }
 
@@ -1915,7 +1933,40 @@ impl Torrent {
         self.on_piece_passed(index, &contributors);
 
         let piece_bytes = Bytes::from(piece_buf);
-        if let Err(e) = self.write_piece(index, piece_bytes).await {
+        let jobs = match self.build_write_jobs(index, &piece_bytes) {
+            Ok(jobs) => jobs,
+            Err(e) => {
+                tracing::error!(index, "failed to write completed piece to disk: {e}");
+                self.emit_alert(crate::alert::Alert::TorrentError {
+                    info_hash: self.info.hash,
+                    error: e.to_string(),
+                });
+                self.picker.mark_missing(index);
+                self.handle_fatal_storage_error(&e);
+                return;
+            }
+        };
+        if jobs.is_empty() {
+            self.on_piece_write_succeeded(index).await;
+            return;
+        }
+        // The actual write runs off this actor's event loop: every peer connection for this
+        // torrent forwards its messages here over one shared, bounded channel, so an inline
+        // `.await` on a slow write (e.g. a network-mounted download dir) would back that
+        // channel up and freeze every peer's read/write, not just the one that delivered this
+        // piece. `WriteBudget` (via `disk.in_flight_write_bytes`) still throttles how many
+        // bytes-in-flight this lets accumulate, by slowing new block requests in
+        // `can_request_block` -- that gate only works once this loop is free to keep ticking.
+        let disk = self.disk.clone();
+        let tx = self.piece_write_tx.clone();
+        tokio::spawn(async move {
+            let result = disk.write_batch(jobs).await;
+            let _ = tx.send((index, result)).await;
+        });
+    }
+
+    async fn on_piece_write_complete(&mut self, index: u32, result: diskio::Result<()>) {
+        if let Err(e) = result {
             tracing::error!(index, "failed to write completed piece to disk: {e}");
             self.emit_alert(crate::alert::Alert::TorrentError {
                 info_hash: self.info.hash,
@@ -1925,7 +1976,10 @@ impl Torrent {
             self.handle_fatal_storage_error(&e);
             return;
         }
+        self.on_piece_write_succeeded(index).await;
+    }
 
+    async fn on_piece_write_succeeded(&mut self, index: u32) {
         self.picker.mark_complete(index);
         self.emit_alert(crate::alert::Alert::PieceFinished {
             info_hash: self.info.hash,
@@ -1961,8 +2015,14 @@ impl Torrent {
             let _ = tx.send(index).await;
         }
         let peer_ids: Vec<PeerId> = self.peers.keys().copied().collect();
+        // `try_send`, not the best-effort `send().await`: that one deliberately burns up to
+        // 200ms per peer when its outbound buffer is congested, and this loop calls it once
+        // per connected peer, sequentially, on every piece completion. A handful of slow
+        // peers turns that into seconds of this actor doing nothing else -- for every other
+        // peer too, since they all share this one event loop (see `finish_piece`). A dropped
+        // Have is harmless: the peer re-syncs the next time it asks us or we send another one.
         for peer in self.peers.values_mut() {
-            peer.handle.send(Message::Have(index)).await;
+            peer.handle.try_send(Message::Have(index));
         }
 
         if self.picker.is_complete() {
@@ -1983,7 +2043,11 @@ impl Torrent {
         }
     }
 
-    pub async fn write_piece(&mut self, index: u32, data: Bytes) -> diskio::Result<()> {
+    /// Resolves a completed piece's bytes into disk-write jobs. Purely in-memory (plus the
+    /// small, synchronous `part_file` bookkeeping write) -- the actual, potentially slow,
+    /// write to `path` is left to the caller so it can be run off the torrent actor's event
+    /// loop; see `finish_piece`.
+    fn build_write_jobs(&mut self, index: u32, data: &Bytes) -> diskio::Result<Vec<WriteJob>> {
         let locations = self.info.block_locations(index, 0, data.len() as u32);
         let mut jobs: Vec<WriteJob> = Vec::new();
         for loc in locations {
@@ -2017,6 +2081,11 @@ impl Torrent {
                 file_len,
             });
         }
+        Ok(jobs)
+    }
+
+    pub async fn write_piece(&mut self, index: u32, data: Bytes) -> diskio::Result<()> {
+        let jobs = self.build_write_jobs(index, &data)?;
         if jobs.is_empty() {
             Ok(())
         } else {
@@ -2667,11 +2736,15 @@ impl Torrent {
             .collect();
         let ChokeDecisions { unchoke, choke } = self.choker.rechoke(&stats, we_are_seeding);
 
+        // `try_send` here too (see the Have broadcast in `finish_piece` for why): this loop
+        // sequentially touches every peer the choker just decided on, and a `send().await`
+        // that blocks up to 200ms per congested peer would stall this actor -- and with it
+        // every other connected peer -- for the whole batch.
         for id in unchoke {
             if let Some(p) = self.peers.get_mut(&id) {
                 if p.am_choking {
                     p.am_choking = false;
-                    p.handle.send(Message::Unchoke).await;
+                    p.handle.try_send(Message::Unchoke);
                     if let Some(ref m) = self.global_metrics {
                         m.unchokes_total.fetch_add(1, Ordering::Relaxed);
                     }
@@ -2682,7 +2755,7 @@ impl Torrent {
             if let Some(p) = self.peers.get_mut(&id) {
                 if !p.am_choking {
                     p.am_choking = true;
-                    p.handle.send(Message::Choke).await;
+                    p.handle.try_send(Message::Choke);
                     if let Some(ref m) = self.global_metrics {
                         m.chokes_total.fetch_add(1, Ordering::Relaxed);
                     }
@@ -3999,5 +4072,144 @@ impl Torrent {
                 });
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use synapse_bencode::BEncode;
+
+    fn single_piece_info(data: &[u8]) -> Info {
+        let hash: [u8; 20] = Sha1::digest(data).into();
+
+        let mut file = BTreeMap::new();
+        file.insert(b"length".to_vec(), BEncode::Int(data.len() as i64));
+        file.insert(
+            b"path".to_vec(),
+            BEncode::List(vec![BEncode::String(b"file.bin".to_vec())]),
+        );
+
+        let mut info_dict = BTreeMap::new();
+        info_dict.insert(
+            b"name".to_vec(),
+            BEncode::String(b"write_offload_test".to_vec()),
+        );
+        info_dict.insert(b"piece length".to_vec(), BEncode::Int(data.len() as i64));
+        info_dict.insert(b"pieces".to_vec(), BEncode::String(hash.to_vec()));
+        info_dict.insert(b"files".to_vec(), BEncode::List(vec![BEncode::Dict(file)]));
+
+        let mut top = BTreeMap::new();
+        top.insert(b"info".to_vec(), BEncode::Dict(info_dict));
+        Info::from_bencode(BEncode::Dict(top)).expect("valid single-piece info")
+    }
+
+    fn test_config(info: Arc<Info>, download_dir: PathBuf, disk: Arc<DiskEngine>) -> TorrentConfig {
+        let stats = Arc::new(RwLock::new(SwarmStats {
+            info_hash: info.hash,
+            name: info.name.clone(),
+            total_size: info.total_len,
+            progress: 0.0,
+            state: SwarmState::Downloading,
+            tier: SwarmTier::Hot,
+            download_rate: 0,
+            upload_rate: 0,
+            downloaded_bytes: 0,
+            uploaded_bytes: 0,
+            peers_connected: 0,
+            peers_sending: 0,
+            eta_seconds: 0,
+            ratio: 0.0,
+            download_dir: download_dir.to_string_lossy().to_string(),
+            added_at: 0,
+            is_private: false,
+            is_stalled: false,
+            last_transfer_at: 0,
+            piece_count: info.pieces(),
+            piece_size: info.piece_len,
+        }));
+        TorrentConfig {
+            info,
+            download_dir,
+            peer_id: [0x53; 20],
+            disk,
+            mode: Mode::RarestFirst,
+            max_pipeline: 8,
+            regular_unchokes: 4,
+            optimistic_unchoke_interval: Duration::from_secs(60),
+            tick_interval: Duration::from_millis(20),
+            on_torrent_completed: None,
+            on_piece_completed: None,
+            stats,
+            bitfield: Arc::new(RwLock::new(None)),
+            download_bucket: Arc::new(TokenBucket::unthrottled()),
+            upload_bucket: Arc::new(TokenBucket::unthrottled()),
+            global_metrics: None,
+            idle_timeout: None,
+            live_peers: Arc::new(RwLock::new(Vec::new())),
+            piece_availability: Arc::new(RwLock::new(vec![0])),
+            settings: Arc::new(RwLock::new(Default::default())),
+            on_peers_discovered: None,
+            on_metadata_resolved: None,
+            ban_list: Default::default(),
+            ip_filter: Default::default(),
+            super_seeding: false,
+            local_webseed_resolver: None,
+            alert_sender: None,
+        }
+    }
+
+    /// Regression test for the "fast seed, then everything hangs" bug: `finish_piece` used
+    /// to await the piece's disk write inline, which (in production) blocked this actor's
+    /// whole event loop -- and with it every peer connection sharing it -- for as long as
+    /// that write took. The write must now run in the background: `finish_piece` returns
+    /// (and the actor loop is free to keep servicing peers) before the piece is credited,
+    /// and completion only lands once the write's result comes back over `piece_write_rx`.
+    #[tokio::test]
+    async fn finish_piece_does_not_block_on_its_disk_write() {
+        let data = vec![0xABu8; 4096];
+        let info = Arc::new(single_piece_info(&data));
+        let tmp = tempfile::tempdir().unwrap();
+        let disk = Arc::new(DiskEngine::new_blocking(64 * 1024 * 1024));
+        let config = test_config(info, tmp.path().to_path_buf(), disk);
+        let mut torrent = Torrent::new(config, None);
+
+        // Simulate having already received this (single-block) piece's only block from a peer.
+        let mut piece = InProgressPiece::new(data.len() as u32);
+        piece.ensure_allocated();
+        piece.buf.copy_from_slice(&data);
+        piece.received_blocks.insert(0);
+        torrent.in_progress.insert(0, piece);
+
+        torrent.finish_piece(0).await;
+
+        // The write was handed to a background task, not awaited inline -- so by the time
+        // `finish_piece` returns, completion bookkeeping must not have run yet.
+        assert!(
+            !torrent.picker.have(0),
+            "piece must not be marked complete before its write finishes"
+        );
+
+        let mut rx = torrent
+            .piece_write_rx
+            .take()
+            .expect("run() hasn't taken the receiver in this test");
+        let (index, result) = rx.recv().await.expect("background write reports back");
+        assert_eq!(index, 0);
+        torrent.on_piece_write_complete(index, result).await;
+
+        assert!(
+            torrent.picker.have(0),
+            "piece must be marked complete once its write finishes"
+        );
+        // A bencoded `files` list (even a single entry) is multi-file BitTorrent layout,
+        // so the file lands under a top-level directory named after the torrent.
+        assert_eq!(
+            tokio::fs::read(tmp.path().join("write_offload_test").join("file.bin"))
+                .await
+                .unwrap(),
+            data
+        );
     }
 }
