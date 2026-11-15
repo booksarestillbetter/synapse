@@ -224,8 +224,8 @@ impl PieceLayerTree {
         let hashes = self.levels[0][index..index + count].to_vec();
         let mut proof = Vec::with_capacity(proof_layers);
         let mut node = index >> sub; // index of the range's subtree root within its level
-        for lvl in sub..sub + proof_layers {
-            proof.push(self.levels[lvl][node ^ 1]);
+        for level in self.levels.iter().skip(sub).take(proof_layers) {
+            proof.push(level[node ^ 1]);
             node >>= 1;
         }
         Some((hashes, proof))
@@ -298,8 +298,8 @@ impl BlockTree {
         let hashes = level[index..index + count].to_vec();
         let mut proof = Vec::with_capacity(proof_layers);
         let mut node = index >> sub;
-        for lvl in base_layer + sub..base_layer + sub + proof_layers {
-            proof.push(self.levels[lvl][node ^ 1]);
+        for level in self.levels.iter().skip(base_layer + sub).take(proof_layers) {
+            proof.push(level[node ^ 1]);
             node >>= 1;
         }
         Some((hashes, proof))

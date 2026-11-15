@@ -35,7 +35,7 @@ pub const PRIME_P_HEX: &str = "\
     FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD1\
     29024E088A67CC74020BBEA63B139B22514A08798E3404DD\
     EF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245\
-    E485B576625E7EC6F44C42E9A63A3620FFFFFFFFFFFFFFFF";
+    E485B576625E7EC6F44C42E9A63A36210000000000090563";
 
 pub const CRYPTO_PLAINTEXT: u32 = 0x01;
 pub const CRYPTO_RC4: u32 = 0x02;
@@ -1006,5 +1006,14 @@ mod tests {
                 EncryptionMode::DisableEncryption
             );
         }
+    }
+
+    #[test]
+    fn test_mse_prime_matches_bittorrent_spec() {
+        // BitTorrent MSE/PE uses the custom 768-bit safe prime ending in ...36210000000000090563,
+        // NOT RFC 2409 Oakley Group 1 (...3620FFFFFFFFFFFFFFFF).
+        assert_eq!(PRIME_P_HEX.len(), 192);
+        assert!(PRIME_P_HEX.ends_with("36210000000000090563"));
+        assert!(!PRIME_P_HEX.ends_with("3620FFFFFFFFFFFFFFFF"));
     }
 }

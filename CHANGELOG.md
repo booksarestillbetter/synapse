@@ -3,6 +3,13 @@
 All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [2.2.31] - 2026-11-15
+
+### Fixed
+
+- **MSE/PE Diffie-Hellman prime (`PRIME_P_HEX`) used RFC 2409 Oakley Group 1 (`...3620FFFFFFFFFFFFFFFF`) instead of the BitTorrent MSE/PE specification prime (`...36210000000000090563`).** Because `synapse` derived a different Diffie-Hellman shared secret `S` than standard BitTorrent clients (Transmission, libtorrent/qBittorrent, etc.), every real-world MSE handshake failed `req1` synchronization on both outbound (`mse_handshake_initiator`) and inbound (`mse_handshake_receiver`) connections — resulting in zero encrypted peers under `prefer_encrypted` and zero connected peers overall under `require_encrypted`. Updated `PRIME_P_HEX` to the standard BitTorrent MSE/PE 768-bit prime and added a regression test.
+- **CI-only: more pre-existing lints caught by a newer clippy than this repo had been checked against.** Two more `needless_range_loop`s in `synapse-meta::merkle` (converted to `self.levels.iter().skip(..).take(..)`) and a `needless_bool` in `synapse-meta::padding`; no behavior change. Verified against the exact toolchain version (1.100.0) the public CI runs, not just whatever was locally installed, to catch all of these in one pass instead of discovering them one push at a time.
+
 ## [2.2.30] - 2026-11-15
 
 ### Fixed

@@ -18,14 +18,9 @@ pub fn is_padding_file(path: &Path, attr: Option<&str>) -> bool {
 
     // Check path components
     let path_str = path.to_string_lossy();
-    if path_str.starts_with(".pad")
+    path_str.starts_with(".pad")
         || path_str.contains("/.pad")
         || path_str.contains("_____padding_file_")
-    {
-        return true;
-    }
-
-    false
 }
 
 /// Splits a list of torrent files into real payload files and padding files.
