@@ -3,6 +3,13 @@
 All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [2.2.30] - 2026-11-15
+
+### Fixed
+
+- **CI-only: a newer Rust toolchain's clippy caught a pre-existing `needless_bool` pattern in `synapse-dht::ip_voter`'s IPv6 plausibility check.** Collapsed the `if { return false } true` into a single boolean expression; no behavior change.
+- **Flaky test: `replacing_trackers_changes_what_the_torrent_announces_to` asserted immediately after `replace_trackers`, racing the background announce scheduler.** `replace_trackers` drops the old tracker's report synchronously, but the new tracker's report only appears once the reannounce it just queued actually runs - a normally sub-millisecond gap that a loaded CI runner can occasionally lose. The test now polls with a bounded timeout instead of asserting once.
+
 ## [2.2.29] - 2026-11-15
 
 ### Fixed

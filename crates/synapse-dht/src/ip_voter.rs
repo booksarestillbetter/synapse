@@ -57,13 +57,9 @@ fn plausible(reported: IpAddr) -> bool {
             }
             let s = v6.segments();
             // Reject ULA (fc00::/7), link-local (fe80::/10), and documentation (2001:db8::/32)
-            if (s[0] & 0xfe00) == 0xfc00
+            !((s[0] & 0xfe00) == 0xfc00
                 || (s[0] & 0xffc0) == 0xfe80
-                || (s[0] == 0x2001 && s[1] == 0x0db8)
-            {
-                return false;
-            }
-            true
+                || (s[0] == 0x2001 && s[1] == 0x0db8))
         }
     }
 }

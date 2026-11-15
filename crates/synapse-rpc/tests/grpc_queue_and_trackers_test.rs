@@ -217,7 +217,21 @@ async fn replacing_trackers_changes_what_the_torrent_announces_to() {
         .unwrap()
         .into_inner();
     assert!(r.success);
-    assert_eq!(urls(&swarm), ["http://new.example.org:8080/announce"]);
+    // replace_trackers drops the old tracker's report synchronously, but the new tracker's
+    // report only appears once the announce it just queued (reannounce() -> the background
+    // announce scheduler) actually runs - a real but normally-sub-millisecond gap that a
+    // loaded CI runner can occasionally lose a race against. Poll instead of asserting once.
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let got = urls(&swarm);
+        if got == ["http://new.example.org:8080/announce"] {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            assert_eq!(got, ["http://new.example.org:8080/announce"]);
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
 
     // Nothing usable in the list is an error, and leaves the current trackers alone.
     let r = client
