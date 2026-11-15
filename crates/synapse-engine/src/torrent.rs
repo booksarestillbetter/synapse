@@ -234,6 +234,10 @@ pub enum TorrentCommand {
     SetLocation(PathBuf),
     /// Switches the piece picker between rarest-first and sequential.
     SetSequential(bool),
+    /// Enables or disables first/last piece priority in the picker.
+    SetFirstLastPiecePriority(bool),
+    /// Enables or disables BEP super-seeding mode.
+    SetSuperSeeding(bool),
     /// Stops the torrent actor: closes all peer handles to terminate connection tasks and exits the actor loop.
     Stop,
     /// Dynamically update regular unchoke slots allocated by the session choker.
@@ -622,6 +626,11 @@ impl Torrent {
         }
     }
 
+    /// Dynamically configures first/last piece priority before starting the actor.
+    pub fn set_first_last_piece_priority(&mut self, enabled: bool) {
+        self.picker.set_first_last_piece_priority(enabled);
+    }
+
     /// Registers a channel that fires exactly once, the moment every piece is complete.
     /// If the torrent is already complete when this is called, fires immediately (on
     /// the next event loop iteration).
@@ -736,9 +745,20 @@ impl Torrent {
                 ev = events.recv() => {
                     self.last_activity = std::time::Instant::now();
                     match ev {
-                        Some(PeerEvent::Connected(handle, info)) => self.on_connected(handle, info).await,
-                        Some(PeerEvent::Message(id, msg)) => self.on_message(id, msg).await,
-                        Some(PeerEvent::Disconnected(id)) => self.on_disconnected(id),
+                        Some(first) => {
+                            self.handle_peer_event(first).await;
+                            // Drain queued peer events in a bounded batch so a high-churn
+                            // swarm cannot starve behind periodic timers.
+                            for _ in 0..63 {
+                                if self.metadata_resolved {
+                                    break;
+                                }
+                                match events.try_recv() {
+                                    Ok(next_ev) => self.handle_peer_event(next_ev).await,
+                                    Err(_) => break,
+                                }
+                            }
+                        }
                         None => break,
                     }
                 }
@@ -757,6 +777,19 @@ impl Torrent {
                             } else {
                                 synapse_picker::Mode::RarestFirst
                             });
+                        }
+                        Some(TorrentCommand::SetFirstLastPiecePriority(on)) => {
+                            self.picker.set_first_last_piece_priority(on);
+                        }
+                        Some(TorrentCommand::SetSuperSeeding(on)) => {
+                            if on {
+                                if self.super_seeder.is_none() {
+                                    self.super_seeder =
+                                        Some(SuperSeeder::new(self.info.pieces()));
+                                }
+                            } else {
+                                self.super_seeder = None;
+                            }
                         }
                         Some(TorrentCommand::Recheck) => self.handle_recheck().await,
                         Some(TorrentCommand::SetLocation(new_dir)) => self.handle_set_location(new_dir).await,
@@ -834,6 +867,14 @@ impl Torrent {
                 std::sync::atomic::Ordering::Relaxed,
                 |v| Some(v.saturating_sub(1)),
             );
+        }
+    }
+
+    async fn handle_peer_event(&mut self, ev: PeerEvent) {
+        match ev {
+            PeerEvent::Connected(handle, info) => self.on_connected(handle, info).await,
+            PeerEvent::Message(id, msg) => self.on_message(id, msg).await,
+            PeerEvent::Disconnected(id) => self.on_disconnected(id),
         }
     }
 
@@ -1700,13 +1741,13 @@ impl Torrent {
                 m.piece_requests_total.fetch_add(1, Ordering::Relaxed);
             }
 
-            handle
-                .send(Message::Request {
-                    index: target_piece,
-                    begin,
-                    length,
-                })
-                .await;
+            if !handle.try_send(Message::Request {
+                index: target_piece,
+                begin,
+                length,
+            }) {
+                break;
+            }
         }
     }
 
@@ -2298,7 +2339,7 @@ impl Torrent {
                 },
                 _ => Message::Piece { index, begin, data },
             };
-            let _ = handle.send(message).await;
+            let _ = handle.try_send(message);
         });
     }
 
@@ -2331,12 +2372,12 @@ impl Torrent {
             return;
         };
         for piece in missing {
-            peer.handle
-                .send(Message::Extension {
-                    id: metadata_id,
-                    payload: synapse_wire::UtMetadataMessage::Request { piece }.encode(),
-                })
-                .await;
+            if !peer.handle.try_send(Message::Extension {
+                id: metadata_id,
+                payload: synapse_wire::UtMetadataMessage::Request { piece }.encode(),
+            }) {
+                break;
+            }
         }
     }
 
@@ -2385,12 +2426,10 @@ impl Torrent {
                     }
                     _ => UtMetadataMessage::Reject { piece },
                 };
-                peer.handle
-                    .send(Message::Extension {
-                        id: their_id,
-                        payload: response.encode(),
-                    })
-                    .await;
+                let _ = peer.handle.try_send(Message::Extension {
+                    id: their_id,
+                    payload: response.encode(),
+                });
             }
             UtMetadataMessage::Data {
                 piece,
@@ -2494,12 +2533,10 @@ impl Torrent {
             .collect();
 
         for (handle, ext_id) in recipients {
-            handle
-                .send(Message::Extension {
-                    id: ext_id,
-                    payload: payload.clone(),
-                })
-                .await;
+            let _ = handle.try_send(Message::Extension {
+                id: ext_id,
+                payload: payload.clone(),
+            });
         }
     }
 
@@ -2798,7 +2835,7 @@ impl Torrent {
                     }
                     if peer.consecutive_timeouts >= 4 {
                         // 20s of sustained timeouts without a single block delivered: disconnect stalled peer
-                        stalled_peers_to_disconnect.push(*peer_id);
+                        stalled_peers_to_disconnect.push((*peer_id, "repeated request timeouts"));
                         continue;
                     }
                 }
@@ -2813,7 +2850,8 @@ impl Torrent {
                     && now.duration_since(peer.last_received_at) >= Duration::from_secs(90)
                     && total_peers >= 12
                 {
-                    stalled_peers_to_disconnect.push(*peer_id);
+                    stalled_peers_to_disconnect
+                        .push((*peer_id, "persistently choked with no active requests"));
                     continue;
                 }
 
@@ -2827,10 +2865,11 @@ impl Torrent {
                 }
             }
 
-            for peer_id in stalled_peers_to_disconnect {
+            for (peer_id, reason) in stalled_peers_to_disconnect {
                 tracing::warn!(
                     peer = peer_id,
-                    "disconnecting unresponsive/stalled peer after repeated request timeouts"
+                    reason,
+                    "disconnecting unresponsive/stalled peer"
                 );
                 self.on_disconnected(peer_id);
             }
@@ -3145,20 +3184,27 @@ impl Torrent {
                     }
                 }
 
-                // A Merkle torrent's pieces are checked as a whole afterwards, so hand back the hash.
-                let sha1: Option<[u8; 20]> =
-                    (read_ok && is_merkle).then(|| Sha1::digest(&buf).into());
-                let verified = read_ok && {
-                    if let Some(expected) = expected_v1 {
-                        let computed: [u8; 20] = Sha1::digest(&buf).into();
-                        computed == expected
-                    } else if let Some(expected_v2) = expected_v2 {
-                        let computed: [u8; 32] = info.compute_piece_hash_v2(idx, &buf);
-                        computed == expected_v2
-                    } else {
-                        false
-                    }
-                };
+                // Offload SHA-1/SHA-256 verification to the blocking pool so large piece
+                // rechecks never stall Tokio async worker threads.
+                let info_for_hash = info.clone();
+                let (verified, sha1) = tokio::task::spawn_blocking(move || {
+                    let sha1: Option<[u8; 20]> =
+                        (read_ok && is_merkle).then(|| Sha1::digest(&buf).into());
+                    let verified = read_ok && {
+                        if let Some(expected) = expected_v1 {
+                            let computed: [u8; 20] = Sha1::digest(&buf).into();
+                            computed == expected
+                        } else if let Some(expected_v2) = expected_v2 {
+                            let computed: [u8; 32] = info_for_hash.compute_piece_hash_v2(idx, &buf);
+                            computed == expected_v2
+                        } else {
+                            false
+                        }
+                    };
+                    (verified, sha1)
+                })
+                .await
+                .unwrap_or((false, None));
 
                 let _ = tx.send((idx, verified, sha1)).await;
             });
@@ -4210,6 +4256,50 @@ mod tests {
                 .await
                 .unwrap(),
             data
+        );
+    }
+
+    /// Regression test: a peer whose outbound queue is full must never stall `Torrent::run`
+    /// with 200ms `handle.send().await` timeouts inside `try_request_more` or
+    /// `maybe_broadcast_pex`, since doing so starves `events.recv()` and creates a
+    /// bidirectional channel livelock across the entire swarm.
+    #[tokio::test]
+    async fn full_peer_outbound_queue_does_not_stall_torrent_actor() {
+        let data = vec![0xCDu8; 32 * 1024];
+        let info = Arc::new(single_piece_info(&data));
+        let tmp = tempfile::tempdir().unwrap();
+        let disk = Arc::new(DiskEngine::new_blocking(64 * 1024 * 1024));
+        let config = test_config(info, tmp.path().to_path_buf(), disk);
+        let mut torrent = Torrent::new(config, None);
+
+        // Saturated outbound queue (capacity 1, already full, receiver intentionally kept alive
+        // and undrained to mimic a peer task stalled on `events.send().await`).
+        let (out_tx, _out_rx) = mpsc::channel(1);
+        out_tx.try_send(Message::KeepAlive).unwrap();
+        let peer_id = 9999;
+        let addr: std::net::SocketAddr = "127.0.0.1:50001".parse().unwrap();
+        let handle = PeerHandle::new_for_test(peer_id, addr, out_tx);
+        let info_hash = torrent.info.hash;
+        let peer_info = crate::peer::PeerInfo {
+            info_hash,
+            peer_id: *b"-SY0001-000000000000",
+            addr,
+            local_addr: None,
+            is_outbound: false,
+            is_encrypted: true,
+        };
+
+        let start = std::time::Instant::now();
+        torrent.on_connected(handle, peer_info).await;
+        torrent.on_message(peer_id, Message::HaveAll).await;
+        torrent.on_message(peer_id, Message::Unchoke).await;
+        torrent.last_pex_broadcast = std::time::Instant::now() - Duration::from_secs(120);
+        torrent.maybe_broadcast_pex().await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "actor stalled for {elapsed:?} on a congested peer outbound queue"
         );
     }
 }

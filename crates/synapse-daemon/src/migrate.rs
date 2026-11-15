@@ -369,6 +369,7 @@ pub fn migrate_transmission(
                 file_priorities: Vec::new(),
                 sequential: false,
                 tracker_override: None,
+                ..Default::default()
             };
 
             if let Some(ref s) = store {
@@ -746,6 +747,7 @@ pub fn migrate_libtorrent_client(
                 file_priorities: Vec::new(),
                 sequential: false,
                 tracker_override: None,
+                ..Default::default()
             };
 
             if let Some(ref s) = store {

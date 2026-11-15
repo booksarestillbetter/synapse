@@ -95,6 +95,7 @@ impl PriorityTier {
 /// - Reverse & sequential range selection for media streaming.
 pub struct Picker {
     mode: Mode,
+    first_last_piece_priority: bool,
     states: Vec<PieceState>,
     availability: Vec<u32>,
     priorities: Vec<u8>,
@@ -105,6 +106,7 @@ impl Picker {
     pub fn new(num_pieces: usize, mode: Mode) -> Picker {
         let mut picker = Picker {
             mode,
+            first_last_piece_priority: false,
             states: vec![PieceState::Missing; num_pieces],
             availability: vec![0; num_pieces],
             priorities: vec![4; num_pieces], // Default priority 4 (Normal)
@@ -140,6 +142,14 @@ impl Picker {
 
     pub fn set_mode(&mut self, mode: Mode) {
         self.mode = mode;
+    }
+
+    pub fn first_last_piece_priority(&self) -> bool {
+        self.first_last_piece_priority
+    }
+
+    pub fn set_first_last_piece_priority(&mut self, enabled: bool) {
+        self.first_last_piece_priority = enabled;
     }
 
     /// Sets wanted/unwanted flags for all pieces (backwards-compatible API).
@@ -420,6 +430,36 @@ impl Picker {
                 true
             }
         };
+
+        // Prioritize the first and last pieces (headers/footers/moov atoms) before normal picking.
+        if self.first_last_piece_priority && !self.states.is_empty() {
+            let last = self.states.len() - 1;
+            let candidates = if last == 0 {
+                vec![0usize]
+            } else {
+                vec![0usize, last]
+            };
+            for &idx in &candidates {
+                if self.states[idx] == PieceState::Missing
+                    && self.priorities[idx] > 0
+                    && in_range(idx as u32)
+                    && peer_has.has(idx)
+                {
+                    return Some(idx as u32);
+                }
+            }
+            if allow_requested {
+                for &idx in &candidates {
+                    if self.states[idx] == PieceState::Requested
+                        && self.priorities[idx] > 0
+                        && in_range(idx as u32)
+                        && peer_has.has(idx)
+                    {
+                        return Some(idx as u32);
+                    }
+                }
+            }
+        }
 
         // Scan priority tiers from highest (7) down to lowest (1)
         for prio in (1..=7).rev() {
@@ -721,5 +761,27 @@ mod tests {
         picker.mark_complete(1);
         let peer = all_bits(2);
         assert_eq!(picker.pick(&peer, false), None);
+    }
+
+    #[test]
+    fn first_last_piece_priority_picks_ends_before_middle() {
+        let mut picker = Picker::new(5, Mode::RarestFirst);
+        picker.set_first_last_piece_priority(true);
+        // Make middle piece (2) rarest (availability 1), ends more common (availability 3)
+        for p in [0, 1, 3, 4] {
+            picker.peer_has(p);
+            picker.peer_has(p);
+        }
+        for p in 0..5 {
+            picker.peer_has(p);
+        }
+        let peer = all_bits(5);
+
+        assert_eq!(picker.pick(&peer, false), Some(0));
+        picker.mark_requested(0);
+        assert_eq!(picker.pick(&peer, false), Some(4));
+        picker.mark_requested(4);
+        // After first and last are requested, falls back to rarest-first (piece 2)
+        assert_eq!(picker.pick(&peer, false), Some(2));
     }
 }

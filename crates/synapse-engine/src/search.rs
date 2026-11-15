@@ -42,9 +42,15 @@ pub struct EngineResults {
 pub struct SearchManager {
     /// `(where it was loaded from, the engine)`.
     engines: RwLock<Vec<(String, SearchEngine)>>,
+    allow_local_for_tests: std::sync::atomic::AtomicBool,
 }
 
 impl SearchManager {
+    #[doc(hidden)]
+    pub fn set_allow_local_for_tests(&self, allow: bool) {
+        self.allow_local_for_tests
+            .store(allow, std::sync::atomic::Ordering::Relaxed);
+    }
     /// Loads a `.btsearch` description from a file path or an http(s) URL and registers it,
     /// replacing an engine of the same name.
     pub async fn add_source(&self, source: &str) -> Result<SearchEngine, String> {
@@ -122,9 +128,17 @@ impl SearchManager {
             .map(|(_, e)| e.clone())
             .filter(|e| only.is_none_or(|n| e.short_name == n))
             .collect();
+        let policy = if self
+            .allow_local_for_tests
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            LocalPolicy::AllowAny
+        } else {
+            LocalPolicy::Deny
+        };
         let searches = engines.into_iter().map(|engine| async move {
             let name = engine.short_name.clone();
-            match query_engine(&engine, query).await {
+            match query_engine(&engine, query, policy).await {
                 Ok(results) => EngineResults {
                     engine: name,
                     error: None,
@@ -141,9 +155,13 @@ impl SearchManager {
     }
 }
 
-async fn query_engine(engine: &SearchEngine, query: &str) -> Result<Vec<SearchItem>, String> {
+async fn query_engine(
+    engine: &SearchEngine,
+    query: &str,
+    policy: LocalPolicy,
+) -> Result<Vec<SearchItem>, String> {
     let url = engine.search_url(query).map_err(|e| e.to_string())?;
-    let fetched = fetch(&url, &options(MAX_RESULT_BYTES, LocalPolicy::AllowAny))
+    let fetched = fetch(&url, &options(MAX_RESULT_BYTES, policy))
         .await
         .map_err(|e| format!("request failed: {e}"))?;
     if !(200..300).contains(&fetched.status) {

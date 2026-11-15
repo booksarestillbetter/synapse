@@ -76,6 +76,7 @@ pub use settings::{
 pub use swarm::{
     EngineMetricsSnapshot, GlobalEngineMetrics, QueueMove, SwarmDiscoveryStats, SwarmEngine,
     SwarmResumeOptions, SwarmState, SwarmStateFilter, SwarmStats, SwarmTier, TorrentHandle,
+    TorrentMetadata, TorrentMetadataPatch,
 };
 pub use synapse_wire::EncryptionMode;
 pub use torrent::{PeerSnapshot, Torrent, TorrentCommand, TorrentConfig};

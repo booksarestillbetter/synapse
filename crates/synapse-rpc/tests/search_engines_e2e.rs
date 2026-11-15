@@ -77,6 +77,7 @@ async fn configured_engines_are_queried_and_their_results_returned() {
 
     let disk = Arc::new(diskio::DiskEngine::auto().await);
     let engine = Arc::new(SwarmEngine::new(disk, [0u8; 20]));
+    engine.search_manager().set_allow_local_for_tests(true);
     let app = synapse_rpc::create_http_router(engine);
 
     // Nothing configured yet.

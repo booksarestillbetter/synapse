@@ -3,6 +3,53 @@
 All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [2.2.29] - 2026-11-15
+
+### Fixed
+
+- **MSE/PE initiator failed whenever a peer sent non-empty `PadB` after `Yb` or downgraded to plaintext under `PreferEncrypted`.** `mse_handshake_initiator` assumed the peer's encrypted `VC` began immediately after `Yb` (96 bytes), failing with `"MSE handshake verification failed (VC mismatch)"` whenever a peer included `PadB` (0–512 random unencrypted padding bytes per the MSE spec), and sent `CRYPTO_PLAINTEXT | CRYPTO_RC4` under `PreferEncrypted` (causing libtorrent/qBittorrent peers with default `prefer_rc4 = false` to select plaintext instead of RC4). It now scans up to `512 + 8` incoming bytes with an 8-byte sliding window to synchronize on `VC`, advances the decrypt cipher past `PadB`, and requests `CRYPTO_RC4` under `PreferEncrypted` (leaving plaintext fallback to `connect_stream` for non-MSE peers).
+- **Remaining `PeerHandle::send().await` calls in `Torrent::run` caused a bidirectional channel livelock and stalled downloads.** `try_request_more`, `serve_request`, `maybe_request_metadata`, `on_ut_metadata_message`, and `maybe_broadcast_pex` still awaited `PeerHandle::send` (200ms timeout per congested peer) inside the single-threaded per-torrent actor loop. When the shared `PeerEvent` channel (`256` -> `2048`) filled up, peer tasks blocked on `events.send().await` and stopped draining `out_rx`, saturating `out_tx` and stalling `Torrent::run` for seconds per tick while `tick_interval` starved `events.recv()`. Switched those sends to non-blocking `try_send`, added bounded batch draining (`64` events/turn) to `Torrent::run`, and distinguished persistently choked peer eviction from repeated request timeouts in disconnect logs.
+
+## [2.2.28] - 2026-11-15
+
+### Fixed
+
+- **`PreferEncrypted` connections to non-MSE peers almost never fell back to plaintext, tanking real-world download throughput.** Both places `synapse-engine::announcer` dials a candidate peer wrapped the attempt in a 12s outer timeout, but `PreferEncrypted`'s own logic can spend up to `HANDSHAKE_TIMEOUT` (15s) running the full MSE Diffie-Hellman negotiation against a peer that never answers it at all — common for genuinely non-MSE peers, which often go silent on unrecognized bytes rather than reset the connection — before falling back to a fresh plaintext connection and handshake (up to another 15s). Since the outer timeout was shorter than the first phase alone, it fired and killed the whole attempt before the plaintext fallback ever got a chance to run, turning every slow-to-reject non-MSE peer into a lost connection instead of a successful fallback. In a real-world swarm with a meaningful fraction of non-MSE seeders this showed up as a storm of circuit-breaker trips and "disconnecting unresponsive/stalled peer" warnings and could reduce aggregate download throughput to a few KB/s despite hundreds of tracker-reported seeders. The outer timeout is now derived from `HANDSHAKE_TIMEOUT` itself (`2x` + slack) so it always outlasts both phases.
+
+## [2.2.27] - 2026-11-14
+
+### Added
+
+- **gRPC parity for 2.2.26's REST-only torrent controls.** `SynapseControl` gains `SetSuperSeeding`, `SetFirstLastPiecePriority`, `UpdateTorrentMetadata` (category/tags/seed-ratio/seed-time-limit, with tri-state patch semantics via `OptionalDouble`/`OptionalUint64`/`TagsPatch` wrapper messages — absent leaves a field unchanged, present-but-empty clears it), and `ExportTorrent`. `TorrentSummary` now also carries `category`, `tags`, `seed_ratio_limit`, `seed_time_limit_secs`, `super_seeding`, and `first_last_piece_priority`, kept current by the existing 1s `sync_from_engine` pass. `GetCapabilities` advertises `super_seeding_v1`, `first_last_piece_priority_v1`, `torrent_metadata_v1`, and `torrent_export_v1`. These four capabilities had REST-only access in 2.2.26 with no way for a gRPC client (Conduit) to reach them at all; this closes that gap.
+
+## [2.2.26] - 2026-11-14
+
+### Added
+
+- **WireGuard/VPN interface-name binding.** `network.bind_interfaces` now resolves network interface names (such as `wg0` or `tun0`) to their active IPv4/IPv6 addresses at startup via the `if-addrs` crate, respecting `network.enable_ipv6` and working on every platform `if-addrs` supports (not just Unix).
+- **First/last piece priority.** Added `first_last_piece_priority` to `Picker` (`synapse-picker`) and `SwarmEngine` so header/footer pieces are prioritized before normal piece selection.
+- **Categories, tags, per-torrent seed limits, and super-seeding toggle.** Persisted `category`, `tags`, `seed_ratio_limit`, `seed_time_limit_secs`, `super_seeding`, and `first_last_piece_priority` in `TorrentSessionState` (`redb`), wired `super_seeding` into `TorrentConfig` and runtime `TorrentCommand`s, and enforced per-torrent seed ratio and seed time limits in `SwarmEngine::reconcile_queue`.
+- **Full REST parity and `.torrent` export.** Added HTTP API endpoints for queue movement (`POST /api/v1/torrents/:info_hash/queue-move`), sequential picking (`POST /api/v1/torrents/:info_hash/sequential`), super-seeding (`POST /api/v1/torrents/:info_hash/super-seed`), first/last piece priority (`POST /api/v1/torrents/:info_hash/first-last-priority`), forced reannounce (`POST /api/v1/torrents/:info_hash/reannounce`), tracker replacement (`POST /api/v1/torrents/:info_hash/trackers`), metadata updates (`PATCH /api/v1/torrents/:info_hash/metadata`), `.torrent` export (`GET /api/v1/torrents/:info_hash/export`), and IP filter reload (`POST /api/v1/ip-filter/reload`), along with inspector controls in the embedded Web UI.
+
+### Security
+
+- **DNS rebinding protection & auth rate limiting on HTTP API.** `verify_same_origin_csrf` validates `Host` headers against configured `http_api.allowed_hosts` (and loopback defaults), and `require_auth` enforces bounded per-IP failure rate limiting keyed off the real caller — see Fixed below for why that keying matters.
+- **Search SSRF default-deny & Web UI security headers.** `SearchManager` search queries now default to `LocalPolicy::Deny`, and embedded Web UI responses include `Content-Security-Policy`, `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, and `Referrer-Policy: no-referrer`.
+
+### Performance
+
+- **O(N) disk write coalescing & single-task batching.** Replaced quadratic sort/scan in `coalesce_write_jobs` with linear-time coalescing and batched `BlockingDiskEngine::write_batch` onto a single `spawn_blocking` task.
+- **Batched session saves & non-blocking recheck hashing.** `SessionStore::save_torrents_batch` commits all torrent snapshots in a single `redb` transaction, torrent recheck SHA-1/SHA-256 hashing is offloaded to `spawn_blocking`, and `Bitfield::count_ones` uses `as_chunks::<8>()` word-level popcount.
+
+### Fixed
+
+- **Closed a login-throttle bypass introduced by this release's own auth rate limiter.** `require_auth`'s new failure limiter keyed on the client-supplied `X-Forwarded-For` prefix with no check that the caller was actually behind a trusted proxy, so any caller could spoof a fresh apparent IP per request and brute-force `http_api.auth_token` without ever tripping the limit. It now only trusts `X-Forwarded-For` when the direct peer is itself a trusted proxy, and takes the hop that proxy appended rather than the client-supplied prefix.
+- **`http_api.allowed_hosts` now actually does something.** The config field existed but was never read; the DNS-rebinding `Host` check only ever compared against hardcoded loopback addresses. Configured hosts are now honored for real.
+- **Graceful tracker `stopped` announces on shutdown.** `SwarmEngine::announce_stopped_all` is now awaited during daemon shutdown (with a 15s timeout) so trackers receive clean `event=stopped` notifications.
+- **Cold-tier dormant seeds no longer stay paused across restarts.** Session flushing now persists `is_paused` only for `SwarmState::Stopped` torrents rather than Cold-tier dormant seeds.
+- **gRPC alert lag & DHT DoS table saturation.** `subscribe_alerts` surfaces `BroadcastStreamRecvError::Lagged` as `Status::resource_exhausted`, and `synapse-dht` DoS tracking falls back to evicting an existing entry when the table is full of blocked IPs.
+- **Real health-check storage probe.** `GET /api/v1/health` verifies actual `download_dir` accessibility instead of returning a static OK.
+
 ## [2.2.25] - 2026-10-27
 
 ### Security

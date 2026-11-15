@@ -166,7 +166,7 @@ impl DiskEngine {
     }
 }
 
-/// Coalesces contiguous block writes into unified OS disk writes.
+/// Coalesces contiguous block writes into unified OS disk writes in O(N) time.
 pub fn coalesce_write_jobs(mut jobs: Vec<WriteJob>) -> Vec<WriteJob> {
     if jobs.len() <= 1 {
         return jobs;
@@ -174,19 +174,40 @@ pub fn coalesce_write_jobs(mut jobs: Vec<WriteJob>) -> Vec<WriteJob> {
     jobs.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.offset.cmp(&b.offset)));
 
     let mut coalesced: Vec<WriteJob> = Vec::with_capacity(jobs.len());
-    for job in jobs {
-        if let Some(last) = coalesced.last_mut() {
-            let last_end = last.offset + last.data.len() as u64;
-            if last.path == job.path && last_end == job.offset {
-                let mut merged = bytes::BytesMut::with_capacity(last.data.len() + job.data.len());
-                merged.extend_from_slice(&last.data);
-                merged.extend_from_slice(&job.data);
-                last.data = merged.freeze();
-                last.file_len = last.file_len.max(job.file_len);
-                continue;
-            }
+    let mut i = 0;
+    while i < jobs.len() {
+        let mut end_offset = jobs[i].offset + jobs[i].data.len() as u64;
+        let mut total_len = jobs[i].data.len();
+        let mut max_file_len = jobs[i].file_len;
+        let mut j = i + 1;
+        while j < jobs.len() && jobs[j].path == jobs[i].path && jobs[j].offset == end_offset {
+            total_len += jobs[j].data.len();
+            end_offset += jobs[j].data.len() as u64;
+            max_file_len = max_file_len.max(jobs[j].file_len);
+            j += 1;
         }
-        coalesced.push(job);
+
+        if j == i + 1 {
+            // Single job in run: move data without copying
+            coalesced.push(WriteJob {
+                path: jobs[i].path.clone(),
+                offset: jobs[i].offset,
+                data: std::mem::take(&mut jobs[i].data),
+                file_len: jobs[i].file_len,
+            });
+        } else {
+            let mut merged = bytes::BytesMut::with_capacity(total_len);
+            for job in &jobs[i..j] {
+                merged.extend_from_slice(&job.data);
+            }
+            coalesced.push(WriteJob {
+                path: jobs[i].path.clone(),
+                offset: jobs[i].offset,
+                data: merged.freeze(),
+                file_len: max_file_len,
+            });
+        }
+        i = j;
     }
     coalesced
 }

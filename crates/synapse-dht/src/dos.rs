@@ -96,13 +96,20 @@ impl DosBlocker {
             e.blocked_until.is_some_and(|u| now < u) || now.duration_since(e.window_start) < WINDOW
         });
         if self.entries.len() >= MAX_TRACKED_SOURCES {
-            if let Some(&victim) = self
+            let victim = self
                 .entries
                 .iter()
                 .filter(|(_, e)| e.blocked_until.is_none())
                 .min_by_key(|(_, e)| e.window_start)
-                .map(|(ip, _)| ip)
-            {
+                .map(|(ip, _)| *ip)
+                .or_else(|| {
+                    // Fallback when all tracked entries are blocked: evict earliest-expiring block
+                    self.entries
+                        .iter()
+                        .min_by_key(|(_, e)| e.blocked_until.unwrap_or(e.window_start))
+                        .map(|(ip, _)| *ip)
+                });
+            if let Some(victim) = victim {
                 self.entries.remove(&victim);
             }
         }

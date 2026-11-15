@@ -77,6 +77,10 @@ async fn capabilities_advertise_the_new_operations() {
         "reannounce_v1",
         "replace_trackers_v1",
         "ip_filter_reload_v1",
+        "super_seeding_v1",
+        "first_last_piece_priority_v1",
+        "torrent_metadata_v1",
+        "torrent_export_v1",
     ] {
         assert!(caps.features.iter().any(|x| x == f), "missing {f}");
     }
@@ -290,4 +294,124 @@ async fn reloading_the_ip_filter_rereads_the_blocklist_file() {
         .ip_filter()
         .read()
         .is_blocked("4.5.6.7".parse().unwrap()));
+}
+
+#[tokio::test]
+async fn super_seeding_and_first_last_priority_toggle_the_torrent_handle() {
+    let (mut client, swarm) = start().await;
+    add(&mut client, A).await;
+
+    let r = client
+        .set_super_seeding(SuperSeedingRequest {
+            hashes: vec![A.into()],
+            enabled: true,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(r.success, "{:?}", r.error);
+    let handle = swarm.get_torrent(&hex(A)).unwrap();
+    assert!(handle
+        .super_seeding
+        .load(std::sync::atomic::Ordering::Relaxed));
+
+    let r = client
+        .set_first_last_piece_priority(FirstLastPiecePriorityRequest {
+            hashes: vec![A.into()],
+            enabled: true,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(r.success, "{:?}", r.error);
+    assert!(handle
+        .first_last_piece_priority
+        .load(std::sync::atomic::Ordering::Relaxed));
+
+    // Unknown hash is reported as not found, not silently ignored.
+    let r = client
+        .set_super_seeding(SuperSeedingRequest {
+            hashes: vec!["dddddddddddddddddddddddddddddddddddddddd".into()],
+            enabled: true,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!r.success);
+}
+
+#[tokio::test]
+async fn torrent_metadata_patch_sets_clears_and_leaves_fields_alone() {
+    let (mut client, swarm) = start().await;
+    add(&mut client, A).await;
+
+    // Set category, tags, and both limits.
+    let r = client
+        .update_torrent_metadata(UpdateTorrentMetadataRequest {
+            hash: A.into(),
+            category: Some("movies".into()),
+            tags: Some(TagsPatch {
+                tags: vec!["4k".into(), "keep".into()],
+            }),
+            seed_ratio_limit: Some(OptionalDouble { value: Some(2.0) }),
+            seed_time_limit_secs: Some(OptionalUint64 { value: Some(3600) }),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(r.success, "{:?}", r.error);
+    assert_eq!(r.category.as_deref(), Some("movies"));
+    assert_eq!(r.tags, vec!["4k".to_string(), "keep".to_string()]);
+    assert_eq!(r.seed_ratio_limit, Some(2.0));
+    assert_eq!(r.seed_time_limit_secs, Some(3600));
+
+    // Patch only the ratio limit (clear it) — category/tags/time-limit must be untouched.
+    let r = client
+        .update_torrent_metadata(UpdateTorrentMetadataRequest {
+            hash: A.into(),
+            category: None,
+            tags: None,
+            seed_ratio_limit: Some(OptionalDouble { value: None }),
+            seed_time_limit_secs: None,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(r.success, "{:?}", r.error);
+    assert_eq!(
+        r.category.as_deref(),
+        Some("movies"),
+        "category must survive a patch that doesn't mention it"
+    );
+    assert_eq!(
+        r.tags,
+        vec!["4k".to_string(), "keep".to_string()],
+        "tags must survive a patch that doesn't mention them"
+    );
+    assert_eq!(r.seed_ratio_limit, None, "explicit clear must take effect");
+    assert_eq!(
+        r.seed_time_limit_secs,
+        Some(3600),
+        "time limit must survive a patch that doesn't mention it"
+    );
+
+    let handle = swarm.get_torrent(&hex(A)).unwrap();
+    let meta = handle.metadata.read();
+    assert_eq!(meta.category.as_deref(), Some("movies"));
+    assert_eq!(meta.seed_ratio_limit, None);
+    assert_eq!(meta.seed_time_limit_secs, Some(3600));
+}
+
+#[tokio::test]
+async fn exporting_an_unknown_torrent_fails_cleanly() {
+    let (mut client, _swarm) = start().await;
+    let r = client
+        .export_torrent(ExportTorrentRequest {
+            hash: "dddddddddddddddddddddddddddddddddddddddd".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!r.success);
+    assert!(r.torrent_bytes.is_empty());
 }

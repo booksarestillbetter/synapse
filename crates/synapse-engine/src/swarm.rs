@@ -443,6 +443,24 @@ fn parse_tracker_urls(list: &[String]) -> Vec<url::Url> {
     out
 }
 
+/// Per-torrent user metadata and seed limits (persisted across restarts).
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct TorrentMetadata {
+    pub category: Option<String>,
+    pub tags: Vec<String>,
+    pub seed_ratio_limit: Option<f64>,
+    pub seed_time_limit_secs: Option<u64>,
+}
+
+/// Partial update for `TorrentMetadata`.
+#[derive(Debug, Clone, Default)]
+pub struct TorrentMetadataPatch {
+    pub category: Option<Option<String>>,
+    pub tags: Option<Vec<String>>,
+    pub seed_ratio_limit: Option<Option<f64>>,
+    pub seed_time_limit_secs: Option<Option<u64>>,
+}
+
 /// Options for restoring historical swarm metrics and lifecycle state upon restart.
 #[derive(Debug, Clone, Default)]
 pub struct SwarmResumeOptions {
@@ -457,6 +475,12 @@ pub struct SwarmResumeOptions {
     pub sequential: bool,
     /// API-set tracker replacement, saved with the session.
     pub tracker_override: Option<Vec<String>>,
+    pub category: Option<String>,
+    pub tags: Vec<String>,
+    pub seed_ratio_limit: Option<f64>,
+    pub seed_time_limit_secs: Option<u64>,
+    pub super_seeding: bool,
+    pub first_last_piece_priority: bool,
 }
 
 /// Which way to move torrents in the download queue.
@@ -546,6 +570,12 @@ pub struct TorrentHandle {
     /// Pick pieces in order rather than rarest-first. Lives here (not on the actor) so it
     /// survives the actor being evicted and woken again.
     pub sequential: Arc<std::sync::atomic::AtomicBool>,
+    /// Prioritize first and last pieces (headers/footers) before general picking.
+    pub first_last_piece_priority: Arc<std::sync::atomic::AtomicBool>,
+    /// BEP super-seeding mode toggle.
+    pub super_seeding: Arc<std::sync::atomic::AtomicBool>,
+    /// User-assigned category, tags, and per-torrent seed limits.
+    pub metadata: Arc<RwLock<TorrentMetadata>>,
     /// API-set replacement tracker list, kept as strings so it can be saved with the session.
     pub tracker_override: Arc<RwLock<Option<Vec<String>>>>,
 }
@@ -1273,6 +1303,10 @@ impl SwarmEngine {
             .await
     }
 
+    pub async fn announce_stopped_all(&self) {
+        self.announce_scheduler.announce_stopped_all().await;
+    }
+
     pub fn shutdown(&self) {
         self.announce_scheduler.shutdown();
         for entry in self.torrents.iter() {
@@ -1364,7 +1398,7 @@ impl SwarmEngine {
             .as_ref()
             .map(|b| b.to_bitfield());
 
-        let (peer_tx, peer_rx) = mpsc::channel(256);
+        let (peer_tx, peer_rx) = mpsc::channel(2048);
         let (command_tx, command_rx) = mpsc::channel(32);
         let (piece_tx, mut piece_rx) = mpsc::channel(128);
         let (pex_tx, mut pex_rx) = mpsc::channel::<Vec<SocketAddr>>(32);
@@ -1435,12 +1469,15 @@ impl SwarmEngine {
             on_metadata_resolved: Some(metadata_tx),
             ban_list: self.ban_list.clone(),
             ip_filter: self.ip_filter.clone(),
-            super_seeding: false,
+            super_seeding: handle.super_seeding.load(Ordering::Relaxed),
             local_webseed_resolver: None,
             alert_sender: Some(self.alert_stream.sender()),
         };
 
         let mut torrent = Torrent::new(config, have.as_ref());
+        if handle.first_last_piece_priority.load(Ordering::Relaxed) {
+            torrent.set_first_last_piece_priority(true);
+        }
         // Skip/priority choices live on the handle so they survive the actor being evicted and
         // woken again, and (via the session store) a daemon restart.
         let priorities = handle.file_priorities.read().clone();
@@ -1511,6 +1548,9 @@ impl SwarmEngine {
 
         let priorities_worker = handle.file_priorities.clone();
         let sequential_worker = handle.sequential.clone();
+        let first_last_worker = handle.first_last_piece_priority.clone();
+        let super_seeding_worker = handle.super_seeding.clone();
+        let metadata_worker = handle.metadata.clone();
         let tracker_override_worker = handle.tracker_override.clone();
         let last_saved_secs = Arc::new(AtomicU64::new(0));
         const SAVE_THROTTLE: Duration = Duration::from_secs(5);
@@ -1571,6 +1611,9 @@ impl SwarmEngine {
                         let raw_hex_c = raw_bencode_hex_worker.clone();
                         let prios_c = priorities_worker.read().clone();
                         let sequential_c = sequential_worker.load(Ordering::Relaxed);
+                        let first_last_c = first_last_worker.load(Ordering::Relaxed);
+                        let super_seeding_c = super_seeding_worker.load(Ordering::Relaxed);
+                        let meta_c = metadata_worker.read().clone();
                         let tracker_override_c = tracker_override_worker.read().clone();
                         let (uploaded_bytes, current_ratio) = {
                             let s = stats_worker.read();
@@ -1597,6 +1640,12 @@ impl SwarmEngine {
                                 file_priorities: prios_c,
                                 sequential: sequential_c,
                                 tracker_override: tracker_override_c,
+                                category: meta_c.category,
+                                tags: meta_c.tags,
+                                seed_ratio_limit: meta_c.seed_ratio_limit,
+                                seed_time_limit_secs: meta_c.seed_time_limit_secs,
+                                super_seeding: super_seeding_c,
+                                first_last_piece_priority: first_last_c,
                             };
                             let _ = store.save_torrent(&state);
                         });
@@ -1668,12 +1717,22 @@ impl SwarmEngine {
                     stats.added_at as u64
                 };
                 let elapsed_secs = now_secs.saturating_sub(last_activity);
+                let meta = handle.metadata.read().clone();
+                let per_torrent_ratio_hit = meta
+                    .seed_ratio_limit
+                    .is_some_and(|limit| limit > 0.0 && (stats.ratio as f64) >= limit);
+                let per_torrent_time_hit = meta
+                    .seed_time_limit_secs
+                    .is_some_and(|limit| elapsed_secs >= limit);
                 let action =
                     qm.evaluate_seeder(1, self.torrents.len(), stats.ratio as f64, elapsed_secs);
-                if matches!(
-                    action,
-                    QueueAction::AutoStopRatioReached | QueueAction::AutoStopSeedTimeReached
-                ) {
+                if per_torrent_ratio_hit
+                    || per_torrent_time_hit
+                    || matches!(
+                        action,
+                        QueueAction::AutoStopRatioReached | QueueAction::AutoStopSeedTimeReached
+                    )
+                {
                     stats.state = SwarmState::Stopped;
                     stats.tier = SwarmTier::Cold;
                     self.metrics
@@ -1978,6 +2037,12 @@ impl SwarmEngine {
                     file_priorities: Vec::new(),
                     sequential: false,
                     tracker_override: None,
+                    category: None,
+                    tags: Vec::new(),
+                    seed_ratio_limit: None,
+                    seed_time_limit_secs: None,
+                    super_seeding: false,
+                    first_last_piece_priority: false,
                 };
                 let _ = store.save_torrent(&state);
             }
@@ -2016,6 +2081,23 @@ impl SwarmEngine {
             file_priorities,
             sequential: Arc::new(std::sync::atomic::AtomicBool::new(
                 resume.as_ref().is_some_and(|r| r.sequential),
+            )),
+            first_last_piece_priority: Arc::new(std::sync::atomic::AtomicBool::new(
+                resume.as_ref().is_some_and(|r| r.first_last_piece_priority),
+            )),
+            super_seeding: Arc::new(std::sync::atomic::AtomicBool::new(
+                resume.as_ref().is_some_and(|r| r.super_seeding),
+            )),
+            metadata: Arc::new(RwLock::new(
+                resume
+                    .as_ref()
+                    .map(|r| TorrentMetadata {
+                        category: r.category.clone(),
+                        tags: r.tags.clone(),
+                        seed_ratio_limit: r.seed_ratio_limit,
+                        seed_time_limit_secs: r.seed_time_limit_secs,
+                    })
+                    .unwrap_or_default(),
             )),
             tracker_override: Arc::new(RwLock::new(
                 resume.as_ref().and_then(|r| r.tracker_override.clone()),
@@ -2109,8 +2191,9 @@ impl SwarmEngine {
                         uploaded_bytes: s.uploaded_bytes,
                         downloaded_bytes: s.downloaded_bytes,
                         added_at: s.added_at,
-                        is_paused: matches!(s.tier, SwarmTier::Cold)
-                            || s.state == SwarmState::Stopped,
+                        // Only persist explicit user-paused/stopped state; Cold-tier dormant seeds
+                        // should resume normally on restart rather than staying stopped.
+                        is_paused: s.state == SwarmState::Stopped,
                         ratio: Some(s.ratio),
                         magnet_uri: None,
                         raw_bencode_hex: if h.info.has_piece_hashes() {
@@ -2121,15 +2204,21 @@ impl SwarmEngine {
                         file_priorities: h.file_priorities.read().clone(),
                         sequential: h.sequential.load(Ordering::Relaxed),
                         tracker_override: h.tracker_override.read().clone(),
+                        category: h.metadata.read().category.clone(),
+                        tags: h.metadata.read().tags.clone(),
+                        seed_ratio_limit: h.metadata.read().seed_ratio_limit,
+                        seed_time_limit_secs: h.metadata.read().seed_time_limit_secs,
+                        super_seeding: h.super_seeding.load(Ordering::Relaxed),
+                        first_last_piece_priority: h
+                            .first_last_piece_priority
+                            .load(Ordering::Relaxed),
                     }
                 })
                 .collect();
 
             let store = store.clone();
             let _ = tokio::task::spawn_blocking(move || {
-                for snap in snapshots {
-                    let _ = store.save_torrent(&snap);
-                }
+                let _ = store.save_torrents_batch(&snapshots);
             })
             .await;
         }
@@ -2183,6 +2272,104 @@ impl SwarmEngine {
         self.torrents
             .get(info_hash)
             .is_some_and(|h| h.sequential.load(Ordering::Relaxed))
+    }
+
+    /// Enables or disables first/last piece priority for a torrent.
+    pub fn set_first_last_piece_priority(&self, info_hash: &[u8; 20], enabled: bool) -> bool {
+        let Some(handle) = self.torrents.get(info_hash) else {
+            return false;
+        };
+        handle
+            .first_last_piece_priority
+            .store(enabled, Ordering::Relaxed);
+        self.persist_torrent_option(info_hash, move |state| {
+            state.first_last_piece_priority = enabled;
+        });
+        if let Some(tx) = handle.command_tx() {
+            let _ = tx.try_send(TorrentCommand::SetFirstLastPiecePriority(enabled));
+        }
+        true
+    }
+
+    /// Enables or disables super-seeding mode for a torrent.
+    pub fn set_super_seeding(&self, info_hash: &[u8; 20], enabled: bool) -> bool {
+        let Some(handle) = self.torrents.get(info_hash) else {
+            return false;
+        };
+        handle.super_seeding.store(enabled, Ordering::Relaxed);
+        self.persist_torrent_option(info_hash, move |state| {
+            state.super_seeding = enabled;
+        });
+        if let Some(tx) = handle.command_tx() {
+            let _ = tx.try_send(TorrentCommand::SetSuperSeeding(enabled));
+        }
+        true
+    }
+
+    /// Updates user-defined metadata (category, tags, per-torrent seed limits) and persists it.
+    pub fn set_torrent_metadata(
+        &self,
+        info_hash: &[u8; 20],
+        patch: TorrentMetadataPatch,
+    ) -> Option<TorrentMetadata> {
+        let handle = self.torrents.get(info_hash)?;
+        let updated = {
+            let mut meta = handle.metadata.write();
+            if let Some(cat) = patch.category {
+                meta.category = cat.and_then(|s| {
+                    let t = s.trim().to_string();
+                    if t.is_empty() {
+                        None
+                    } else {
+                        Some(t)
+                    }
+                });
+            }
+            if let Some(tags) = patch.tags {
+                let mut clean: Vec<String> = Vec::new();
+                for t in tags {
+                    let trimmed = t.trim().to_string();
+                    if !trimmed.is_empty() && !clean.contains(&trimmed) {
+                        clean.push(trimmed);
+                    }
+                }
+                meta.tags = clean;
+            }
+            if let Some(ratio_lim) = patch.seed_ratio_limit {
+                meta.seed_ratio_limit = ratio_lim.filter(|r| *r > 0.0);
+            }
+            if let Some(time_lim) = patch.seed_time_limit_secs {
+                meta.seed_time_limit_secs = time_lim.filter(|t| *t > 0);
+            }
+            meta.clone()
+        };
+        let persisted = updated.clone();
+        self.persist_torrent_option(info_hash, move |state| {
+            state.category = persisted.category;
+            state.tags = persisted.tags;
+            state.seed_ratio_limit = persisted.seed_ratio_limit;
+            state.seed_time_limit_secs = persisted.seed_time_limit_secs;
+        });
+        Some(updated)
+    }
+
+    /// Exports the `.torrent` bencode bytes and torrent name for a loaded torrent.
+    pub fn export_torrent_bytes(&self, info_hash: &[u8; 20]) -> Option<(String, Vec<u8>)> {
+        let handle = self.torrents.get(info_hash)?;
+        let name = handle.stats.read().name.clone();
+        if handle.info.has_piece_hashes() {
+            return Some((name, handle.info.to_torrent_bytes()));
+        }
+        if let Some(ref store) = self.session_store {
+            if let Ok(Some(state)) = store.load_torrent(&hex::encode(info_hash)) {
+                if let Some(hex_str) = state.raw_bencode_hex {
+                    if let Ok(bytes) = hex::decode(&hex_str) {
+                        return Some((name, bytes));
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// Replaces the trackers a torrent announces to with `trackers` and announces to them
@@ -2907,6 +3094,12 @@ impl SwarmEngine {
                         file_priorities: state.file_priorities.clone(),
                         sequential: state.sequential,
                         tracker_override: state.tracker_override.clone(),
+                        category: state.category.clone(),
+                        tags: state.tags.clone(),
+                        seed_ratio_limit: state.seed_ratio_limit,
+                        seed_time_limit_secs: state.seed_time_limit_secs,
+                        super_seeding: state.super_seeding,
+                        first_last_piece_priority: state.first_last_piece_priority,
                     };
                     self.add_torrent_with_resume(
                         Arc::new(info),

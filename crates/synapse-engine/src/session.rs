@@ -12,7 +12,7 @@ use tracing::{debug, info, warn};
 
 use synapse_picker::Bitfield;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TorrentSessionState {
     pub info_hash_hex: String,
     pub name: String,
@@ -40,6 +40,24 @@ pub struct TorrentSessionState {
     /// Replacement tracker list set through the API. `None` means "use the torrent's own".
     #[serde(default)]
     pub tracker_override: Option<Vec<String>>,
+    /// Optional user-assigned category (e.g. "tv", "movies", "linux").
+    #[serde(default)]
+    pub category: Option<String>,
+    /// Optional user-assigned tags.
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// Per-torrent ratio limit; when reached while seeding, auto-stops the torrent.
+    #[serde(default)]
+    pub seed_ratio_limit: Option<f64>,
+    /// Per-torrent idle/seed time limit in seconds; when reached while seeding, auto-stops.
+    #[serde(default)]
+    pub seed_time_limit_secs: Option<u64>,
+    /// Whether super-seeding mode is enabled for this torrent.
+    #[serde(default)]
+    pub super_seeding: bool,
+    /// Whether first and last piece priority is enabled for this torrent.
+    #[serde(default)]
+    pub first_last_piece_priority: bool,
 }
 
 impl TorrentSessionState {
@@ -224,47 +242,57 @@ impl SessionStore {
 
     /// Atomically persists encrypted torrent session state to the embedded database.
     pub fn save_torrent(&self, state: &TorrentSessionState) -> std::io::Result<()> {
-        let hash = state.info_hash().ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "invalid info_hash_hex in session state",
-            )
-        })?;
+        self.save_torrents_batch(std::slice::from_ref(state))
+    }
 
-        // If the state being saved does not carry raw_bencode_hex, check whether an existing
-        // record for this torrent already has raw_bencode_hex saved in the database. If so, preserve
-        // it rather than overwriting it with None.
-        let state_to_save = if state.raw_bencode_hex.is_none() {
-            if let Ok(Some(existing)) = self.load_torrent(&state.info_hash_hex) {
-                if existing.raw_bencode_hex.is_some() {
-                    let mut s = state.clone();
-                    s.raw_bencode_hex = existing.raw_bencode_hex;
-                    s
-                } else {
-                    state.clone()
-                }
-            } else {
-                state.clone()
-            }
-        } else {
-            state.clone()
-        };
-
-        let data = serde_json::to_vec(&state_to_save)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        let encrypted = encrypt(&self.cipher, &data)?;
-
+    /// Atomically persists a batch of encrypted torrent session states in a single `redb`
+    /// write transaction (one fsync instead of N).
+    pub fn save_torrents_batch(&self, states: &[TorrentSessionState]) -> std::io::Result<()> {
+        if states.is_empty() {
+            return Ok(());
+        }
         let write_tx = self.db.begin_write().map_err(to_io_err)?;
         {
             let mut table = write_tx.open_table(TORRENTS_TABLE).map_err(to_io_err)?;
-            table
-                .insert(&hash, encrypted.as_slice())
-                .map_err(to_io_err)?;
+            for state in states {
+                let hash = state.info_hash().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "invalid info_hash_hex in session state",
+                    )
+                })?;
+
+                let state_to_save = if state.raw_bencode_hex.is_none() {
+                    let existing_bencode = table
+                        .get(&hash)
+                        .ok()
+                        .flatten()
+                        .and_then(|guard| decrypt(&self.cipher, guard.value()).ok())
+                        .and_then(|pt| serde_json::from_slice::<TorrentSessionState>(&pt).ok())
+                        .and_then(|s| s.raw_bencode_hex);
+                    if existing_bencode.is_some() {
+                        let mut s = state.clone();
+                        s.raw_bencode_hex = existing_bencode;
+                        s
+                    } else {
+                        state.clone()
+                    }
+                } else {
+                    state.clone()
+                };
+
+                let data = serde_json::to_vec(&state_to_save)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                let encrypted = encrypt(&self.cipher, &data)?;
+                table
+                    .insert(&hash, encrypted.as_slice())
+                    .map_err(to_io_err)?;
+            }
         }
         write_tx.commit().map_err(to_io_err)?;
         debug!(
-            "Persisted encrypted session state for {}",
-            state.info_hash_hex
+            "Persisted batch of {} encrypted session states",
+            states.len()
         );
         Ok(())
     }

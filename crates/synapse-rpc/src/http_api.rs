@@ -13,8 +13,56 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use synapse_engine::SwarmEngine;
+
+#[derive(Clone, Default)]
+pub struct AuthRateLimiter {
+    inner: Arc<parking_lot::Mutex<HashMap<String, (u32, Instant)>>>,
+}
+
+impl AuthRateLimiter {
+    const WINDOW: Duration = Duration::from_secs(60);
+    const MAX_FAILURES: u32 = 15;
+    const MAX_KEYS: usize = 4096;
+
+    pub fn is_blocked(&self, key: &str) -> bool {
+        let mut guard = self.inner.lock();
+        let now = Instant::now();
+        if let Some((count, start)) = guard.get(key) {
+            if now.duration_since(*start) < Self::WINDOW {
+                return *count >= Self::MAX_FAILURES;
+            }
+            guard.remove(key);
+        }
+        false
+    }
+
+    pub fn record_failure(&self, key: &str) {
+        let mut guard = self.inner.lock();
+        let now = Instant::now();
+        if guard.len() >= Self::MAX_KEYS {
+            guard.retain(|_, (_, start)| now.duration_since(*start) < Self::WINDOW);
+            if guard.len() >= Self::MAX_KEYS {
+                if let Some(oldest) = guard
+                    .iter()
+                    .min_by_key(|(_, (_, s))| *s)
+                    .map(|(k, _)| k.clone())
+                {
+                    guard.remove(&oldest);
+                }
+            }
+        }
+        let entry = guard.entry(key.to_string()).or_insert((0, now));
+        if now.duration_since(entry.1) >= Self::WINDOW {
+            *entry = (1, now);
+        } else {
+            entry.0 = entry.0.saturating_add(1);
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct ApiState {
@@ -22,6 +70,8 @@ pub struct ApiState {
     pub auth_token: Option<String>,
     pub web_config: synapse_config::WebConfig,
     pub base_download_dir: std::path::PathBuf,
+    pub rate_limiter: AuthRateLimiter,
+    pub allowed_hosts: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]
@@ -163,6 +213,7 @@ pub fn create_http_router_full(
         auth_token,
         metrics_enabled,
         synapse_config::WebConfig::default(),
+        Vec::new(),
     )
 }
 
@@ -171,6 +222,7 @@ pub fn create_http_router_all(
     auth_token: Option<String>,
     metrics_enabled: bool,
     web_config: synapse_config::WebConfig,
+    allowed_hosts: Vec<String>,
 ) -> Router {
     let base_download_dir = engine.settings().read().download_dir.clone();
     let auth_token = auth_token.filter(|t| !t.trim().is_empty());
@@ -179,6 +231,8 @@ pub fn create_http_router_all(
         auth_token,
         web_config: web_config.clone(),
         base_download_dir,
+        rate_limiter: AuthRateLimiter::default(),
+        allowed_hosts,
     };
 
     let protected = Router::new()
@@ -220,6 +274,39 @@ pub fn create_http_router_all(
             "/api/v1/torrents/:info_hash/files/:index/priority",
             post(set_file_priority_handler),
         )
+        .route(
+            "/api/v1/torrents/:info_hash/queue-move",
+            post(queue_move_handler),
+        )
+        .route(
+            "/api/v1/torrents/:info_hash/sequential",
+            post(set_sequential_handler),
+        )
+        .route(
+            "/api/v1/torrents/:info_hash/super-seed",
+            post(set_super_seed_handler),
+        )
+        .route(
+            "/api/v1/torrents/:info_hash/first-last-priority",
+            post(set_first_last_priority_handler),
+        )
+        .route(
+            "/api/v1/torrents/:info_hash/reannounce",
+            post(reannounce_torrent_handler),
+        )
+        .route(
+            "/api/v1/torrents/:info_hash/trackers",
+            post(replace_trackers_handler),
+        )
+        .route(
+            "/api/v1/torrents/:info_hash/metadata",
+            axum::routing::patch(update_metadata_handler),
+        )
+        .route(
+            "/api/v1/torrents/:info_hash/export",
+            get(export_torrent_handler),
+        )
+        .route("/api/v1/ip-filter/reload", post(reload_ip_filter_handler))
         .route("/api/v1/alerts", get(alerts_stream_handler))
         .route("/api/v1/search", get(search_torrents_handler))
         .route("/api/v1/torrents/create", post(create_torrent_handler))
@@ -473,7 +560,77 @@ pub fn is_safe_single_component_name(name: &str) -> bool {
     matches!(comps.next(), Some(std::path::Component::Normal(_))) && comps.next().is_none()
 }
 
-fn verify_same_origin_csrf(req: &Request) -> Result<(), StatusCode> {
+fn strip_host_port(host_hdr: &str) -> &str {
+    let trimmed = host_hdr.trim();
+    if let Some(rest) = trimmed.strip_prefix('[') {
+        if let Some(end) = rest.find(']') {
+            return &trimmed[..=end + 1];
+        }
+    }
+    trimmed.rsplit_once(':').map(|(h, _)| h).unwrap_or(trimmed)
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    matches!(
+        host.to_ascii_lowercase().as_str(),
+        "localhost" | "127.0.0.1" | "[::1]" | "::1"
+    )
+}
+
+/// A `Host`/`Origin` host is acceptable for DNS-rebinding purposes when it's loopback, or when
+/// it's explicitly listed in `http_api.allowed_hosts` (e.g. the hostname of a reverse proxy
+/// fronting this daemon).
+fn is_allowed_host(host: &str, allowed_hosts: &[String]) -> bool {
+    is_loopback_host(host) || allowed_hosts.iter().any(|h| h.eq_ignore_ascii_case(host))
+}
+
+fn is_trusted_proxy_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
+        std::net::IpAddr::V6(v6) => {
+            v6.is_loopback() || v6.is_unique_local() || v6.is_unicast_link_local()
+        }
+    }
+}
+
+/// Identifies the real caller for rate-limiting. `X-Forwarded-For` is only honored when the
+/// direct peer is itself a trusted proxy (loopback/private/link-local); a trusted proxy appends
+/// the IP *it* observed to the end of the list, so we walk from the right and take the first
+/// entry that isn't itself another trusted-proxy hop — the client-supplied prefix is otherwise
+/// fully attacker-controlled and must never be trusted as-is.
+fn extract_client_ip(req: &Request) -> String {
+    let peer_ip = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|ci| ci.0.ip());
+
+    if let Some(ip) = peer_ip {
+        if is_trusted_proxy_ip(ip) {
+            if let Some(xff) = req
+                .headers()
+                .get("x-forwarded-for")
+                .and_then(|v| v.to_str().ok())
+            {
+                for candidate in xff.split(',').rev().map(str::trim) {
+                    if let Ok(parsed) = candidate.parse::<std::net::IpAddr>() {
+                        if !is_trusted_proxy_ip(parsed) {
+                            return parsed.to_string();
+                        }
+                    }
+                }
+            }
+        }
+        return ip.to_string();
+    }
+
+    "unknown".to_string()
+}
+
+fn verify_same_origin_csrf(
+    req: &Request,
+    require_loopback_host: bool,
+    allowed_hosts: &[String],
+) -> Result<(), StatusCode> {
     use axum::http::Method;
     if !matches!(
         *req.method(),
@@ -489,6 +646,18 @@ fn verify_same_origin_csrf(req: &Request) -> Result<(), StatusCode> {
     {
         if sec_fetch.eq_ignore_ascii_case("cross-site") {
             return Err(StatusCode::FORBIDDEN);
+        }
+    }
+
+    if require_loopback_host {
+        if let Some(host_hdr) = req
+            .headers()
+            .get(header::HOST)
+            .and_then(|v| v.to_str().ok())
+        {
+            if !is_allowed_host(strip_host_port(host_hdr), allowed_hosts) {
+                return Err(StatusCode::FORBIDDEN);
+            }
         }
     }
 
@@ -516,16 +685,13 @@ fn verify_same_origin_csrf(req: &Request) -> Result<(), StatusCode> {
             .and_then(|v| v.to_str().ok())
         {
             let host_trimmed = host_hdr.trim();
-            let host_only = host_trimmed
-                .rsplit_once(':')
-                .map(|(h, _)| h)
-                .unwrap_or(host_trimmed);
+            let host_only = strip_host_port(host_trimmed);
             if !origin_authority.eq_ignore_ascii_case(host_trimmed)
                 && !origin_host.eq_ignore_ascii_case(host_only)
             {
                 return Err(StatusCode::FORBIDDEN);
             }
-        } else if !matches!(origin_host, "localhost" | "127.0.0.1" | "[::1]" | "::1") {
+        } else if !is_allowed_host(origin_host, allowed_hosts) {
             return Err(StatusCode::FORBIDDEN);
         }
     }
@@ -538,11 +704,16 @@ async fn require_auth(
     req: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    verify_same_origin_csrf(&req)?;
+    verify_same_origin_csrf(&req, state.auth_token.is_none(), &state.allowed_hosts)?;
 
     let Some(ref expected) = state.auth_token else {
         return Ok(next.run(req).await);
     };
+    let client_key = extract_client_ip(&req);
+    if state.rate_limiter.is_blocked(&client_key) {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+
     let expected_trimmed = expected.trim();
     if expected_trimmed.is_empty() {
         return Err(StatusCode::UNAUTHORIZED);
@@ -557,17 +728,34 @@ async fn require_auth(
         })
         .unwrap_or(false);
     if !authorized {
+        state.rate_limiter.record_failure(&client_key);
         return Err(StatusCode::UNAUTHORIZED);
     }
     Ok(next.run(req).await)
 }
 
-async fn health_handler() -> Json<HealthResponse> {
-    Json(HealthResponse {
-        status: "ok".to_string(),
-        version: env!("CARGO_PKG_VERSION").to_string(),
-        features: vec!["tracker_circuit_breaker_v1".to_string()],
-    })
+async fn health_handler(State(state): State<ApiState>) -> (StatusCode, Json<HealthResponse>) {
+    let dir_ok = tokio::fs::metadata(&state.base_download_dir)
+        .await
+        .map(|m| m.is_dir())
+        .unwrap_or(false);
+    let status_code = if dir_ok {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (
+        status_code,
+        Json(HealthResponse {
+            status: if dir_ok {
+                "ok".to_string()
+            } else {
+                "degraded".to_string()
+            },
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            features: vec!["tracker_circuit_breaker_v1".to_string()],
+        }),
+    )
 }
 
 fn circuit_state_label(state: synapse_tracker::CircuitState) -> &'static str {
@@ -771,6 +959,19 @@ async fn list_torrents_handler(
     let list: Vec<serde_json::Value> = paged_swarms
         .into_iter()
         .map(|s| {
+            let (meta, sequential, super_seeding, first_last) = state
+                .engine
+                .get_torrent(&s.info_hash)
+                .map(|h| {
+                    (
+                        h.metadata.read().clone(),
+                        h.sequential.load(std::sync::atomic::Ordering::Relaxed),
+                        h.super_seeding.load(std::sync::atomic::Ordering::Relaxed),
+                        h.first_last_piece_priority
+                            .load(std::sync::atomic::Ordering::Relaxed),
+                    )
+                })
+                .unwrap_or_default();
             serde_json::json!({
                 "info_hash": hex::encode(s.info_hash),
                 "name": s.name,
@@ -787,6 +988,13 @@ async fn list_torrents_handler(
                 "download_dir": s.download_dir,
                 "state": format!("{:?}", s.state),
                 "tier": format!("{:?}", s.tier),
+                "category": meta.category,
+                "tags": meta.tags,
+                "seed_ratio_limit": meta.seed_ratio_limit,
+                "seed_time_limit_secs": meta.seed_time_limit_secs,
+                "sequential": sequential,
+                "super_seeding": super_seeding,
+                "first_last_piece_priority": first_last,
             })
         })
         .collect();
@@ -1225,6 +1433,7 @@ async fn get_torrent_handler(
 
     if let Some(handle) = state.engine.get_torrent(&hash) {
         let stats = handle.stats.read().clone();
+        let meta = handle.metadata.read().clone();
         Ok(Json(serde_json::json!({
             "info_hash": hex::encode(stats.info_hash),
             "name": stats.name,
@@ -1235,6 +1444,13 @@ async fn get_torrent_handler(
             "peers_connected": stats.peers_connected,
             "state": format!("{:?}", stats.state),
             "tier": format!("{:?}", stats.tier),
+            "category": meta.category,
+            "tags": meta.tags,
+            "seed_ratio_limit": meta.seed_ratio_limit,
+            "seed_time_limit_secs": meta.seed_time_limit_secs,
+            "sequential": handle.sequential.load(std::sync::atomic::Ordering::Relaxed),
+            "super_seeding": handle.super_seeding.load(std::sync::atomic::Ordering::Relaxed),
+            "first_last_piece_priority": handle.first_last_piece_priority.load(std::sync::atomic::Ordering::Relaxed),
         })))
     } else {
         Err(StatusCode::NOT_FOUND)
@@ -1408,6 +1624,7 @@ async fn get_torrent_detail_handler(
     }
 
     let discovery = state.engine.swarm_discovery_stats(&hash);
+    let meta = handle.metadata.read().clone();
 
     Ok(Json(serde_json::json!({
         "info_hash": hex::encode(stats.info_hash),
@@ -1428,6 +1645,13 @@ async fn get_torrent_detail_handler(
         "discovery": discovery,
         "state": format!("{:?}", stats.state),
         "tier": format!("{:?}", stats.tier),
+        "category": meta.category,
+        "tags": meta.tags,
+        "seed_ratio_limit": meta.seed_ratio_limit,
+        "seed_time_limit_secs": meta.seed_time_limit_secs,
+        "sequential": handle.sequential.load(std::sync::atomic::Ordering::Relaxed),
+        "super_seeding": handle.super_seeding.load(std::sync::atomic::Ordering::Relaxed),
+        "first_last_piece_priority": handle.first_last_piece_priority.load(std::sync::atomic::Ordering::Relaxed),
         "piece_count": piece_count,
         "piece_size": piece_size,
         "piece_bitfield": piece_bitfield_hex,
@@ -1608,6 +1832,217 @@ async fn set_file_priority_handler(
     } else {
         Err(StatusCode::NOT_FOUND)
     }
+}
+
+fn parse_info_hash(info_hash_str: &str) -> Result<[u8; 20], StatusCode> {
+    let hash_bytes = hex::decode(info_hash_str.trim()).map_err(|_| StatusCode::BAD_REQUEST)?;
+    if hash_bytes.len() != 20 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let mut hash = [0u8; 20];
+    hash.copy_from_slice(&hash_bytes);
+    Ok(hash)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct QueueMoveRequest {
+    pub direction: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ToggleRequest {
+    pub enabled: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ReplaceTrackersBody {
+    pub trackers: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateMetadataRequest {
+    pub category: Option<Option<String>>,
+    pub tags: Option<Vec<String>>,
+    pub seed_ratio_limit: Option<Option<f64>>,
+    pub seed_time_limit_secs: Option<Option<u64>>,
+}
+
+async fn queue_move_handler(
+    State(state): State<ApiState>,
+    Path(info_hash_str): Path<String>,
+    Json(payload): Json<QueueMoveRequest>,
+) -> Result<Json<ActionResponse>, StatusCode> {
+    let hash = parse_info_hash(&info_hash_str)?;
+    let dir = match payload.direction.to_lowercase().as_str() {
+        "top" => synapse_engine::QueueMove::Top,
+        "up" => synapse_engine::QueueMove::Up,
+        "down" => synapse_engine::QueueMove::Down,
+        "bottom" => synapse_engine::QueueMove::Bottom,
+        _ => return Err(StatusCode::BAD_REQUEST),
+    };
+    if state.engine.move_in_queue(&[hash], dir) == 0 {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    Ok(Json(ActionResponse {
+        success: true,
+        message: format!("Moved torrent {} in queue", payload.direction),
+    }))
+}
+
+async fn set_sequential_handler(
+    State(state): State<ApiState>,
+    Path(info_hash_str): Path<String>,
+    Json(payload): Json<ToggleRequest>,
+) -> Result<Json<ActionResponse>, StatusCode> {
+    let hash = parse_info_hash(&info_hash_str)?;
+    if state.engine.set_sequential_download(&hash, payload.enabled) {
+        Ok(Json(ActionResponse {
+            success: true,
+            message: format!("Sequential download set to {}", payload.enabled),
+        }))
+    } else {
+        Err(StatusCode::NOT_FOUND)
+    }
+}
+
+async fn set_super_seed_handler(
+    State(state): State<ApiState>,
+    Path(info_hash_str): Path<String>,
+    Json(payload): Json<ToggleRequest>,
+) -> Result<Json<ActionResponse>, StatusCode> {
+    let hash = parse_info_hash(&info_hash_str)?;
+    if state.engine.set_super_seeding(&hash, payload.enabled) {
+        Ok(Json(ActionResponse {
+            success: true,
+            message: format!("Super-seeding set to {}", payload.enabled),
+        }))
+    } else {
+        Err(StatusCode::NOT_FOUND)
+    }
+}
+
+async fn set_first_last_priority_handler(
+    State(state): State<ApiState>,
+    Path(info_hash_str): Path<String>,
+    Json(payload): Json<ToggleRequest>,
+) -> Result<Json<ActionResponse>, StatusCode> {
+    let hash = parse_info_hash(&info_hash_str)?;
+    if state
+        .engine
+        .set_first_last_piece_priority(&hash, payload.enabled)
+    {
+        Ok(Json(ActionResponse {
+            success: true,
+            message: format!("First/last piece priority set to {}", payload.enabled),
+        }))
+    } else {
+        Err(StatusCode::NOT_FOUND)
+    }
+}
+
+async fn reannounce_torrent_handler(
+    State(state): State<ApiState>,
+    Path(info_hash_str): Path<String>,
+) -> Result<Json<ActionResponse>, StatusCode> {
+    let hash = parse_info_hash(&info_hash_str)?;
+    if state.engine.get_torrent(&hash).is_none() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    let ok = state.engine.reannounce_torrent(&hash);
+    Ok(Json(ActionResponse {
+        success: ok,
+        message: if ok {
+            "Reannounce triggered".to_string()
+        } else {
+            "Torrent is not currently announcing (stopped or queued)".to_string()
+        },
+    }))
+}
+
+async fn replace_trackers_handler(
+    State(state): State<ApiState>,
+    Path(info_hash_str): Path<String>,
+    Json(payload): Json<ReplaceTrackersBody>,
+) -> Result<Json<ActionResponse>, StatusCode> {
+    let hash = parse_info_hash(&info_hash_str)?;
+    match state.engine.replace_trackers(&hash, &payload.trackers) {
+        None => Err(StatusCode::NOT_FOUND),
+        Some(0) if !payload.trackers.is_empty() => Err(StatusCode::BAD_REQUEST),
+        Some(count) => Ok(Json(ActionResponse {
+            success: true,
+            message: format!("Updated trackers ({count} active)"),
+        })),
+    }
+}
+
+async fn update_metadata_handler(
+    State(state): State<ApiState>,
+    Path(info_hash_str): Path<String>,
+    Json(payload): Json<UpdateMetadataRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let hash = parse_info_hash(&info_hash_str)?;
+    let patch = synapse_engine::TorrentMetadataPatch {
+        category: payload.category,
+        tags: payload.tags,
+        seed_ratio_limit: payload.seed_ratio_limit,
+        seed_time_limit_secs: payload.seed_time_limit_secs,
+    };
+    let Some(updated) = state.engine.set_torrent_metadata(&hash, patch) else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "metadata": updated,
+    })))
+}
+
+async fn export_torrent_handler(
+    State(state): State<ApiState>,
+    Path(info_hash_str): Path<String>,
+) -> Result<impl axum::response::IntoResponse, StatusCode> {
+    let hash = parse_info_hash(&info_hash_str)?;
+    let Some((name, bytes)) = state.engine.export_torrent_bytes(&hash) else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+    let safe_name: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let filename = if safe_name.is_empty() {
+        format!("{info_hash_str}.torrent")
+    } else {
+        format!("{safe_name}.torrent")
+    };
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/x-bittorrent"),
+    );
+    if let Ok(disp) =
+        axum::http::HeaderValue::from_str(&format!("attachment; filename=\"{filename}\""))
+    {
+        headers.insert(axum::http::header::CONTENT_DISPOSITION, disp);
+    }
+    Ok((StatusCode::OK, headers, bytes))
+}
+
+async fn reload_ip_filter_handler(
+    State(state): State<ApiState>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let engine = state.engine.clone();
+    let rules = tokio::task::spawn_blocking(move || engine.reload_ip_filter())
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "rules": rules,
+    })))
 }
 
 async fn pause_torrent_handler(
@@ -2093,5 +2528,80 @@ mod tests {
                 "delete_data=true must never follow a directory symlink to delete outside files"
             );
         }
+    }
+
+    fn request_from_peer(peer: &str, xff: Option<&str>) -> axum::extract::Request {
+        let mut builder = Request::builder().uri("/");
+        if let Some(xff) = xff {
+            builder = builder.header("x-forwarded-for", xff);
+        }
+        let mut req = builder.body(Body::empty()).unwrap();
+        req.extensions_mut().insert(axum::extract::ConnectInfo(
+            peer.parse::<std::net::SocketAddr>().unwrap(),
+        ));
+        req
+    }
+
+    #[test]
+    fn client_ip_ignores_a_spoofed_prefix_and_uses_the_hop_the_trusted_proxy_appended() {
+        let req = request_from_peer("127.0.0.1:1234", Some("203.0.113.9, 10.0.0.5"));
+        assert_eq!(extract_client_ip(&req), "203.0.113.9");
+    }
+
+    #[test]
+    fn client_ip_falls_back_to_the_peer_when_forwarded_for_is_entirely_private() {
+        let req = request_from_peer("127.0.0.1:1234", Some("10.0.0.1, 10.0.0.2"));
+        assert_eq!(extract_client_ip(&req), "127.0.0.1");
+    }
+
+    #[test]
+    fn client_ip_from_an_untrusted_peer_ignores_forwarded_for_entirely() {
+        let req = request_from_peer("203.0.113.1:1234", Some("1.2.3.4"));
+        assert_eq!(extract_client_ip(&req), "203.0.113.1");
+    }
+
+    #[test]
+    fn allowed_host_accepts_loopback_and_configured_hosts_only() {
+        let allowed = vec!["synapse.example.com".to_string()];
+        assert!(is_allowed_host("localhost", &allowed));
+        assert!(is_allowed_host("Synapse.Example.com", &allowed));
+        assert!(!is_allowed_host("evil.example.com", &allowed));
+        assert!(!is_allowed_host("synapse.example.com", &[]));
+    }
+
+    #[tokio::test]
+    async fn spoofed_forwarded_for_cannot_bypass_the_auth_failure_rate_limit() {
+        let disk = Arc::new(diskio::DiskEngine::auto().await);
+        let engine = Arc::new(SwarmEngine::new(disk, [0u8; 20]));
+        let app = create_http_router_all(
+            engine,
+            Some("super-secret-token".to_string()),
+            false,
+            synapse_config::WebConfig::default(),
+            Vec::new(),
+        );
+
+        // 20 failed attempts, each from a direct (untrusted) peer claiming a different
+        // X-Forwarded-For value. If the header were trusted, every attempt would land in its
+        // own bucket and never trip the limiter; since the peer isn't a trusted proxy, they all
+        // key on the one real peer IP and the account-wide limiter kicks in well before 20.
+        let mut saw_rate_limited = false;
+        for i in 0..20 {
+            let mut req = request_from_peer("203.0.113.50:1234", Some(&format!("10.0.{i}.1")));
+            *req.uri_mut() = "/api/v1/torrents".parse().unwrap();
+            req.headers_mut()
+                .insert(header::AUTHORIZATION, "Bearer wrong-token".parse().unwrap());
+            let resp = app.clone().oneshot(req).await.unwrap();
+            if resp.status() == StatusCode::TOO_MANY_REQUESTS {
+                saw_rate_limited = true;
+                break;
+            }
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        }
+        assert!(
+            saw_rate_limited,
+            "repeated auth failures from one real peer must eventually be rate-limited \
+             regardless of the X-Forwarded-For value they send"
+        );
     }
 }

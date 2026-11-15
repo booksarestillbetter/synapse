@@ -109,9 +109,9 @@ impl AsyncWrite for PeerStream {
 /// otherwise tie up a tokio task indefinitely -- a trivial resource-exhaustion vector
 /// against an internet-facing listener.
 #[cfg(not(test))]
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 #[cfg(test)]
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_millis(300);
+pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_millis(300);
 
 /// We send a keep-alive if nothing has been written to a peer for this long, so idle but
 /// healthy connections are not dropped by the other side's inactivity timer.
@@ -179,6 +179,15 @@ pub struct PeerHandle {
 }
 
 impl PeerHandle {
+    #[cfg(test)]
+    pub(crate) fn new_for_test(
+        id: PeerId,
+        addr: SocketAddr,
+        outbound: mpsc::Sender<Message>,
+    ) -> Self {
+        Self { id, addr, outbound }
+    }
+
     /// Best-effort send: attempts an immediate non-blocking send, falling back to a bounded
     /// timeout (200ms) if the outbound buffer is congested. If the peer is completely stalled,
     /// the message is dropped rather than stalling the torrent actor event loop and choking all
@@ -908,5 +917,65 @@ mod liveness_tests {
                 "live peer was disconnected"
             );
         }
+    }
+
+    /// Regression for a production bug: callers of `connect_with_options` (in
+    /// `synapse-engine::announcer`) wrapped it in an outer timeout shorter than
+    /// `HANDSHAKE_TIMEOUT`, so a `PreferEncrypted` peer that never answers the MSE probe at
+    /// all (silence, not a reset - common for genuinely non-MSE peers) got killed by the
+    /// outer timeout before `connect_stream`'s own plaintext fallback ever got to run. This
+    /// reproduces exactly that shape - a first connection that never speaks, forcing the MSE
+    /// probe to run out its own full timeout, then a second (fallback) connection that
+    /// completes a plain handshake - wrapped in the combined budget callers must now use
+    /// (`2 * HANDSHAKE_TIMEOUT + slack`), and asserts it actually succeeds.
+    #[tokio::test]
+    async fn prefer_encrypted_falls_back_to_plaintext_within_the_combined_dial_budget() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, mut rx) = mpsc::channel(4);
+
+        tokio::spawn(async move {
+            // First connection: a peer that doesn't speak MSE and never answers the DH
+            // probe - held open and silent for longer than one `HANDSHAKE_TIMEOUT`, so the
+            // initiator's encrypted attempt has to run out its own timeout rather than fail
+            // fast on a reset.
+            let (first, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                tokio::time::sleep(HANDSHAKE_TIMEOUT * 4).await;
+                drop(first);
+            });
+
+            // Second connection: the fallback's fresh plaintext attempt - answer it like any
+            // other inbound peer.
+            let (second, remote) = listener.accept().await.unwrap();
+            accept(second, remote, [9; 20], [7; 20], false, tx)
+                .await
+                .unwrap();
+        });
+
+        // The budget every real caller (`announcer::dial_step` and its sibling) must give
+        // `connect_with_options` - see the comment there for why it's derived this way.
+        let dial_timeout = 2 * HANDSHAKE_TIMEOUT + Duration::from_secs(5);
+        let (events_tx, _events_rx) = mpsc::channel(4);
+        let result = tokio::time::timeout(
+            dial_timeout,
+            connect_with_mode(
+                addr,
+                [1; 20],
+                [7; 20],
+                false,
+                events_tx,
+                EncryptionMode::PreferEncrypted,
+            ),
+        )
+        .await;
+        assert!(
+            matches!(result, Ok(Ok(()))),
+            "expected the plaintext fallback to succeed within the combined dial budget, got {result:?}"
+        );
+        assert!(
+            rx.recv().await.is_some(),
+            "fallback connection never reached the accept() side"
+        );
     }
 }

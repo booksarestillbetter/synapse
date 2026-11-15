@@ -19,7 +19,7 @@ use synapse_meta::Info;
 use synapse_tracker::{AnnounceRequest, CanaryCircuitBreaker, Event};
 
 use crate::circuit_breaker::PeerCircuitBreaker;
-use crate::peer::{connect_with_options, PeerEvent};
+use crate::peer::{connect_with_options, PeerEvent, HANDSHAKE_TIMEOUT};
 use crate::pex;
 use crate::swarm::SwarmStats;
 
@@ -822,9 +822,14 @@ impl Announcer {
                 .unwrap_or(synapse_wire::EncryptionMode::PreferEncrypted);
             let utp_mgr = self.utp_manager.read().clone();
 
+            // See the matching comment in `dial_step` below: this must comfortably outlast
+            // both the `PreferEncrypted` MSE attempt AND its plaintext fallback (each up to
+            // `HANDSHAKE_TIMEOUT`), or the fallback never gets a chance to run.
+            let dial_timeout = 2 * HANDSHAKE_TIMEOUT + Duration::from_secs(5);
+
             tokio::spawn(async move {
                 match tokio::time::timeout(
-                    Duration::from_secs(12),
+                    dial_timeout,
                     connect_with_options(
                         peer_addr, our_id, info_hash, is_private, tx, enc_mode, utp_mgr,
                     ),
@@ -1346,6 +1351,42 @@ impl AnnounceScheduler {
         self.wake_notify.notify_one();
     }
 
+    /// Best-effort `event=stopped` announce for all active swarms during graceful shutdown.
+    pub async fn announce_stopped_all(&self) {
+        let targets: Vec<(Arc<Info>, u64, u64, u64)> = {
+            let swarms = self.swarms.read();
+            swarms
+                .values()
+                .filter_map(|m| {
+                    let s = m.stats.read();
+                    if s.state == crate::SwarmState::Stopped {
+                        return None;
+                    }
+                    let left = s.total_size.saturating_sub(s.downloaded_bytes);
+                    Some((m.info.clone(), s.downloaded_bytes, left, s.uploaded_bytes))
+                })
+                .collect()
+        };
+        if targets.is_empty() {
+            return;
+        }
+        let sem = Arc::new(Semaphore::new(16));
+        let mut futs = Vec::with_capacity(targets.len());
+        for (info, downloaded, left, uploaded) in targets {
+            let announcer = self.announcer.clone();
+            let sem = sem.clone();
+            futs.push(async move {
+                let Ok(_permit) = sem.acquire().await else {
+                    return;
+                };
+                let _ = announcer
+                    .announce(&info, downloaded, left, uploaded, Event::Stopped)
+                    .await;
+            });
+        }
+        let _ = tokio::time::timeout(Duration::from_secs(2), futures::future::join_all(futs)).await;
+    }
+
     /// Spawns the background scheduler actor loop and continuous candidate peer dialer.
     pub fn start(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
         let dialer_self = self.clone();
@@ -1563,9 +1604,19 @@ impl AnnounceScheduler {
                 .unwrap_or(synapse_wire::EncryptionMode::PreferEncrypted);
             let utp_mgr = self.utp_manager.read().clone();
 
+            // `PreferEncrypted` can run the full MSE negotiation (up to `HANDSHAKE_TIMEOUT`)
+            // against a peer that never answers it (many real peers go silent rather than
+            // reset on unrecognized bytes), THEN fall back to a fresh plaintext connection
+            // and handshake (up to another `HANDSHAKE_TIMEOUT`). This outer timeout must
+            // comfortably outlast both phases plus the fallback's own TCP connect, or it
+            // fires first and kills the task before the plaintext fallback ever gets to run
+            // - silently turning every slow-to-reject non-MSE peer into a lost connection
+            // (and, at scale, most of a swarm's effective throughput) instead of a fallback.
+            let dial_timeout = 2 * HANDSHAKE_TIMEOUT + Duration::from_secs(5);
+
             tokio::spawn(async move {
                 match tokio::time::timeout(
-                    Duration::from_secs(12),
+                    dial_timeout,
                     connect_with_options(
                         addr,
                         our_id,

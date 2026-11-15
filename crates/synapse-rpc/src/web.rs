@@ -10,6 +10,29 @@ use axum::{
     response::{Html, IntoResponse, Response},
 };
 
+const CSP_HEADER: &str = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' ws: wss:; frame-ancestors 'none'";
+
+fn with_security_headers(mut resp: Response) -> Response {
+    let headers = resp.headers_mut();
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        header::HeaderValue::from_static(CSP_HEADER),
+    );
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        header::HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        header::X_FRAME_OPTIONS,
+        header::HeaderValue::from_static("DENY"),
+    );
+    headers.insert(
+        header::REFERRER_POLICY,
+        header::HeaderValue::from_static("no-referrer"),
+    );
+    resp
+}
+
 pub async fn web_index_handler(State(state): State<ApiState>) -> Response {
     if !state.web_config.enabled {
         return StatusCode::NOT_FOUND.into_response();
@@ -17,10 +40,10 @@ pub async fn web_index_handler(State(state): State<ApiState>) -> Response {
     if let Some(ref root) = state.web_config.web_root {
         let index_path = root.join("index.html");
         if let Ok(content) = tokio::fs::read_to_string(&index_path).await {
-            return Html(content).into_response();
+            return with_security_headers(Html(content).into_response());
         }
     }
-    Html(INDEX_HTML).into_response()
+    with_security_headers(Html(INDEX_HTML).into_response())
 }
 
 pub async fn web_css_handler(State(state): State<ApiState>) -> Response {
@@ -30,14 +53,18 @@ pub async fn web_css_handler(State(state): State<ApiState>) -> Response {
     if let Some(ref root) = state.web_config.web_root {
         let path = root.join("style.css");
         if let Ok(content) = tokio::fs::read_to_string(&path).await {
-            return ([(header::CONTENT_TYPE, "text/css; charset=utf-8")], content).into_response();
+            return with_security_headers(
+                ([(header::CONTENT_TYPE, "text/css; charset=utf-8")], content).into_response(),
+            );
         }
     }
-    (
-        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
-        STYLE_CSS,
+    with_security_headers(
+        (
+            [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+            STYLE_CSS,
+        )
+            .into_response(),
     )
-        .into_response()
 }
 
 pub async fn web_js_handler(State(state): State<ApiState>) -> Response {
@@ -47,24 +74,28 @@ pub async fn web_js_handler(State(state): State<ApiState>) -> Response {
     if let Some(ref root) = state.web_config.web_root {
         let path = root.join("app.js");
         if let Ok(content) = tokio::fs::read_to_string(&path).await {
-            return (
-                [(
-                    header::CONTENT_TYPE,
-                    "application/javascript; charset=utf-8",
-                )],
-                content,
-            )
-                .into_response();
+            return with_security_headers(
+                (
+                    [(
+                        header::CONTENT_TYPE,
+                        "application/javascript; charset=utf-8",
+                    )],
+                    content,
+                )
+                    .into_response(),
+            );
         }
     }
-    (
-        [(
-            header::CONTENT_TYPE,
-            "application/javascript; charset=utf-8",
-        )],
-        APP_JS,
+    with_security_headers(
+        (
+            [(
+                header::CONTENT_TYPE,
+                "application/javascript; charset=utf-8",
+            )],
+            APP_JS,
+        )
+            .into_response(),
     )
-        .into_response()
 }
 
 pub async fn web_favicon_handler() -> Response {
@@ -168,7 +199,7 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
         <div class="daemon-info-card">
           <div><small>Engine:</small> <strong>Synapse 2.0</strong></div>
           <div><small>Peer ID:</small> <code>-SY2200-</code></div>
-          <div id="daemon-version"><small>Version:</small> 2.2.25</div>
+          <div id="daemon-version"><small>Version:</small> 2.2.29</div>
           <div id="daemon-dht"><small>DHT Nodes:</small> <span id="stat-dht-nodes">0</span></div>
         </div>
       </div>
@@ -213,6 +244,11 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
           <button class="tab-btn" data-tab="files">Files</button>
           <button class="tab-btn" data-tab="pieces">Piece Map</button>
           <div class="tab-spacer"></div>
+          <button class="btn btn-sm" id="btn-reannounce-torrent" title="Announce to trackers now">Reannounce</button>
+          <button class="btn btn-sm" id="btn-sequential-torrent" title="Toggle sequential piece picking">Sequential</button>
+          <button class="btn btn-sm" id="btn-first-last-torrent" title="Prioritize first and last pieces">First/Last</button>
+          <button class="btn btn-sm" id="btn-super-seed-torrent" title="Toggle super-seeding mode">Super-Seed</button>
+          <button class="btn btn-sm" id="btn-export-torrent" title="Download .torrent file">Export .torrent</button>
           <button class="btn btn-sm" id="btn-recheck-torrent" title="Force recheck integrity">Force Recheck</button>
           <button class="tab-close" id="btn-close-inspector" title="Close Inspector">✕</button>
         </div>
@@ -230,6 +266,7 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
               <div class="detail-item"><span class="lbl">Swarm Privacy:</span> <span class="val" id="det-privacy">-</span></div>
               <div class="detail-item"><span class="lbl">Discovery:</span> <span class="val" id="det-discovery">-</span></div>
               <div class="detail-item"><span class="lbl">Webseeds:</span> <span class="val" id="det-webseeds">-</span></div>
+              <div class="detail-item"><span class="lbl">Category:</span> <span class="val" id="det-category">-</span> <button class="btn btn-sm" id="btn-edit-category">Edit</button></div>
             </div>
           </div>
 
@@ -1347,6 +1384,20 @@ async function updateInspector(hash) {
     if (webseedsEl) {
       webseedsEl.innerText = (disc.webseeds_count || 0) > 0 ? `${disc.webseeds_count} HTTP mirror(s)` : 'None';
     }
+    const catEl = document.getElementById('det-category');
+    if (catEl) {
+      catEl.innerText = d.category || 'None';
+    }
+    const syncToggleBtn = (id, label, on) => {
+      const btn = document.getElementById(id);
+      if (btn) {
+        btn.dataset.enabled = on ? 'true' : 'false';
+        btn.innerText = on ? `${label}: ON` : label;
+      }
+    };
+    syncToggleBtn('btn-sequential-torrent', 'Sequential', !!d.sequential);
+    syncToggleBtn('btn-first-last-torrent', 'First/Last', !!d.first_last_piece_priority);
+    syncToggleBtn('btn-super-seed-torrent', 'Super-Seed', !!d.super_seeding);
 
     // Transfer
     document.getElementById('det-downloaded').innerText = formatBytes(d.downloaded_bytes);
@@ -1535,6 +1586,63 @@ async function forceRecheck() {
   await api(`/api/v1/torrents/${h}/recheck`, { method: 'POST' });
   showToast('Piece verification recheck dispatched', 'info');
   fetchUpdate();
+}
+
+async function reannounceTorrent() {
+  if (selectedHashes.size !== 1) return;
+  const h = [...selectedHashes][0];
+  const res = await api(`/api/v1/torrents/${h}/reannounce`, { method: 'POST' });
+  showToast(res.message || 'Reannounce triggered', res.success ? 'success' : 'info');
+}
+
+async function toggleTorrentFlag(endpoint, btnId, label) {
+  if (selectedHashes.size !== 1) return;
+  const h = [...selectedHashes][0];
+  const btn = document.getElementById(btnId);
+  const next = !(btn && btn.dataset.enabled === 'true');
+  await api(`/api/v1/torrents/${h}/${endpoint}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ enabled: next }),
+  });
+  showToast(`${label} ${next ? 'enabled' : 'disabled'}`, 'success');
+  updateInspector(h);
+}
+
+async function editTorrentCategory() {
+  if (selectedHashes.size !== 1) return;
+  const h = [...selectedHashes][0];
+  const cur = document.getElementById('det-category')?.innerText || '';
+  const next = window.prompt('Enter category (leave empty to clear):', cur === 'None' ? '' : cur);
+  if (next === null) return;
+  await api(`/api/v1/torrents/${h}/metadata`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ category: next.trim() || null }),
+  });
+  showToast('Category updated', 'success');
+  updateInspector(h);
+}
+
+async function exportTorrentFile() {
+  if (selectedHashes.size !== 1) return;
+  const h = [...selectedHashes][0];
+  const headers = {};
+  if (authToken) headers['Authorization'] = `Bearer ${authToken}`;
+  const resp = await fetch(`/api/v1/torrents/${h}/export`, { headers });
+  if (!resp.ok) {
+    showToast('Torrent metadata not available for export', 'error');
+    return;
+  }
+  const blob = await resp.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `${h}.torrent`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
 }
 
 // Add torrent handling
@@ -1804,6 +1912,12 @@ window.addEventListener('DOMContentLoaded', () => {
   document.getElementById('btn-save-settings').addEventListener('click', saveSettings);
   document.getElementById('btn-submit-add').addEventListener('click', submitAddTorrent);
   document.getElementById('btn-recheck-torrent').addEventListener('click', forceRecheck);
+  document.getElementById('btn-reannounce-torrent').addEventListener('click', reannounceTorrent);
+  document.getElementById('btn-sequential-torrent').addEventListener('click', () => toggleTorrentFlag('sequential', 'btn-sequential-torrent', 'Sequential'));
+  document.getElementById('btn-first-last-torrent').addEventListener('click', () => toggleTorrentFlag('first-last-priority', 'btn-first-last-torrent', 'First/Last priority'));
+  document.getElementById('btn-super-seed-torrent').addEventListener('click', () => toggleTorrentFlag('super-seed', 'btn-super-seed-torrent', 'Super-seeding'));
+  document.getElementById('btn-export-torrent').addEventListener('click', exportTorrentFile);
+  document.getElementById('btn-edit-category').addEventListener('click', editTorrentCategory);
   const btnClearToken = document.getElementById('btn-clear-token');
   if (btnClearToken) {
     btnClearToken.addEventListener('click', () => {

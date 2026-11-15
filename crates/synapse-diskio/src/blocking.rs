@@ -65,14 +65,15 @@ impl BlockingDiskEngine {
                 source: std::io::Error::new(std::io::ErrorKind::BrokenPipe, e),
             })?;
 
-        let mut tasks = Vec::with_capacity(jobs.len());
-        for job in jobs {
-            let cache = self.cache.clone();
-            tasks.push(tokio::task::spawn_blocking(move || write_one(&cache, job)));
-        }
-        for task in tasks {
-            task.await.expect("blocking disk write task panicked")?;
-        }
+        let cache = self.cache.clone();
+        tokio::task::spawn_blocking(move || {
+            for job in jobs {
+                write_one(&cache, job)?;
+            }
+            Ok::<_, DiskError>(())
+        })
+        .await
+        .expect("blocking disk write task panicked")?;
         Ok(())
     }
 

@@ -729,10 +729,30 @@ async fn main() -> std::process::ExitCode {
                     tracing::info!(target: LIFECYCLE_TARGET, "Skipping IPv6 bind_interfaces entry {entry}: enable_ipv6 is false");
                 }
                 Ok(ip) => listen_addrs.push(SocketAddr::new(ip, config.network.listen_port)),
-                Err(_) => tracing::warn!(
-                    target: LIFECYCLE_TARGET,
-                    "bind_interfaces entry {entry:?} is not an IP address and is ignored (interface names are not supported)"
-                ),
+                Err(_) => {
+                    let resolved = resolve_interface_ips(entry);
+                    if resolved.is_empty() {
+                        tracing::warn!(
+                            target: LIFECYCLE_TARGET,
+                            "bind_interfaces entry {entry:?} is neither an IP address nor an active interface with IP addresses; ignoring"
+                        );
+                    } else {
+                        for ip in resolved {
+                            if ip.is_ipv6() && !config.network.enable_ipv6 {
+                                tracing::info!(
+                                    target: LIFECYCLE_TARGET,
+                                    "Skipping resolved IPv6 address {ip} for interface {entry}: enable_ipv6 is false"
+                                );
+                            } else {
+                                tracing::info!(
+                                    target: LIFECYCLE_TARGET,
+                                    "Resolved bind_interfaces entry {entry:?} -> {ip}"
+                                );
+                                listen_addrs.push(SocketAddr::new(ip, config.network.listen_port));
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -1026,6 +1046,7 @@ async fn main() -> std::process::ExitCode {
         let http_auth = web_auth_token.clone();
         let metrics_enabled = config.metrics.enabled;
         let web_config = config.web.clone();
+        let allowed_hosts = config.http_api.allowed_hosts.clone();
         let mut http_shutdown = shutdown_rx.clone();
         tokio::spawn(async move {
             let web_enabled = web_config.enabled;
@@ -1034,6 +1055,7 @@ async fn main() -> std::process::ExitCode {
                 http_auth,
                 metrics_enabled,
                 web_config,
+                allowed_hosts,
             );
             tracing::info!(target: LIFECYCLE_TARGET, "🌐 REST API & Web Server listening on http://{}", http_addr);
             if web_enabled {
@@ -1057,9 +1079,12 @@ async fn main() -> std::process::ExitCode {
                             }
                         }
                     };
-                    if let Err(e) = axum::serve(listener, app)
-                        .with_graceful_shutdown(shutdown_signal)
-                        .await
+                    if let Err(e) = axum::serve(
+                        listener,
+                        app.into_make_service_with_connect_info::<SocketAddr>(),
+                    )
+                    .with_graceful_shutdown(shutdown_signal)
+                    .await
                     {
                         tracing::error!(target: LIFECYCLE_TARGET, "HTTP server error: {}", e);
                     }
@@ -1210,9 +1235,10 @@ async fn main() -> std::process::ExitCode {
 
     tracing::info!(
         target: LIFECYCLE_TARGET,
-        "Shutting down: stopping torrent actors and flushing state to disk (5s timeout)..."
+        "Shutting down: stopping torrent actors and flushing state to disk (15s timeout)..."
     );
     let shutdown_future = async {
+        swarm.announce_stopped_all().await;
         swarm.shutdown();
         swarm.flush_session().await;
         // Persist the DHT node id and known nodes, and give the gateway its port mappings back.
@@ -1220,11 +1246,11 @@ async fn main() -> std::process::ExitCode {
         swarm.release_port_mappings().await;
     };
 
-    if tokio::time::timeout(Duration::from_secs(5), shutdown_future)
+    if tokio::time::timeout(Duration::from_secs(15), shutdown_future)
         .await
         .is_err()
     {
-        tracing::warn!(target: LIFECYCLE_TARGET, "⚠️ Graceful shutdown timed out after 5s — forcing process exit.");
+        tracing::warn!(target: LIFECYCLE_TARGET, "⚠️ Graceful shutdown timed out after 15s — forcing process exit.");
     } else {
         tracing::info!(target: LIFECYCLE_TARGET, "✅ Session state flushed successfully. Daemon shutdown complete.");
     }
@@ -1491,6 +1517,27 @@ fn settings_from_config(config: &Config) -> synapse_engine::DynamicSessionSettin
     }
 }
 
+/// Resolves a network interface name (e.g. `wg0`, `tun0`) to its active IP addresses.
+/// Uses the `if-addrs` crate rather than hand-rolled `getifaddrs` FFI so this stays within
+/// the project's "no `unsafe` outside the io_uring submission call" invariant, and works on
+/// every platform `if-addrs` supports rather than just Unix.
+fn resolve_interface_ips(name: &str) -> Vec<std::net::IpAddr> {
+    let Ok(interfaces) = if_addrs::get_if_addrs() else {
+        return Vec::new();
+    };
+    let mut result = Vec::new();
+    for iface in interfaces {
+        if iface.name != name {
+            continue;
+        }
+        let ip = iface.ip();
+        if !result.contains(&ip) {
+            result.push(ip);
+        }
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1525,5 +1572,21 @@ mod tests {
         assert!(warnings.iter().any(|w| w.contains("rpc.auth_token")));
         assert!(warnings.iter().any(|w| w.contains("http_api.auth_token")));
         assert!(warnings.iter().any(|w| w.contains("privacy.paranoid_mode")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_interface_ips_finds_loopback_and_ignores_unknown() {
+        let lo_name = if cfg!(target_os = "macos") {
+            "lo0"
+        } else {
+            "lo"
+        };
+        let ips = resolve_interface_ips(lo_name);
+        assert!(
+            !ips.is_empty(),
+            "expected at least one IP on loopback interface {lo_name}"
+        );
+        assert!(resolve_interface_ips("nonexistent-iface-xyz-999").is_empty());
     }
 }

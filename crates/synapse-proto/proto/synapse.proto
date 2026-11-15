@@ -34,6 +34,12 @@ service SynapseControl {
   rpc ReannounceTorrents(TorrentHashesRequest) returns (CommandResponse);
   rpc ReplaceTrackers(ReplaceTrackersRequest) returns (CommandResponse);
   rpc ReloadIpFilter(Empty) returns (ReloadIpFilterResponse);
+
+  // Super-seeding, first/last piece priority, category/tags/seed-limit metadata, export
+  rpc SetSuperSeeding(SuperSeedingRequest) returns (CommandResponse);
+  rpc SetFirstLastPiecePriority(FirstLastPiecePriorityRequest) returns (CommandResponse);
+  rpc UpdateTorrentMetadata(UpdateTorrentMetadataRequest) returns (TorrentMetadataResponse);
+  rpc ExportTorrent(ExportTorrentRequest) returns (ExportTorrentResponse);
 }
 
 message Empty {}
@@ -103,6 +109,61 @@ message ReloadIpFilterResponse {
   uint32 rules = 1; // rules active after the reload
 }
 
+message SuperSeedingRequest {
+  repeated string hashes = 1;
+  bool enabled = 2;
+}
+
+message FirstLastPiecePriorityRequest {
+  repeated string hashes = 1;
+  bool enabled = 2;
+}
+
+// Wrapper types give a tri-state patch over a plain `optional` field: the wrapper message
+// itself absent means "leave unchanged"; present with no inner value means "clear"; present
+// with a value means "set to this value".
+message OptionalDouble {
+  optional double value = 1;
+}
+
+message OptionalUint64 {
+  optional uint64 value = 1;
+}
+
+// Present (even with an empty list) replaces the tag list; absent leaves tags unchanged.
+message TagsPatch {
+  repeated string tags = 1;
+}
+
+message UpdateTorrentMetadataRequest {
+  string hash = 1;
+  // Absent leaves the category unchanged; present + empty string clears it.
+  optional string category = 2;
+  TagsPatch tags = 3;
+  OptionalDouble seed_ratio_limit = 4;
+  OptionalUint64 seed_time_limit_secs = 5;
+}
+
+message TorrentMetadataResponse {
+  bool success = 1;
+  optional string error = 2;
+  optional string category = 3;
+  repeated string tags = 4;
+  optional double seed_ratio_limit = 5;
+  optional uint64 seed_time_limit_secs = 6;
+}
+
+message ExportTorrentRequest {
+  string hash = 1;
+}
+
+message ExportTorrentResponse {
+  bool success = 1;
+  optional string error = 2;
+  string filename = 3;
+  bytes torrent_bytes = 4;
+}
+
 enum TorrentState {
   STATE_STOPPED = 0;
   STATE_CHECKING = 1;
@@ -156,6 +217,16 @@ message TorrentSummary {
   // Carried by snapshots and "added" events; not by TorrentDelta (trackers rarely change, and
   // a change is re-sent as an "added" event).
   repeated string tracker_hosts = 18;
+  // User-assigned category; absent when unset.
+  optional string category = 19;
+  // User-assigned tags.
+  repeated string tags = 20;
+  // Per-torrent seed ratio limit; absent when unset (no limit).
+  optional double seed_ratio_limit = 21;
+  // Per-torrent seed/idle time limit in seconds; absent when unset (no limit).
+  optional uint64 seed_time_limit_secs = 22;
+  bool super_seeding = 23;
+  bool first_last_piece_priority = 24;
 }
 
 message TorrentDelta {

@@ -69,7 +69,15 @@ impl Bitfield {
     }
 
     pub fn count_ones(&self) -> usize {
-        self.data.iter().map(|b| b.count_ones() as usize).sum()
+        let (chunks, remainder) = self.data.as_chunks::<8>();
+        let mut count = 0usize;
+        for chunk in chunks {
+            count += u64::from_ne_bytes(*chunk).count_ones() as usize;
+        }
+        for b in remainder {
+            count += b.count_ones() as usize;
+        }
+        count
     }
 
     pub fn is_complete(&self) -> bool {

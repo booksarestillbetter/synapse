@@ -129,7 +129,8 @@ async fn test_web_interface_enabled_and_disabled_modes() {
         enabled: true,
         ..Default::default()
     };
-    let app_enabled = synapse_rpc::create_http_router_all(engine.clone(), None, true, web_cfg);
+    let app_enabled =
+        synapse_rpc::create_http_router_all(engine.clone(), None, true, web_cfg, Vec::new());
 
     // Root /
     let req = Request::builder().uri("/").body(Body::empty()).unwrap();
@@ -179,8 +180,13 @@ async fn test_web_interface_enabled_and_disabled_modes() {
         enabled: false,
         ..Default::default()
     };
-    let app_disabled =
-        synapse_rpc::create_http_router_all(engine.clone(), None, true, web_cfg_disabled);
+    let app_disabled = synapse_rpc::create_http_router_all(
+        engine.clone(),
+        None,
+        true,
+        web_cfg_disabled,
+        Vec::new(),
+    );
 
     let req_root_disabled = Request::builder().uri("/").body(Body::empty()).unwrap();
     let resp_root_disabled = app_disabled
@@ -312,6 +318,7 @@ async fn test_http_api_and_web_token_authentication() {
         Some("super-secret-token".to_string()),
         true,
         web_cfg,
+        Vec::new(),
     );
 
     // 1. Health check is public
@@ -587,4 +594,123 @@ async fn test_rss_feeds_http_endpoints() {
         .unwrap();
     let val3: serde_json::Value = serde_json::from_slice(&body3).unwrap();
     assert_eq!(val3["count"], 0);
+}
+
+#[tokio::test]
+async fn test_rest_parity_metadata_flags_export_and_ip_filter() {
+    let disk = Arc::new(diskio::DiskEngine::auto().await);
+    let engine = Arc::new(SwarmEngine::new(disk, [0x77; 20]));
+    let info = Arc::new(build_test_torrent("ParityTest"));
+    let hash_hex = hex::encode(info.hash);
+    let tmp = tempfile::tempdir().unwrap();
+    engine.add_torrent(info.clone(), tmp.path().to_path_buf(), None);
+
+    let app = synapse_rpc::create_http_router_all(
+        engine.clone(),
+        None,
+        false,
+        synapse_config::WebConfig::default(),
+        Vec::new(),
+    );
+
+    // 1. Toggle sequential, super-seed, and first-last-priority
+    for (endpoint, field) in [
+        ("sequential", "sequential"),
+        ("super-seed", "super_seeding"),
+        ("first-last-priority", "first_last_piece_priority"),
+    ] {
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/torrents/{hash_hex}/{endpoint}"))
+            .header("Content-Type", "application/json")
+            .body(Body::from(r#"{"enabled":true}"#))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "failed on {endpoint}");
+
+        let detail_req = Request::builder()
+            .uri(format!("/api/v1/torrents/{hash_hex}/detail"))
+            .body(Body::empty())
+            .unwrap();
+        let detail_resp = app.clone().oneshot(detail_req).await.unwrap();
+        assert_eq!(detail_resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(detail_resp.into_body(), 50_000)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(val[field], true, "{field} should be true");
+    }
+
+    // 2. PATCH metadata (category, tags, seed limits)
+    let meta_req = Request::builder()
+        .method("PATCH")
+        .uri(format!("/api/v1/torrents/{hash_hex}/metadata"))
+        .header("Content-Type", "application/json")
+        .body(Body::from(
+            r#"{"category":"linux","tags":["iso","lts"],"seed_ratio_limit":2.5,"seed_time_limit_secs":3600}"#,
+        ))
+        .unwrap();
+    let meta_resp = app.clone().oneshot(meta_req).await.unwrap();
+    assert_eq!(meta_resp.status(), StatusCode::OK);
+    let meta_body = axum::body::to_bytes(meta_resp.into_body(), 10_000)
+        .await
+        .unwrap();
+    let meta_val: serde_json::Value = serde_json::from_slice(&meta_body).unwrap();
+    assert_eq!(meta_val["metadata"]["category"], "linux");
+    assert_eq!(
+        meta_val["metadata"]["tags"],
+        serde_json::json!(["iso", "lts"])
+    );
+    assert_eq!(meta_val["metadata"]["seed_ratio_limit"], 2.5);
+    assert_eq!(meta_val["metadata"]["seed_time_limit_secs"], 3600);
+
+    // 3. Queue move
+    let qm_req = Request::builder()
+        .method("POST")
+        .uri(format!("/api/v1/torrents/{hash_hex}/queue-move"))
+        .header("Content-Type", "application/json")
+        .body(Body::from(r#"{"direction":"top"}"#))
+        .unwrap();
+    let qm_resp = app.clone().oneshot(qm_req).await.unwrap();
+    assert_eq!(qm_resp.status(), StatusCode::OK);
+
+    // 4. Export .torrent
+    let exp_req = Request::builder()
+        .uri(format!("/api/v1/torrents/{hash_hex}/export"))
+        .body(Body::empty())
+        .unwrap();
+    let exp_resp = app.clone().oneshot(exp_req).await.unwrap();
+    assert_eq!(exp_resp.status(), StatusCode::OK);
+    assert_eq!(
+        exp_resp.headers().get("content-type").unwrap(),
+        "application/x-bittorrent"
+    );
+    let exp_bytes = axum::body::to_bytes(exp_resp.into_body(), 100_000)
+        .await
+        .unwrap();
+    let parsed =
+        synapse_meta::Info::from_bencode(synapse_bencode::decode_buf(&exp_bytes).unwrap()).unwrap();
+    assert_eq!(parsed.hash, info.hash);
+
+    // 5. Reload IP filter
+    let ipf_req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/ip-filter/reload")
+        .body(Body::empty())
+        .unwrap();
+    let ipf_resp = app.clone().oneshot(ipf_req).await.unwrap();
+    assert_eq!(ipf_resp.status(), StatusCode::OK);
+
+    // 6. Per-torrent seed_ratio_limit auto-stops seeding torrent on reconcile_queue
+    let handle = engine.get_torrent(&info.hash).unwrap();
+    {
+        let mut s = handle.stats.write();
+        s.state = synapse_engine::SwarmState::Seeding;
+        s.ratio = 3.0;
+    }
+    engine.reconcile_queue();
+    assert_eq!(
+        handle.stats.read().state,
+        synapse_engine::SwarmState::Stopped
+    );
 }

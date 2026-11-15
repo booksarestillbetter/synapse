@@ -149,6 +149,20 @@ impl SynapseService {
             seen.insert(hash.clone());
             let mut new_summary = swarm_stats_to_summary(stats);
             new_summary.queue_position = positions.get(&stats.info_hash).copied().unwrap_or(0);
+            if let Some(handle) = engine.get_torrent(&stats.info_hash) {
+                let meta = handle.metadata.read();
+                new_summary.category = meta.category.clone();
+                new_summary.tags = meta.tags.clone();
+                new_summary.seed_ratio_limit = meta.seed_ratio_limit;
+                new_summary.seed_time_limit_secs = meta.seed_time_limit_secs;
+                drop(meta);
+                new_summary.super_seeding = handle
+                    .super_seeding
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                new_summary.first_last_piece_priority = handle
+                    .first_last_piece_priority
+                    .load(std::sync::atomic::Ordering::Relaxed);
+            }
 
             let existing = self.active_summaries.get(&hash).map(|r| r.value().clone());
 
@@ -263,6 +277,12 @@ fn swarm_stats_to_summary(s: &synapse_engine::SwarmStats) -> TorrentSummary {
         piece_size: s.piece_size,
         queue_position: 0,
         tracker_hosts: Vec::new(),
+        category: None,
+        tags: Vec::new(),
+        seed_ratio_limit: None,
+        seed_time_limit_secs: None,
+        super_seeding: false,
+        first_last_piece_priority: false,
     }
 }
 
@@ -446,7 +466,12 @@ impl SynapseControl for SynapseService {
         let rx = self.event_bus.subscribe();
         let live_stream = BroadcastStream::new(rx).filter_map(|res| match res {
             Ok(item) => Some(Ok(item)),
-            Err(_) => None,
+            Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(skipped)) => {
+                Some(Err(Status::resource_exhausted(format!(
+                    "torrent event stream lagged by {} events; resync required",
+                    skipped
+                ))))
+            }
         });
 
         let snapshot_stream = tokio_stream::iter(snapshot_events.into_iter().map(Ok));
@@ -936,6 +961,12 @@ impl SynapseControl for SynapseService {
             queue_position: 0,
             // Filled in by the next `sync_from_engine` pass (announce data isn't known yet).
             tracker_hosts: Vec::new(),
+            category: None,
+            tags: Vec::new(),
+            seed_ratio_limit: None,
+            seed_time_limit_secs: None,
+            super_seeding: false,
+            first_last_piece_priority: false,
         };
 
         self.upsert_torrent(summary);
@@ -1330,6 +1361,10 @@ impl SynapseControl for SynapseService {
                 "reannounce_v1",
                 "replace_trackers_v1",
                 "ip_filter_reload_v1",
+                "super_seeding_v1",
+                "first_last_piece_priority_v1",
+                "torrent_metadata_v1",
+                "torrent_export_v1",
             ]
             .map(String::from)
             .to_vec(),
@@ -1496,6 +1531,136 @@ impl SynapseControl for SynapseService {
         Ok(Response::new(ReloadIpFilterResponse {
             rules: rules as u32,
         }))
+    }
+
+    async fn set_super_seeding(
+        &self,
+        request: Request<SuperSeedingRequest>,
+    ) -> Result<Response<CommandResponse>, Status> {
+        self.verify_auth(&request)?;
+        let Some(ref engine) = self.swarm_engine else {
+            return Err(Status::unavailable("SwarmEngine not configured"));
+        };
+        let req = request.into_inner();
+        let mut missing = 0usize;
+        for h in &req.hashes {
+            let Some(hash) = parse_hash(h) else {
+                return Err(Status::invalid_argument("malformed info hash"));
+            };
+            if !engine.set_super_seeding(&hash, req.enabled) {
+                missing += 1;
+            }
+        }
+        if missing > 0 {
+            return Ok(command_result(
+                false,
+                format!("{missing} torrent(s) not found"),
+            ));
+        }
+        Ok(command_result(true, ""))
+    }
+
+    async fn set_first_last_piece_priority(
+        &self,
+        request: Request<FirstLastPiecePriorityRequest>,
+    ) -> Result<Response<CommandResponse>, Status> {
+        self.verify_auth(&request)?;
+        let Some(ref engine) = self.swarm_engine else {
+            return Err(Status::unavailable("SwarmEngine not configured"));
+        };
+        let req = request.into_inner();
+        let mut missing = 0usize;
+        for h in &req.hashes {
+            let Some(hash) = parse_hash(h) else {
+                return Err(Status::invalid_argument("malformed info hash"));
+            };
+            if !engine.set_first_last_piece_priority(&hash, req.enabled) {
+                missing += 1;
+            }
+        }
+        if missing > 0 {
+            return Ok(command_result(
+                false,
+                format!("{missing} torrent(s) not found"),
+            ));
+        }
+        Ok(command_result(true, ""))
+    }
+
+    async fn update_torrent_metadata(
+        &self,
+        request: Request<UpdateTorrentMetadataRequest>,
+    ) -> Result<Response<TorrentMetadataResponse>, Status> {
+        self.verify_auth(&request)?;
+        let Some(ref engine) = self.swarm_engine else {
+            return Err(Status::unavailable("SwarmEngine not configured"));
+        };
+        let req = request.into_inner();
+        let Some(hash) = parse_hash(&req.hash) else {
+            return Err(Status::invalid_argument("malformed info hash"));
+        };
+        let patch = synapse_engine::TorrentMetadataPatch {
+            category: req.category.map(|c| {
+                let t = c.trim().to_string();
+                if t.is_empty() {
+                    None
+                } else {
+                    Some(t)
+                }
+            }),
+            tags: req.tags.map(|t| t.tags),
+            seed_ratio_limit: req.seed_ratio_limit.map(|w| w.value),
+            seed_time_limit_secs: req.seed_time_limit_secs.map(|w| w.value),
+        };
+        match engine.set_torrent_metadata(&hash, patch) {
+            None => Ok(Response::new(TorrentMetadataResponse {
+                success: false,
+                error: Some("no such torrent".to_string()),
+                category: None,
+                tags: Vec::new(),
+                seed_ratio_limit: None,
+                seed_time_limit_secs: None,
+            })),
+            Some(updated) => {
+                self.sync_from_engine();
+                Ok(Response::new(TorrentMetadataResponse {
+                    success: true,
+                    error: None,
+                    category: updated.category,
+                    tags: updated.tags,
+                    seed_ratio_limit: updated.seed_ratio_limit,
+                    seed_time_limit_secs: updated.seed_time_limit_secs,
+                }))
+            }
+        }
+    }
+
+    async fn export_torrent(
+        &self,
+        request: Request<ExportTorrentRequest>,
+    ) -> Result<Response<ExportTorrentResponse>, Status> {
+        self.verify_auth(&request)?;
+        let Some(ref engine) = self.swarm_engine else {
+            return Err(Status::unavailable("SwarmEngine not configured"));
+        };
+        let req = request.into_inner();
+        let Some(hash) = parse_hash(&req.hash) else {
+            return Err(Status::invalid_argument("malformed info hash"));
+        };
+        match engine.export_torrent_bytes(&hash) {
+            None => Ok(Response::new(ExportTorrentResponse {
+                success: false,
+                error: Some("no such torrent, or it has no retrievable metainfo".to_string()),
+                filename: String::new(),
+                torrent_bytes: Vec::new(),
+            })),
+            Some((filename, bytes)) => Ok(Response::new(ExportTorrentResponse {
+                success: true,
+                error: None,
+                filename,
+                torrent_bytes: bytes,
+            })),
+        }
     }
 }
 

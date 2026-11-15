@@ -63,8 +63,17 @@ cargo fmt --all -- --check
 
 When writing or modifying code in Synapse 2.0, you must uphold the following architectural rules:
 
-1. **Zero Unsafe Outside `io_uring`**:
-   No `unsafe` blocks are permitted in any crate except for the Linux direct I/O ring submission call in `crates/synapse-diskio/src/uring.rs:314`. All other network, parsing, and buffer operations must use safe Rust with bounded slices (`bytes::Bytes`).
+1. **No Unsafe for Untrusted/Network Data**:
+   All parsing of `.torrent`/magnet/bencode data, peer wire messages, and anything else that
+   touches attacker-controlled bytes must use safe Rust with bounded slices (`bytes::Bytes`) —
+   no `unsafe` blocks, ever, in that path. `unsafe` is permitted outside that path only for a
+   small, fixed set of narrowly-scoped local OS-interop FFI calls, each with a `// SAFETY`
+   comment justifying it: the Linux direct I/O ring submission in `synapse-diskio/src/uring.rs`,
+   the `statvfs` free-space probe in `synapse-engine/src/fs.rs`, the `getrlimit`/`setrlimit`
+   file-descriptor tuning in `synapse-daemon/src/main.rs` (`tune_system_limits`), and nowhere
+   else — prefer a safe-Rust crate (as `resolve_interface_ips` does via `if-addrs`) over adding a
+   new one. A new unsafe block anywhere else is a defect; one of these four growing in scope or
+   a fifth appearing is a sign the design should be reconsidered, not just reviewed.
 
 2. **No Synchronous Locks Across `.await`**:
    `parking_lot::RwLock` and `parking_lot::Mutex` must only protect instant in-memory structures (e.g. counters, bitfields, endpoint maps) and must **never** be held across an asynchronous `.await` boundary.

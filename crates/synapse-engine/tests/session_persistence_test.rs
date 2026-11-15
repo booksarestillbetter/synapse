@@ -29,6 +29,7 @@ async fn test_session_persistence_save_load_remove() {
         file_priorities: Vec::new(),
         sequential: false,
         tracker_override: None,
+        ..Default::default()
     };
 
     // 1. Save
@@ -79,6 +80,7 @@ async fn test_session_store_encryption_isolation() {
         file_priorities: Vec::new(),
         sequential: false,
         tracker_override: None,
+        ..Default::default()
     };
     store1.save_torrent(&state).unwrap();
     drop(store1);
@@ -128,6 +130,7 @@ async fn test_legacy_json_auto_migration() {
         file_priorities: Vec::new(),
         sequential: false,
         tracker_override: None,
+        ..Default::default()
     };
 
     let legacy_file = torrents_dir.join(format!("{}.json", hex::encode(info_hash)));
@@ -169,6 +172,7 @@ async fn test_raw_bencode_hex_preservation_and_evicted_restore() {
         file_priorities: Vec::new(),
         sequential: false,
         tracker_override: None,
+        ..Default::default()
     };
 
     // 1. Initial save with raw_bencode_hex
@@ -233,6 +237,7 @@ async fn test_swarm_stats_and_paused_preserved_across_restarts() {
         file_priorities: Vec::new(),
         sequential: false,
         tracker_override: None,
+        ..Default::default()
     };
 
     store.save_torrent(&state).unwrap();
@@ -333,6 +338,7 @@ async fn file_priorities_survive_a_restart_and_part_file_data_counts_as_present(
             file_priorities: vec![4, 0],
             sequential: false,
             tracker_override: None,
+            ..Default::default()
         })
         .unwrap();
 

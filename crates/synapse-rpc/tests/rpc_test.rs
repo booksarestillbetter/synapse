@@ -37,6 +37,12 @@ async fn test_grpc_subscribe_torrents_and_delta_streaming() {
             piece_size: 10000,
             queue_position: 0,
             tracker_hosts: Vec::new(),
+            category: None,
+            tags: Vec::new(),
+            seed_ratio_limit: None,
+            seed_time_limit_secs: None,
+            super_seeding: false,
+            first_last_piece_priority: false,
         };
         service.upsert_torrent(summary);
     }

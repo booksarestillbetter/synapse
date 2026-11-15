@@ -397,6 +397,7 @@ pub struct HttpApiConfig {
     pub listen_addr: SocketAddr,
     pub cors_enabled: bool,
     pub auth_token: Option<String>,
+    pub allowed_hosts: Vec<String>,
 }
 
 impl Default for HttpApiConfig {
@@ -409,6 +410,7 @@ impl Default for HttpApiConfig {
             ),
             cors_enabled: true,
             auth_token: None,
+            allowed_hosts: Vec::new(),
         }
     }
 }

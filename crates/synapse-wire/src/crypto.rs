@@ -419,10 +419,12 @@ where
     let mut enc_a = Rc4Cipher::new(&key_a);
     let mut dec_b = Rc4Cipher::new(&key_b);
 
-    // crypto_provide: bit 0: Plaintext (0x01), bit 1: RC4 (0x02)
+    // Request RC4 in PreferEncrypted too: libtorrent/qBittorrent defaults to `prefer_rc4 = false`
+    // and downgrades `CRYPTO_PLAINTEXT | CRYPTO_RC4` to plaintext. Non-MSE peers fall back to
+    // plaintext at the `connect_stream` layer.
     let crypto_provide: u32 = match mode {
-        EncryptionMode::ForcedEncrypted => CRYPTO_RC4,
-        _ => CRYPTO_PLAINTEXT | CRYPTO_RC4,
+        EncryptionMode::ForcedEncrypted | EncryptionMode::PreferEncrypted => CRYPTO_RC4,
+        EncryptionMode::PlaintextOnly => CRYPTO_PLAINTEXT,
     };
 
     // Encrypt: VC (8 zeros) + crypto_provide (4 bytes) + len(PadC) (2 bytes = 0) + len(IA) (2 bytes) + IA
@@ -443,20 +445,39 @@ where
     stream.flush().await?;
 
     // Receive receiver response:
-    // Decrypt VC (8 bytes) + crypto_select (4 bytes) + len(PadD) (2 bytes) + PadD
-    let mut resp = [0u8; 14];
-    stream.read_exact(&mut resp).await?;
-    dec_b.apply_keystream(&mut resp);
+    // Yb was already read above; the peer may send 0..=512 bytes of unencrypted random PadB
+    // before ENCRYPT(VC (8 bytes) + crypto_select (4 bytes) + len(PadD) (2 bytes) + PadD).
+    let mut expected_vc = [0u8; 8];
+    dec_b.clone().apply_keystream(&mut expected_vc);
 
-    if resp[0..8] != [0u8; 8] {
+    let mut search_buf = [0u8; 512 + 8];
+    stream.read_exact(&mut search_buf[..8]).await?;
+    let mut filled = 8usize;
+    let mut matched = search_buf[..8] == expected_vc;
+    while !matched && filled < search_buf.len() {
+        let b = stream.read_u8().await?;
+        search_buf[filled] = b;
+        filled += 1;
+        if search_buf[filled - 8..filled] == expected_vc {
+            matched = true;
+        }
+    }
+    if !matched {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "MSE handshake verification failed (VC mismatch)",
         ));
     }
 
-    let crypto_select = u32::from_be_bytes([resp[8], resp[9], resp[10], resp[11]]);
-    let pad_d_len = u16::from_be_bytes([resp[12], resp[13]]) as usize;
+    // Advance dec_b past the 8-byte VC, then read and decrypt crypto_select (4) + len(PadD) (2).
+    let mut vc_advance = [0u8; 8];
+    dec_b.apply_keystream(&mut vc_advance);
+    let mut tail = [0u8; 6];
+    stream.read_exact(&mut tail).await?;
+    dec_b.apply_keystream(&mut tail);
+
+    let crypto_select = u32::from_be_bytes([tail[0], tail[1], tail[2], tail[3]]);
+    let pad_d_len = u16::from_be_bytes([tail[4], tail[5]]) as usize;
     if pad_d_len > 512 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -814,6 +835,124 @@ mod tests {
             mse_handshake_receiver(server_raw, EncryptionMode::ForcedEncrypted, |_| None).await;
         assert!(server_err.is_err());
         client_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn mse_initiator_handles_non_empty_pad_b() {
+        use tokio::io::AsyncReadExt;
+
+        let info_hash = [0x42u8; 20];
+        let (client_raw, mut server_raw) = tokio::io::duplex(4096);
+
+        let server_task = tokio::spawn(async move {
+            // Step 1: Read Ya (96 bytes)
+            let mut ya = [0u8; 96];
+            server_raw.read_exact(&mut ya).await.unwrap();
+
+            let dh = DhKeyPair::generate();
+            let secret = dh.compute_shared_secret(&ya);
+            let req1 = mse_req1(&secret);
+
+            // Step 2: Send Yb + 137 bytes of non-empty random PadB immediately
+            let mut step2 = Vec::with_capacity(96 + 137);
+            step2.extend_from_slice(&dh.public_key);
+            step2.extend(std::iter::repeat_n(0xA5u8, 137));
+            server_raw.write_all(&step2).await.unwrap();
+            server_raw.flush().await.unwrap();
+
+            // Step 3: Scan PadA for req1 and read the rest of Step 3
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 256];
+            let req1_pos = loop {
+                let n = server_raw.read(&mut tmp).await.unwrap();
+                assert!(n > 0);
+                buf.extend_from_slice(&tmp[..n]);
+                if let Some(pos) = buf.windows(20).position(|w| w == req1) {
+                    break pos;
+                }
+            };
+            while buf.len() < req1_pos + 40 + 14 {
+                let n = server_raw.read(&mut tmp).await.unwrap();
+                assert!(n > 0);
+                buf.extend_from_slice(&tmp[..n]);
+            }
+
+            let (_key_a, key_b) = mse_derive_keys(&secret, &info_hash);
+            let mut enc_b = Rc4Cipher::new(&key_b);
+
+            // Step 4: Send ENCRYPT(VC + crypto_select + len(PadD))
+            let mut resp = [0u8; 14];
+            resp[8..12].copy_from_slice(&2u32.to_be_bytes()); // RC4
+            resp[12..14].copy_from_slice(&0u16.to_be_bytes()); // len(PadD) = 0
+            enc_b.apply_keystream(&mut resp);
+
+            server_raw.write_all(&resp).await.unwrap();
+            server_raw.flush().await.unwrap();
+            server_raw
+        });
+
+        let client_stream =
+            mse_handshake_initiator(client_raw, info_hash, EncryptionMode::ForcedEncrypted, &[])
+                .await
+                .expect("MSE initiator should synchronize past PadB");
+        assert!(client_stream.is_encrypted());
+        let _server_raw = server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn mse_initiator_prefer_encrypted_requests_rc4_not_plaintext() {
+        use tokio::io::AsyncReadExt;
+
+        let info_hash = [0x24u8; 20];
+        let (client_raw, mut server_raw) = tokio::io::duplex(4096);
+
+        let server_task = tokio::spawn(async move {
+            let mut ya = [0u8; 96];
+            server_raw.read_exact(&mut ya).await.unwrap();
+
+            let dh = DhKeyPair::generate();
+            let secret = dh.compute_shared_secret(&ya);
+            let req1 = mse_req1(&secret);
+            server_raw.write_all(&dh.public_key).await.unwrap();
+            server_raw.flush().await.unwrap();
+
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 256];
+            let req1_pos = loop {
+                let n = server_raw.read(&mut tmp).await.unwrap();
+                buf.extend_from_slice(&tmp[..n]);
+                if let Some(pos) = buf.windows(20).position(|w| w == req1) {
+                    break pos;
+                }
+            };
+            while buf.len() < req1_pos + 40 + 14 {
+                let n = server_raw.read(&mut tmp).await.unwrap();
+                buf.extend_from_slice(&tmp[..n]);
+            }
+
+            let (key_a, key_b) = mse_derive_keys(&secret, &info_hash);
+            let mut dec_a = Rc4Cipher::new(&key_a);
+            let mut enc_b = Rc4Cipher::new(&key_b);
+            let mut enc_header = buf[req1_pos + 40..req1_pos + 40 + 14].to_vec();
+            dec_a.apply_keystream(&mut enc_header);
+            let crypto_provide =
+                u32::from_be_bytes([enc_header[8], enc_header[9], enc_header[10], enc_header[11]]);
+            assert_eq!(crypto_provide, CRYPTO_RC4);
+
+            let mut resp = [0u8; 14];
+            resp[8..12].copy_from_slice(&CRYPTO_RC4.to_be_bytes());
+            enc_b.apply_keystream(&mut resp);
+            server_raw.write_all(&resp).await.unwrap();
+            server_raw.flush().await.unwrap();
+            server_raw
+        });
+
+        let client_stream =
+            mse_handshake_initiator(client_raw, info_hash, EncryptionMode::PreferEncrypted, &[])
+                .await
+                .expect("PreferEncrypted MSE handshake should succeed with RC4");
+        assert!(client_stream.is_encrypted());
+        let _server_raw = server_task.await.unwrap();
     }
 
     #[test]
