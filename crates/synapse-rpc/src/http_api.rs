@@ -5,7 +5,7 @@
 use crate::metrics::{render_prometheus_metrics, PrometheusSnapshot};
 use crate::swagger::{get_swagger_ui_html, OPENAPI_JSON};
 use axum::{
-    extract::{Path, Query, Request, State},
+    extract::{DefaultBodyLimit, Path, Query, Request, State},
     http::{header, StatusCode},
     middleware::{self, Next},
     response::{Html, IntoResponse, Response},
@@ -14,13 +14,22 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use synapse_engine::SwarmEngine;
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct AuthRateLimiter {
     inner: Arc<parking_lot::Mutex<HashMap<String, (u32, Instant)>>>,
+    max_failures: u32,
+    total_failures: Arc<AtomicU64>,
+}
+
+impl Default for AuthRateLimiter {
+    fn default() -> Self {
+        Self::with_max_failures(Self::MAX_FAILURES)
+    }
 }
 
 impl AuthRateLimiter {
@@ -28,12 +37,24 @@ impl AuthRateLimiter {
     const MAX_FAILURES: u32 = 15;
     const MAX_KEYS: usize = 4096;
 
+    pub fn with_max_failures(max_failures: u32) -> Self {
+        Self {
+            inner: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            max_failures,
+            total_failures: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    pub fn total_failures(&self) -> u64 {
+        self.total_failures.load(Ordering::Relaxed)
+    }
+
     pub fn is_blocked(&self, key: &str) -> bool {
         let mut guard = self.inner.lock();
         let now = Instant::now();
         if let Some((count, start)) = guard.get(key) {
             if now.duration_since(*start) < Self::WINDOW {
-                return *count >= Self::MAX_FAILURES;
+                return *count >= self.max_failures;
             }
             guard.remove(key);
         }
@@ -41,6 +62,7 @@ impl AuthRateLimiter {
     }
 
     pub fn record_failure(&self, key: &str) {
+        self.total_failures.fetch_add(1, Ordering::Relaxed);
         let mut guard = self.inner.lock();
         let now = Instant::now();
         if guard.len() >= Self::MAX_KEYS {
@@ -72,6 +94,7 @@ pub struct ApiState {
     pub base_download_dir: std::path::PathBuf,
     pub rate_limiter: AuthRateLimiter,
     pub allowed_hosts: Vec<String>,
+    pub trusted_proxies: Vec<std::net::IpAddr>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]
@@ -88,6 +111,8 @@ pub struct UploadTorrentQuery {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SetLocationRequest {
     pub new_download_dir: String,
+    #[serde(default)]
+    pub move_existing_files: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -107,6 +132,26 @@ pub struct HealthResponse {
     pub status: String,
     pub version: String,
     pub features: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LivenessResponse {
+    pub status: String,
+    pub version: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ReadinessChecks {
+    pub download_dir: bool,
+    pub session_db: bool,
+    pub listener: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ReadinessResponse {
+    pub status: String,
+    pub version: String,
+    pub checks: ReadinessChecks,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -169,8 +214,12 @@ pub struct SessionSettingsApiResponse {
     pub max_peers_per_torrent: usize,
     pub max_global_peers: usize,
     pub dht_enabled: bool,
+    pub dht_read_only: bool,
     pub pex_enabled: bool,
     pub lsd_enabled: bool,
+    pub zeroconf_enabled: bool,
+    pub announce_ip: Option<String>,
+    pub enable_utp: bool,
     pub encryption: String,
 
     pub download_dir: String,
@@ -178,6 +227,43 @@ pub struct SessionSettingsApiResponse {
     pub incomplete_dir_enabled: bool,
     pub start_added_torrents: bool,
     pub trash_original_torrent_files: bool,
+
+    pub unchoke_slots_global: usize,
+    pub seed_choking_algorithm: String,
+    pub unchoke_slot_bandwidth: u64,
+    pub limit_lan_peers: bool,
+    pub rate_limit_ip_overhead: bool,
+    pub max_concurrent_tracker_announces: usize,
+    pub max_concurrent_dht_announces: usize,
+    pub max_concurrent_lsd_announces: usize,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BatchHashesRequest {
+    pub hashes: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BatchRemoveRequest {
+    pub hashes: Vec<String>,
+    #[serde(default)]
+    pub delete_data: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BatchActionResponse {
+    pub success: bool,
+    pub succeeded: usize,
+    pub failed_hashes: Vec<String>,
+    pub message: String,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct TorrentStreamQuery {
+    pub page: Option<usize>,
+    pub limit: Option<usize>,
+    pub state: Option<String>,
+    pub interval_ms: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -224,6 +310,31 @@ pub fn create_http_router_all(
     web_config: synapse_config::WebConfig,
     allowed_hosts: Vec<String>,
 ) -> Router {
+    create_http_router_with_options(
+        engine,
+        auth_token,
+        metrics_enabled,
+        web_config,
+        allowed_hosts,
+        Vec::new(),
+        AuthRateLimiter::default(),
+    )
+}
+
+const DEFAULT_API_BODY_LIMIT: usize = 64 * 1024;
+const BATCH_API_BODY_LIMIT: usize = 1024 * 1024;
+const UPLOAD_TORRENT_BODY_LIMIT: usize = 11 * 1024 * 1024;
+const ADD_TORRENT_JSON_BODY_LIMIT: usize = 14 * 1024 * 1024;
+
+pub fn create_http_router_with_options(
+    engine: Arc<SwarmEngine>,
+    auth_token: Option<String>,
+    metrics_enabled: bool,
+    web_config: synapse_config::WebConfig,
+    allowed_hosts: Vec<String>,
+    trusted_proxies: Vec<std::net::IpAddr>,
+    rate_limiter: AuthRateLimiter,
+) -> Router {
     let base_download_dir = engine.settings().read().download_dir.clone();
     let auth_token = auth_token.filter(|t| !t.trim().is_empty());
     let state = ApiState {
@@ -231,21 +342,17 @@ pub fn create_http_router_all(
         auth_token,
         web_config: web_config.clone(),
         base_download_dir,
-        rate_limiter: AuthRateLimiter::default(),
+        rate_limiter,
         allowed_hosts,
+        trusted_proxies,
     };
 
-    let protected = Router::new()
+    let standard_routes = Router::new()
         .route(
             "/api/v1/session",
             get(get_session_settings_handler).patch(update_session_settings_handler),
         )
         .route("/api/v1/session/stats", get(session_stats_handler))
-        .route(
-            "/api/v1/torrents",
-            get(list_torrents_handler).post(add_torrent_handler),
-        )
-        .route("/api/v1/torrents/upload", post(upload_torrent_handler))
         .route(
             "/api/v1/torrents/:info_hash",
             get(get_torrent_handler).delete(delete_torrent_handler),
@@ -347,9 +454,48 @@ pub fn create_http_router_all(
                 .delete(remove_rss_feed_handler),
         )
         .route("/api/v1/rss/poll", post(poll_rss_feeds_handler))
+        .route("/api/v1/torrents/stream", get(torrents_stream_handler))
+        .layer(DefaultBodyLimit::max(DEFAULT_API_BODY_LIMIT));
+
+    let batch_routes = Router::new()
+        .route(
+            "/api/v1/torrents/batch/pause",
+            post(batch_pause_torrents_handler),
+        )
+        .route(
+            "/api/v1/torrents/batch/resume",
+            post(batch_resume_torrents_handler),
+        )
+        .route(
+            "/api/v1/torrents/batch/remove",
+            post(batch_remove_torrents_handler),
+        )
+        .route(
+            "/api/v1/torrents/batch/recheck",
+            post(batch_recheck_torrents_handler),
+        )
+        .layer(DefaultBodyLimit::max(BATCH_API_BODY_LIMIT));
+
+    let add_route = Router::new()
+        .route(
+            "/api/v1/torrents",
+            get(list_torrents_handler).post(add_torrent_handler),
+        )
+        .layer(DefaultBodyLimit::max(ADD_TORRENT_JSON_BODY_LIMIT));
+
+    let upload_route = Router::new()
+        .route("/api/v1/torrents/upload", post(upload_torrent_handler))
+        .layer(DefaultBodyLimit::max(UPLOAD_TORRENT_BODY_LIMIT));
+
+    let protected = standard_routes
+        .merge(batch_routes)
+        .merge(add_route)
+        .merge(upload_route)
         .route_layer(middleware::from_fn_with_state(state.clone(), require_auth));
 
     let mut public = Router::new()
+        .route("/healthz", get(healthz_handler))
+        .route("/readyz", get(readyz_handler))
         .route("/api/v1/health", get(health_handler))
         .route("/api-docs/openapi.json", get(openapi_json_handler))
         .route("/swagger-ui", get(swagger_ui_handler));
@@ -367,6 +513,8 @@ pub fn create_http_router_all(
             .route("/app.js", get(crate::web::web_js_handler))
             .route("/favicon.ico", get(crate::web::web_favicon_handler));
     }
+
+    let public = public.layer(DefaultBodyLimit::max(DEFAULT_API_BODY_LIMIT));
 
     protected.merge(public).with_state(state)
 }
@@ -416,6 +564,7 @@ async fn alerts_stream_handler(
         ))?),
         None => None,
     };
+    let lag_engine = state.engine.clone();
     let stream =
         BroadcastStream::new(state.engine.subscribe_alerts()).filter_map(move |item| match item {
             Ok(alert) => {
@@ -426,9 +575,12 @@ async fn alerts_stream_handler(
                 let name = json["type"].as_str().unwrap_or("alert").to_string();
                 Some(Ok(Event::default().event(name).data(json.to_string())))
             }
-            Err(BroadcastStreamRecvError::Lagged(skipped)) => Some(Ok(Event::default()
-                .event("lagged")
-                .data(serde_json::json!({ "skipped": skipped }).to_string()))),
+            Err(BroadcastStreamRecvError::Lagged(skipped)) => {
+                lag_engine.record_event_bus_lag(skipped);
+                Some(Ok(Event::default()
+                    .event("lagged")
+                    .data(serde_json::json!({ "skipped": skipped }).to_string())))
+            }
         });
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
@@ -438,20 +590,18 @@ fn parse_info_hash_hex(s: &str) -> Option<[u8; 20]> {
     hex::decode(s).ok()?.try_into().ok()
 }
 
-/// Constant-time byte slice comparison that rejects empty secrets/tokens and avoids
-/// length or byte-position timing side-channels.
+/// Constant-time comparison over SHA-256 digests so neither byte content nor secret
+/// length leaks through comparison timing, rejecting empty secrets/tokens.
 pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    use sha2::{Digest, Sha256};
+    use subtle::ConstantTimeEq;
+
     if a.is_empty() || b.is_empty() {
         return false;
     }
-    let max_len = a.len().max(b.len());
-    let mut diff = a.len() ^ b.len();
-    for i in 0..max_len {
-        let byte_a = a.get(i).copied().unwrap_or(0);
-        let byte_b = b.get(i).copied().unwrap_or(0);
-        diff |= (byte_a ^ byte_b) as usize;
-    }
-    diff == 0
+    let da = Sha256::digest(a);
+    let db = Sha256::digest(b);
+    da.ct_eq(&db).into()
 }
 
 fn canonicalize_with_nonexistent_tail(
@@ -560,14 +710,24 @@ pub fn is_safe_single_component_name(name: &str) -> bool {
     matches!(comps.next(), Some(std::path::Component::Normal(_))) && comps.next().is_none()
 }
 
-fn strip_host_port(host_hdr: &str) -> &str {
+fn parse_host_and_port(host_hdr: &str) -> (&str, Option<u16>) {
     let trimmed = host_hdr.trim();
     if let Some(rest) = trimmed.strip_prefix('[') {
         if let Some(end) = rest.find(']') {
-            return &trimmed[..=end + 1];
+            let host = &trimmed[..=end + 1];
+            let after = &rest[end + 1..];
+            let port = after.strip_prefix(':').and_then(|p| p.parse::<u16>().ok());
+            return (host, port);
         }
     }
-    trimmed.rsplit_once(':').map(|(h, _)| h).unwrap_or(trimmed)
+    if let Some((h, p)) = trimmed.rsplit_once(':') {
+        if !h.contains(':') {
+            if let Ok(port) = p.parse::<u16>() {
+                return (h, Some(port));
+            }
+        }
+    }
+    (trimmed, None)
 }
 
 fn is_loopback_host(host: &str) -> bool {
@@ -584,8 +744,15 @@ fn is_allowed_host(host: &str, allowed_hosts: &[String]) -> bool {
     is_loopback_host(host) || allowed_hosts.iter().any(|h| h.eq_ignore_ascii_case(host))
 }
 
-fn is_trusted_proxy_ip(ip: std::net::IpAddr) -> bool {
+pub(crate) fn canonical_ip(ip: std::net::IpAddr) -> std::net::IpAddr {
     match ip {
+        std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped().map(std::net::IpAddr::V4).unwrap_or(ip),
+        v4 => v4,
+    }
+}
+
+fn is_internal_proxy_hop(ip: std::net::IpAddr) -> bool {
+    match canonical_ip(ip) {
         std::net::IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
         std::net::IpAddr::V6(v6) => {
             v6.is_loopback() || v6.is_unique_local() || v6.is_unicast_link_local()
@@ -593,19 +760,25 @@ fn is_trusted_proxy_ip(ip: std::net::IpAddr) -> bool {
     }
 }
 
-/// Identifies the real caller for rate-limiting. `X-Forwarded-For` is only honored when the
-/// direct peer is itself a trusted proxy (loopback/private/link-local); a trusted proxy appends
-/// the IP *it* observed to the end of the list, so we walk from the right and take the first
-/// entry that isn't itself another trusted-proxy hop — the client-supplied prefix is otherwise
-/// fully attacker-controlled and must never be trusted as-is.
-fn extract_client_ip(req: &Request) -> String {
+fn is_trusted_proxy(ip: std::net::IpAddr, trusted_proxies: &[std::net::IpAddr]) -> bool {
+    let canonical = canonical_ip(ip);
+    trusted_proxies
+        .iter()
+        .any(|&p| canonical_ip(p) == canonical)
+}
+
+/// Identifies the real caller for rate-limiting. `X-Forwarded-For` is ONLY honored when the
+/// direct peer is explicitly listed in `trusted_proxies` (canonicalizing IPv4-mapped IPv6
+/// addresses); walking right-to-left skips configured/internal proxy hops to find the real
+/// client address.
+fn extract_client_ip(req: &Request, trusted_proxies: &[std::net::IpAddr]) -> String {
     let peer_ip = req
         .extensions()
         .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
-        .map(|ci| ci.0.ip());
+        .map(|ci| canonical_ip(ci.0.ip()));
 
     if let Some(ip) = peer_ip {
-        if is_trusted_proxy_ip(ip) {
+        if is_trusted_proxy(ip, trusted_proxies) {
             if let Some(xff) = req
                 .headers()
                 .get("x-forwarded-for")
@@ -613,7 +786,10 @@ fn extract_client_ip(req: &Request) -> String {
             {
                 for candidate in xff.split(',').rev().map(str::trim) {
                     if let Ok(parsed) = candidate.parse::<std::net::IpAddr>() {
-                        if !is_trusted_proxy_ip(parsed) {
+                        let parsed = canonical_ip(parsed);
+                        if !is_trusted_proxy(parsed, trusted_proxies)
+                            && !is_internal_proxy_hop(parsed)
+                        {
                             return parsed.to_string();
                         }
                     }
@@ -632,6 +808,22 @@ fn verify_same_origin_csrf(
     allowed_hosts: &[String],
 ) -> Result<(), StatusCode> {
     use axum::http::Method;
+
+    // Enforce Host DNS-rebinding check on ALL HTTP methods (including GET/HEAD/OPTIONS)
+    // whenever the server is unauthenticated.
+    if require_loopback_host {
+        if let Some(host_hdr) = req
+            .headers()
+            .get(header::HOST)
+            .and_then(|v| v.to_str().ok())
+        {
+            let (host_only, _) = parse_host_and_port(host_hdr);
+            if !is_allowed_host(host_only, allowed_hosts) {
+                return Err(StatusCode::FORBIDDEN);
+            }
+        }
+    }
+
     if !matches!(
         *req.method(),
         Method::POST | Method::PUT | Method::PATCH | Method::DELETE
@@ -649,18 +841,6 @@ fn verify_same_origin_csrf(
         }
     }
 
-    if require_loopback_host {
-        if let Some(host_hdr) = req
-            .headers()
-            .get(header::HOST)
-            .and_then(|v| v.to_str().ok())
-        {
-            if !is_allowed_host(strip_host_port(host_hdr), allowed_hosts) {
-                return Err(StatusCode::FORBIDDEN);
-            }
-        }
-    }
-
     let origin_or_referer = req
         .headers()
         .get(header::ORIGIN)
@@ -674,22 +854,28 @@ fn verify_same_origin_csrf(
         }
         let parsed = url::Url::parse(trimmed).map_err(|_| StatusCode::FORBIDDEN)?;
         let origin_host = parsed.host_str().ok_or(StatusCode::FORBIDDEN)?;
-        let origin_authority = match parsed.port() {
-            Some(p) => format!("{origin_host}:{p}"),
-            None => origin_host.to_string(),
-        };
+        let origin_port = parsed.port_or_known_default();
 
         if let Some(host_hdr) = req
             .headers()
             .get(header::HOST)
             .and_then(|v| v.to_str().ok())
         {
-            let host_trimmed = host_hdr.trim();
-            let host_only = strip_host_port(host_trimmed);
-            if !origin_authority.eq_ignore_ascii_case(host_trimmed)
-                && !origin_host.eq_ignore_ascii_case(host_only)
-            {
+            let (host_only, host_port) = parse_host_and_port(host_hdr);
+            if !origin_host.eq_ignore_ascii_case(host_only) {
                 return Err(StatusCode::FORBIDDEN);
+            }
+            match host_port {
+                Some(hp) => {
+                    if origin_port != Some(hp) {
+                        return Err(StatusCode::FORBIDDEN);
+                    }
+                }
+                None => {
+                    if parsed.port().is_some() && !matches!(origin_port, Some(80) | Some(443)) {
+                        return Err(StatusCode::FORBIDDEN);
+                    }
+                }
             }
         } else if !is_allowed_host(origin_host, allowed_hosts) {
             return Err(StatusCode::FORBIDDEN);
@@ -709,7 +895,7 @@ async fn require_auth(
     let Some(ref expected) = state.auth_token else {
         return Ok(next.run(req).await);
     };
-    let client_key = extract_client_ip(&req);
+    let client_key = extract_client_ip(&req, &state.trusted_proxies);
     if state.rate_limiter.is_blocked(&client_key) {
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
@@ -732,6 +918,52 @@ async fn require_auth(
         return Err(StatusCode::UNAUTHORIZED);
     }
     Ok(next.run(req).await)
+}
+
+async fn healthz_handler() -> (StatusCode, Json<LivenessResponse>) {
+    (
+        StatusCode::OK,
+        Json(LivenessResponse {
+            status: "ok".to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+        }),
+    )
+}
+
+async fn readyz_handler(State(state): State<ApiState>) -> (StatusCode, Json<ReadinessResponse>) {
+    let configured_dir = state.engine.settings().read().download_dir.clone();
+    let download_dir_path = if configured_dir.as_os_str().is_empty() {
+        state.base_download_dir.clone()
+    } else {
+        configured_dir
+    };
+    let download_dir = tokio::fs::metadata(&download_dir_path)
+        .await
+        .map(|m| m.is_dir())
+        .unwrap_or(false);
+    let session_db = state.engine.is_session_store_healthy().await;
+    let listener = !state.engine.is_listener_required() || state.engine.listen_port() != 0;
+    let ready = download_dir && session_db && listener;
+    (
+        if ready {
+            StatusCode::OK
+        } else {
+            StatusCode::SERVICE_UNAVAILABLE
+        },
+        Json(ReadinessResponse {
+            status: if ready {
+                "ready".to_string()
+            } else {
+                "not_ready".to_string()
+            },
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            checks: ReadinessChecks {
+                download_dir,
+                session_db,
+                listener,
+            },
+        }),
+    )
 }
 
 async fn health_handler(State(state): State<ApiState>) -> (StatusCode, Json<HealthResponse>) {
@@ -848,8 +1080,12 @@ async fn get_session_settings_handler(
         max_peers_per_torrent: s.max_peers_per_torrent,
         max_global_peers: s.max_global_peers,
         dht_enabled: s.dht_enabled,
+        dht_read_only: s.dht_read_only,
         pex_enabled: s.pex_enabled,
         lsd_enabled: s.lsd_enabled,
+        zeroconf_enabled: s.zeroconf_enabled,
+        announce_ip: s.announce_ip.map(|ip| ip.to_string()),
+        enable_utp: s.enable_utp,
         encryption: s.encryption,
 
         download_dir: s.download_dir.to_string_lossy().into_owned(),
@@ -857,43 +1093,62 @@ async fn get_session_settings_handler(
         incomplete_dir_enabled: s.incomplete_dir_enabled,
         start_added_torrents: s.start_added_torrents,
         trash_original_torrent_files: s.trash_original_torrent_files,
+
+        unchoke_slots_global: s.unchoke_slots_global,
+        seed_choking_algorithm: s.seed_choking_algorithm,
+        unchoke_slot_bandwidth: s.unchoke_slot_bandwidth,
+        limit_lan_peers: s.limit_lan_peers,
+        rate_limit_ip_overhead: s.rate_limit_ip_overhead,
+        max_concurrent_tracker_announces: s.max_concurrent_tracker_announces,
+        max_concurrent_dht_announces: s.max_concurrent_dht_announces,
+        max_concurrent_lsd_announces: s.max_concurrent_lsd_announces,
     })
 }
 
 async fn update_session_settings_handler(
     State(state): State<ApiState>,
-    Json(payload): Json<synapse_engine::SessionSettingsUpdate>,
+    Json(mut payload): Json<synapse_engine::SessionSettingsUpdate>,
 ) -> Result<Json<UpdateSessionSettingsResponse>, (StatusCode, Json<UpdateSessionSettingsResponse>)>
 {
     if let Some(ref dl_dir) = payload.download_dir {
         if !dl_dir.trim().is_empty() {
-            if let Err(msg) = validate_path_under_base(
+            match validate_path_under_base(
                 &state.base_download_dir,
                 std::path::Path::new(dl_dir.trim()),
             ) {
-                return Err((
-                    StatusCode::FORBIDDEN,
-                    Json(UpdateSessionSettingsResponse {
-                        success: false,
-                        warnings: vec![format!("download_dir rejected: {msg}")],
-                    }),
-                ));
+                Ok(canonical) => {
+                    payload.download_dir = Some(canonical.to_string_lossy().into_owned());
+                }
+                Err(msg) => {
+                    return Err((
+                        StatusCode::FORBIDDEN,
+                        Json(UpdateSessionSettingsResponse {
+                            success: false,
+                            warnings: vec![format!("download_dir rejected: {msg}")],
+                        }),
+                    ));
+                }
             }
         }
     }
     if let Some(ref inc_dir) = payload.incomplete_dir {
         if !inc_dir.trim().is_empty() {
-            if let Err(msg) = validate_path_under_base(
+            match validate_path_under_base(
                 &state.base_download_dir,
                 std::path::Path::new(inc_dir.trim()),
             ) {
-                return Err((
-                    StatusCode::FORBIDDEN,
-                    Json(UpdateSessionSettingsResponse {
-                        success: false,
-                        warnings: vec![format!("incomplete_dir rejected: {msg}")],
-                    }),
-                ));
+                Ok(canonical) => {
+                    payload.incomplete_dir = Some(canonical.to_string_lossy().into_owned());
+                }
+                Err(msg) => {
+                    return Err((
+                        StatusCode::FORBIDDEN,
+                        Json(UpdateSessionSettingsResponse {
+                            success: false,
+                            warnings: vec![format!("incomplete_dir rejected: {msg}")],
+                        }),
+                    ));
+                }
             }
         }
     }
@@ -904,63 +1159,218 @@ async fn update_session_settings_handler(
     }))
 }
 
-async fn session_stats_handler(State(state): State<ApiState>) -> Json<serde_json::Value> {
-    let m = state.engine.global_metrics();
-    let dht_nodes = state.engine.dht_node_count().await;
+#[derive(Serialize)]
+struct SessionStatsResponse {
+    total_torrents: usize,
+    downloading_torrents: usize,
+    seeding_torrents: usize,
+    paused_torrents: usize,
+    queued_torrents: usize,
+    downloaded_bytes: u64,
+    uploaded_bytes: u64,
+    download_rate: u64,
+    upload_rate: u64,
+    peers_connected: usize,
+    active_actors: usize,
+    free_disk_space_bytes: u64,
+    dht_nodes: usize,
+    dht_enabled: bool,
+    pex_enabled: bool,
+    lsd_enabled: bool,
+    version: &'static str,
+}
+
+#[derive(Clone, Serialize)]
+struct TorrentListItem {
+    info_hash: String,
+    name: String,
+    total_bytes: u64,
+    progress: f32,
+    download_rate: u64,
+    upload_rate: u64,
+    downloaded_bytes: u64,
+    uploaded_bytes: u64,
+    peers_connected: usize,
+    peers_sending: usize,
+    eta_seconds: u64,
+    ratio: f32,
+    download_dir: String,
+    state: String,
+    tier: String,
+    category: Option<String>,
+    tags: Vec<String>,
+    seed_ratio_limit: Option<f64>,
+    seed_time_limit_secs: Option<u64>,
+    sequential: bool,
+    super_seeding: bool,
+    first_last_piece_priority: bool,
+}
+
+#[derive(Serialize)]
+struct TorrentListDelta {
+    info_hash: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    total_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    progress: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    download_rate: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    upload_rate: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    downloaded_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    uploaded_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    peers_connected: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    peers_sending: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    eta_seconds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ratio: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    download_dir: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    state: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tier: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    category: Option<Option<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tags: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    seed_ratio_limit: Option<Option<f64>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    seed_time_limit_secs: Option<Option<u64>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sequential: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    super_seeding: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    first_last_piece_priority: Option<bool>,
+}
+
+fn compute_item_delta(prev: &TorrentListItem, curr: &TorrentListItem) -> Option<TorrentListDelta> {
+    let mut changed = false;
+    macro_rules! diff_field {
+        ($field:ident, $cond:expr) => {
+            if $cond {
+                changed = true;
+                Some(curr.$field.clone())
+            } else {
+                None
+            }
+        };
+    }
+
+    let delta = TorrentListDelta {
+        info_hash: curr.info_hash.clone(),
+        name: diff_field!(name, prev.name != curr.name),
+        total_bytes: diff_field!(total_bytes, prev.total_bytes != curr.total_bytes),
+        progress: diff_field!(progress, prev.progress.to_bits() != curr.progress.to_bits()),
+        download_rate: diff_field!(download_rate, prev.download_rate != curr.download_rate),
+        upload_rate: diff_field!(upload_rate, prev.upload_rate != curr.upload_rate),
+        downloaded_bytes: diff_field!(
+            downloaded_bytes,
+            prev.downloaded_bytes != curr.downloaded_bytes
+        ),
+        uploaded_bytes: diff_field!(uploaded_bytes, prev.uploaded_bytes != curr.uploaded_bytes),
+        peers_connected: diff_field!(
+            peers_connected,
+            prev.peers_connected != curr.peers_connected
+        ),
+        peers_sending: diff_field!(peers_sending, prev.peers_sending != curr.peers_sending),
+        eta_seconds: diff_field!(eta_seconds, prev.eta_seconds != curr.eta_seconds),
+        ratio: diff_field!(ratio, prev.ratio.to_bits() != curr.ratio.to_bits()),
+        download_dir: diff_field!(download_dir, prev.download_dir != curr.download_dir),
+        state: diff_field!(state, prev.state != curr.state),
+        tier: diff_field!(tier, prev.tier != curr.tier),
+        category: diff_field!(category, prev.category != curr.category),
+        tags: diff_field!(tags, prev.tags != curr.tags),
+        seed_ratio_limit: diff_field!(
+            seed_ratio_limit,
+            prev.seed_ratio_limit.map(f64::to_bits) != curr.seed_ratio_limit.map(f64::to_bits)
+        ),
+        seed_time_limit_secs: diff_field!(
+            seed_time_limit_secs,
+            prev.seed_time_limit_secs != curr.seed_time_limit_secs
+        ),
+        sequential: diff_field!(sequential, prev.sequential != curr.sequential),
+        super_seeding: diff_field!(super_seeding, prev.super_seeding != curr.super_seeding),
+        first_last_piece_priority: diff_field!(
+            first_last_piece_priority,
+            prev.first_last_piece_priority != curr.first_last_piece_priority
+        ),
+    };
+
+    changed.then_some(delta)
+}
+
+#[derive(Serialize)]
+struct TorrentListResponse {
+    torrents: Vec<TorrentListItem>,
+    total: usize,
+    page: usize,
+    limit: usize,
+}
+
+async fn build_session_stats_response(engine: &SwarmEngine) -> SessionStatsResponse {
+    let m = engine.global_metrics();
+    let dht_nodes = engine.dht_node_count_fast();
     let (dht_enabled, pex_enabled, lsd_enabled) = {
-        let s = state.engine.settings().read().clone();
+        let settings = engine.settings();
+        let s = settings.read();
         (s.dht_enabled, s.pex_enabled, s.lsd_enabled)
     };
 
-    Json(serde_json::json!({
-        "total_torrents": m.total_torrents,
-        "downloading_torrents": m.downloading_torrents,
-        "seeding_torrents": m.seeding_torrents,
-        "paused_torrents": m.paused_torrents,
-        "queued_torrents": m.queued_torrents,
-        "downloaded_bytes": m.downloaded_bytes,
-        "uploaded_bytes": m.uploaded_bytes,
-        "download_rate": m.download_rate,
-        "upload_rate": m.upload_rate,
-        "peers_connected": m.peers_connected,
-        "active_actors": m.active_actors,
-        "free_disk_space_bytes": state.engine.free_disk_space_bytes(),
-        "dht_nodes": dht_nodes,
-        "dht_enabled": dht_enabled,
-        "pex_enabled": pex_enabled,
-        "lsd_enabled": lsd_enabled,
-        "version": env!("CARGO_PKG_VERSION")
-    }))
+    SessionStatsResponse {
+        total_torrents: m.total_torrents,
+        downloading_torrents: m.downloading_torrents,
+        seeding_torrents: m.seeding_torrents,
+        paused_torrents: m.paused_torrents,
+        queued_torrents: m.queued_torrents,
+        downloaded_bytes: m.downloaded_bytes,
+        uploaded_bytes: m.uploaded_bytes,
+        download_rate: m.download_rate,
+        upload_rate: m.upload_rate,
+        peers_connected: m.peers_connected,
+        active_actors: m.active_actors,
+        free_disk_space_bytes: engine.free_disk_space_bytes_async().await,
+        dht_nodes,
+        dht_enabled,
+        pex_enabled,
+        lsd_enabled,
+        version: env!("CARGO_PKG_VERSION"),
+    }
 }
 
-async fn list_torrents_handler(
-    State(state): State<ApiState>,
-    Query(query): Query<PaginationQuery>,
-) -> Json<serde_json::Value> {
-    let page = query.page.unwrap_or(1).max(1);
-    let limit = query.limit.unwrap_or(50).max(1);
-    let offset = page.saturating_sub(1).saturating_mul(limit);
+fn parse_state_filter(state: Option<&str>) -> Option<synapse_engine::SwarmStateFilter> {
+    state.and_then(|s| match s.to_lowercase().as_str() {
+        "downloading" => Some(synapse_engine::SwarmStateFilter::Downloading),
+        "seeding" => Some(synapse_engine::SwarmStateFilter::Seeding),
+        "paused" | "stopped" => Some(synapse_engine::SwarmStateFilter::Paused),
+        "queued" => Some(synapse_engine::SwarmStateFilter::Queued),
+        "checking" => Some(synapse_engine::SwarmStateFilter::Checking),
+        "error" => Some(synapse_engine::SwarmStateFilter::Error),
+        _ => None,
+    })
+}
 
-    let filter = query
-        .state
-        .as_deref()
-        .and_then(|s| match s.to_lowercase().as_str() {
-            "downloading" => Some(synapse_engine::SwarmStateFilter::Downloading),
-            "seeding" => Some(synapse_engine::SwarmStateFilter::Seeding),
-            "paused" | "stopped" => Some(synapse_engine::SwarmStateFilter::Paused),
-            "queued" => Some(synapse_engine::SwarmStateFilter::Queued),
-            "checking" => Some(synapse_engine::SwarmStateFilter::Checking),
-            "error" => Some(synapse_engine::SwarmStateFilter::Error),
-            _ => None,
-        });
+fn build_torrent_list_items(
+    engine: &SwarmEngine,
+    offset: usize,
+    limit: usize,
+    filter: Option<synapse_engine::SwarmStateFilter>,
+) -> (Vec<TorrentListItem>, usize) {
+    let (paged_swarms, total) = engine.list_torrents_paged(offset, limit, filter);
 
-    let (paged_swarms, total) = state.engine.list_torrents_paged(offset, limit, filter);
-
-    let list: Vec<serde_json::Value> = paged_swarms
+    let list = paged_swarms
         .into_iter()
         .map(|s| {
-            let (meta, sequential, super_seeding, first_last) = state
-                .engine
+            let (meta, sequential, super_seeding, first_last) = engine
                 .get_torrent(&s.info_hash)
                 .map(|h| {
                     (
@@ -972,38 +1382,350 @@ async fn list_torrents_handler(
                     )
                 })
                 .unwrap_or_default();
-            serde_json::json!({
-                "info_hash": hex::encode(s.info_hash),
-                "name": s.name,
-                "total_bytes": s.total_size,
-                "progress": s.progress,
-                "download_rate": s.download_rate,
-                "upload_rate": s.upload_rate,
-                "downloaded_bytes": s.downloaded_bytes,
-                "uploaded_bytes": s.uploaded_bytes,
-                "peers_connected": s.peers_connected,
-                "peers_sending": s.peers_sending,
-                "eta_seconds": s.eta_seconds,
-                "ratio": s.ratio,
-                "download_dir": s.download_dir,
-                "state": format!("{:?}", s.state),
-                "tier": format!("{:?}", s.tier),
-                "category": meta.category,
-                "tags": meta.tags,
-                "seed_ratio_limit": meta.seed_ratio_limit,
-                "seed_time_limit_secs": meta.seed_time_limit_secs,
-                "sequential": sequential,
-                "super_seeding": super_seeding,
-                "first_last_piece_priority": first_last,
-            })
+            TorrentListItem {
+                info_hash: hex::encode(s.info_hash),
+                name: s.name,
+                total_bytes: s.total_size,
+                progress: s.progress,
+                download_rate: s.download_rate,
+                upload_rate: s.upload_rate,
+                downloaded_bytes: s.downloaded_bytes,
+                uploaded_bytes: s.uploaded_bytes,
+                peers_connected: s.peers_connected,
+                peers_sending: s.peers_sending,
+                eta_seconds: s.eta_seconds,
+                ratio: s.ratio,
+                download_dir: s.download_dir,
+                state: format!("{:?}", s.state),
+                tier: format!("{:?}", s.tier),
+                category: meta.category,
+                tags: meta.tags,
+                seed_ratio_limit: meta.seed_ratio_limit,
+                seed_time_limit_secs: meta.seed_time_limit_secs,
+                sequential,
+                super_seeding,
+                first_last_piece_priority: first_last,
+            }
         })
         .collect();
 
-    Json(serde_json::json!({
-        "torrents": list,
-        "total": total,
-        "page": page,
-        "limit": limit
+    (list, total)
+}
+
+async fn session_stats_handler(State(state): State<ApiState>) -> Json<SessionStatsResponse> {
+    Json(build_session_stats_response(&state.engine).await)
+}
+
+async fn list_torrents_handler(
+    State(state): State<ApiState>,
+    Query(query): Query<PaginationQuery>,
+) -> Json<TorrentListResponse> {
+    let page = query.page.unwrap_or(1).max(1);
+    let limit = query.limit.unwrap_or(50).clamp(1, 500);
+    let offset = page.saturating_sub(1).saturating_mul(limit);
+    let filter = parse_state_filter(query.state.as_deref());
+
+    let (torrents, total) = build_torrent_list_items(&state.engine, offset, limit, filter);
+
+    Json(TorrentListResponse {
+        torrents,
+        total,
+        page,
+        limit,
+    })
+}
+
+async fn torrents_stream_handler(
+    State(state): State<ApiState>,
+    Query(query): Query<TorrentStreamQuery>,
+) -> axum::response::sse::Sse<
+    impl futures::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>,
+> {
+    use axum::response::sse::{Event, KeepAlive, Sse};
+    use tokio_stream::wrappers::ReceiverStream;
+
+    let page = query.page.unwrap_or(1).max(1);
+    let limit = query.limit.unwrap_or(50).clamp(1, 500);
+    let offset = page.saturating_sub(1).saturating_mul(limit);
+    let filter = parse_state_filter(query.state.as_deref());
+    let interval_ms = query.interval_ms.unwrap_or(1000).clamp(250, 5000);
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, std::convert::Infallible>>(64);
+    let engine = state.engine.clone();
+
+    tokio::spawn(async move {
+        let (items, total) = build_torrent_list_items(&engine, offset, limit, filter);
+        let stats = build_session_stats_response(&engine).await;
+        let mut last_stats_json = serde_json::to_string(&stats).unwrap_or_default();
+        let mut last_total = total;
+
+        let snapshot_payload = serde_json::json!({
+            "torrents": &items,
+            "total": total,
+            "page": page,
+            "limit": limit,
+            "stats": stats,
+        })
+        .to_string();
+
+        let mut last_items: HashMap<String, TorrentListItem> = items
+            .into_iter()
+            .map(|it| (it.info_hash.clone(), it))
+            .collect();
+
+        if tx
+            .send(Ok(Event::default()
+                .event("snapshot")
+                .data(snapshot_payload)))
+            .await
+            .is_err()
+        {
+            return;
+        }
+
+        let mut alert_rx = engine.subscribe_alerts();
+        let mut alerts_open = true;
+        let mut ticker = tokio::time::interval(Duration::from_millis(interval_ms));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        ticker.tick().await;
+
+        loop {
+            tokio::select! {
+                _ = tx.closed() => break,
+                _ = ticker.tick() => {}
+                res = alert_rx.recv(), if alerts_open => {
+                    match res {
+                        Ok(alert) => {
+                            if !matches!(
+                                alert,
+                                synapse_engine::Alert::TorrentAdded { .. }
+                                    | synapse_engine::Alert::TorrentFinished { .. }
+                                    | synapse_engine::Alert::TorrentError { .. }
+                                    | synapse_engine::Alert::StateChanged { .. }
+                            ) {
+                                continue;
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                            engine.record_event_bus_lag(skipped);
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            alerts_open = false;
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            let (curr_items, total) = build_torrent_list_items(&engine, offset, limit, filter);
+            let stats = build_session_stats_response(&engine).await;
+            let stats_json = serde_json::to_string(&stats).unwrap_or_default();
+
+            let mut added = Vec::new();
+            let mut updated = Vec::new();
+            let mut next_items = HashMap::with_capacity(curr_items.len());
+            for item in curr_items {
+                let key = item.info_hash.clone();
+                if let Some(prev) = last_items.remove(&key) {
+                    if let Some(delta) = compute_item_delta(&prev, &item) {
+                        updated.push(delta);
+                    }
+                } else {
+                    added.push(item.clone());
+                }
+                next_items.insert(key, item);
+            }
+            let removed: Vec<String> = last_items.into_keys().collect();
+            last_items = next_items;
+
+            if !added.is_empty()
+                || !updated.is_empty()
+                || !removed.is_empty()
+                || total != last_total
+            {
+                last_total = total;
+                let delta_payload = serde_json::json!({
+                    "added": added,
+                    "updated": updated,
+                    "removed": removed,
+                    "total": total,
+                    "page": page,
+                    "limit": limit,
+                })
+                .to_string();
+                if tx
+                    .send(Ok(Event::default().event("delta").data(delta_payload)))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+
+            if stats_json != last_stats_json {
+                last_stats_json = stats_json;
+                if tx
+                    .send(Ok(Event::default()
+                        .event("stats")
+                        .data(last_stats_json.clone())))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }
+    });
+
+    Sse::new(ReceiverStream::new(rx)).keep_alive(KeepAlive::default())
+}
+
+#[derive(Clone, Copy)]
+enum HttpBatchOp {
+    Pause,
+    Resume,
+    Recheck,
+}
+
+type BatchApiError = (StatusCode, Json<BatchActionResponse>);
+type ParsedBatchHashes = Vec<(String, [u8; 20])>;
+
+fn parse_batch_hashes(hashes: &[String]) -> Result<ParsedBatchHashes, BatchApiError> {
+    hashes
+        .iter()
+        .map(|raw| {
+            let hash_hex = raw.to_lowercase();
+            let arr = parse_info_hash_hex(&hash_hex).ok_or_else(|| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(BatchActionResponse {
+                        success: false,
+                        succeeded: 0,
+                        failed_hashes: Vec::new(),
+                        message: format!("Invalid info hash: {raw}"),
+                    }),
+                )
+            })?;
+            Ok((hash_hex, arr))
+        })
+        .collect()
+}
+
+fn run_batch_state_op(
+    engine: &SwarmEngine,
+    raw_hashes: &[String],
+    op: HttpBatchOp,
+    verb: &str,
+) -> Result<Json<BatchActionResponse>, (StatusCode, Json<BatchActionResponse>)> {
+    let parsed = parse_batch_hashes(raw_hashes)?;
+    let mut succeeded = 0usize;
+    let mut failed_hashes = Vec::new();
+    for (hash_hex, arr) in parsed {
+        let ok = match op {
+            HttpBatchOp::Pause => engine.transition_to_cold(&arr),
+            HttpBatchOp::Resume => engine.transition_to_hot(&arr),
+            HttpBatchOp::Recheck => engine.recheck_torrent(&arr),
+        };
+        if ok {
+            succeeded += 1;
+        } else {
+            failed_hashes.push(hash_hex);
+        }
+    }
+    let all_ok = failed_hashes.is_empty();
+    let failed_count = failed_hashes.len();
+    Ok(Json(BatchActionResponse {
+        success: all_ok,
+        succeeded,
+        failed_hashes,
+        message: if all_ok {
+            format!("{verb} {succeeded} torrent(s)")
+        } else {
+            format!("{verb} {succeeded} torrent(s); {failed_count} not found")
+        },
+    }))
+}
+
+async fn batch_pause_torrents_handler(
+    State(state): State<ApiState>,
+    Json(payload): Json<BatchHashesRequest>,
+) -> Result<Json<BatchActionResponse>, (StatusCode, Json<BatchActionResponse>)> {
+    run_batch_state_op(&state.engine, &payload.hashes, HttpBatchOp::Pause, "Paused")
+}
+
+async fn batch_resume_torrents_handler(
+    State(state): State<ApiState>,
+    Json(payload): Json<BatchHashesRequest>,
+) -> Result<Json<BatchActionResponse>, (StatusCode, Json<BatchActionResponse>)> {
+    run_batch_state_op(
+        &state.engine,
+        &payload.hashes,
+        HttpBatchOp::Resume,
+        "Resumed",
+    )
+}
+
+async fn batch_recheck_torrents_handler(
+    State(state): State<ApiState>,
+    Json(payload): Json<BatchHashesRequest>,
+) -> Result<Json<BatchActionResponse>, (StatusCode, Json<BatchActionResponse>)> {
+    run_batch_state_op(
+        &state.engine,
+        &payload.hashes,
+        HttpBatchOp::Recheck,
+        "Rechecking",
+    )
+}
+
+async fn batch_remove_torrents_handler(
+    State(state): State<ApiState>,
+    Json(payload): Json<BatchRemoveRequest>,
+) -> Result<Json<BatchActionResponse>, (StatusCode, Json<BatchActionResponse>)> {
+    let parsed = parse_batch_hashes(&payload.hashes)?;
+    let mut succeeded = 0usize;
+    let mut failed_hashes = Vec::new();
+    let mut to_delete: Vec<(String, String)> = Vec::new();
+
+    for (hash_hex, arr) in parsed {
+        let target_info = if payload.delete_data {
+            state.engine.get_torrent(&arr).map(|h| {
+                let s = h.stats.read();
+                (s.download_dir.clone(), s.name.clone())
+            })
+        } else {
+            None
+        };
+        if state.engine.remove_torrent(&arr) {
+            succeeded += 1;
+            if let Some(info) = target_info {
+                to_delete.push(info);
+            }
+        } else {
+            failed_hashes.push(hash_hex);
+        }
+    }
+
+    if !to_delete.is_empty() {
+        let base = state.base_download_dir.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            for (dl_dir_str, torrent_name) in to_delete {
+                delete_torrent_data_under_base(&base, &dl_dir_str, &torrent_name);
+            }
+        })
+        .await;
+    }
+
+    let all_ok = failed_hashes.is_empty();
+    let failed_count = failed_hashes.len();
+    Ok(Json(BatchActionResponse {
+        success: all_ok,
+        succeeded,
+        failed_hashes,
+        message: if all_ok {
+            format!("Removed {succeeded} torrent(s)")
+        } else {
+            format!("Removed {succeeded} torrent(s); {failed_count} not found")
+        },
     }))
 }
 
@@ -1089,7 +1811,7 @@ async fn add_search_engine_handler(
     match state
         .engine
         .search_manager()
-        .add_source(payload.source.trim())
+        .add_url_source(payload.source.trim())
         .await
     {
         Ok(engine) => Ok(Json(
@@ -1457,6 +2179,34 @@ async fn get_torrent_handler(
     }
 }
 
+pub(crate) fn delete_torrent_data_under_base(
+    base_download_dir: &std::path::Path,
+    dl_dir_str: &str,
+    torrent_name: &str,
+) {
+    if !is_safe_single_component_name(torrent_name) {
+        return;
+    }
+    if let (Ok(canonical_base), Ok(canonical_dl_dir)) = (
+        canonicalize_with_nonexistent_tail(base_download_dir),
+        validate_path_under_base(base_download_dir, std::path::Path::new(dl_dir_str)),
+    ) {
+        let candidate = canonical_dl_dir.join(torrent_name);
+        if candidate != canonical_dl_dir
+            && candidate != canonical_base
+            && candidate.starts_with(&canonical_base)
+        {
+            if let Ok(meta) = std::fs::symlink_metadata(&candidate) {
+                if meta.file_type().is_symlink() || meta.file_type().is_file() {
+                    let _ = std::fs::remove_file(&candidate);
+                } else if meta.file_type().is_dir() {
+                    let _ = std::fs::remove_dir_all(&candidate);
+                }
+            }
+        }
+    }
+}
+
 async fn delete_torrent_handler(
     State(state): State<ApiState>,
     Path(info_hash_str): Path<String>,
@@ -1479,29 +2229,11 @@ async fn delete_torrent_handler(
     if state.engine.remove_torrent(&hash) {
         if query.delete_data.unwrap_or(false) {
             if let Some((dl_dir_str, torrent_name)) = target_info {
-                if is_safe_single_component_name(&torrent_name) {
-                    if let (Ok(canonical_base), Ok(canonical_dl_dir)) = (
-                        canonicalize_with_nonexistent_tail(&state.base_download_dir),
-                        validate_path_under_base(
-                            &state.base_download_dir,
-                            std::path::Path::new(&dl_dir_str),
-                        ),
-                    ) {
-                        let candidate = canonical_dl_dir.join(&torrent_name);
-                        if candidate != canonical_dl_dir
-                            && candidate != canonical_base
-                            && candidate.starts_with(&canonical_base)
-                        {
-                            if let Ok(meta) = std::fs::symlink_metadata(&candidate) {
-                                if meta.file_type().is_symlink() || meta.file_type().is_file() {
-                                    let _ = std::fs::remove_file(&candidate);
-                                } else if meta.file_type().is_dir() {
-                                    let _ = std::fs::remove_dir_all(&candidate);
-                                }
-                            }
-                        }
-                    }
-                }
+                let base = state.base_download_dir.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    delete_torrent_data_under_base(&base, &dl_dir_str, &torrent_name);
+                })
+                .await;
             }
         }
         Ok(Json(ActionResponse {
@@ -1605,6 +2337,10 @@ async fn get_torrent_detail_handler(
             "leechers": rep.leechers,
             "next_announce_in": rep.next_announce_in,
             "failure_reason": rep.failure_reason,
+            "is_circuit_broken": rep.is_circuit_broken,
+            "cb_state": rep.cb_state.map(circuit_state_label),
+            "recovery_progress_pct": rep.recovery_progress_pct,
+            "last_announce_time": rep.last_announce_time,
         }));
     }
 
@@ -1792,11 +2528,16 @@ async fn set_location_handler(
         std::path::Path::new(payload.new_download_dir.trim()),
     )
     .map_err(|_| StatusCode::FORBIDDEN)?;
+    let validated_str = validated.to_string_lossy().into_owned();
+    let move_files = payload.move_existing_files.unwrap_or(true);
+    let engine = state.engine.clone();
+    let ok = tokio::task::spawn_blocking(move || {
+        engine.set_location_with_options(&hash, &validated_str, move_files)
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    if state
-        .engine
-        .set_location(&hash, &validated.to_string_lossy())
-    {
+    if ok {
         Ok(Json(ActionResponse {
             success: true,
             message: "Location updated".to_string(),
@@ -1859,11 +2600,22 @@ pub struct ReplaceTrackersBody {
     pub trackers: Vec<String>,
 }
 
+fn deserialize_double_option<'de, T, D>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    Deserialize::deserialize(deserializer).map(Some)
+}
+
 #[derive(Debug, Deserialize)]
 pub struct UpdateMetadataRequest {
+    #[serde(default, deserialize_with = "deserialize_double_option")]
     pub category: Option<Option<String>>,
     pub tags: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "deserialize_double_option")]
     pub seed_ratio_limit: Option<Option<f64>>,
+    #[serde(default, deserialize_with = "deserialize_double_option")]
     pub seed_time_limit_secs: Option<Option<u64>>,
 }
 
@@ -2001,7 +2753,12 @@ async fn export_torrent_handler(
     Path(info_hash_str): Path<String>,
 ) -> Result<impl axum::response::IntoResponse, StatusCode> {
     let hash = parse_info_hash(&info_hash_str)?;
-    let Some((name, bytes)) = state.engine.export_torrent_bytes(&hash) else {
+    let engine = state.engine.clone();
+    let Some((name, bytes)) =
+        tokio::task::spawn_blocking(move || engine.export_torrent_bytes(&hash))
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    else {
         return Err(StatusCode::NOT_FOUND);
     };
     let safe_name: String = name
@@ -2101,12 +2858,16 @@ async fn swagger_ui_handler() -> Html<String> {
 
 async fn metrics_handler(State(state): State<ApiState>) -> Response {
     let m = state.engine.global_metrics();
+    let free_disk_space_bytes = state.engine.free_disk_space_bytes_async().await;
 
     let snapshot = PrometheusSnapshot {
         total_torrents: m.total_torrents,
         downloading_torrents: m.downloading_torrents,
         seeding_torrents: m.seeding_torrents,
         paused_torrents: m.paused_torrents,
+        queued_torrents: m.queued_torrents,
+        checking_torrents: m.checking_torrents,
+        error_torrents: m.error_torrents,
         bytes_downloaded: m.downloaded_bytes,
         bytes_uploaded: m.uploaded_bytes,
         download_rate: m.download_rate,
@@ -2114,7 +2875,7 @@ async fn metrics_handler(State(state): State<ApiState>) -> Response {
         connected_peers: m.peers_connected,
         circuit_breakers_tripped: state.engine.circuit_breaker().tripped_count()
             + state.engine.tracker_circuit_breaker().tripped_count(),
-        dht_nodes: state.engine.dht_node_count().await,
+        dht_nodes: state.engine.dht_node_count_fast(),
         nat_mapped_port: state.engine.mapped_external_port(
             state.engine.listen_port(),
             synapse_engine::PortProtocol::Tcp,
@@ -2126,8 +2887,13 @@ async fn metrics_handler(State(state): State<ApiState>) -> Response {
         hash_fails_total: m.hash_fails_total,
         peer_bans_total: m.peers_banned,
         disk_write_queue_bytes: state.engine.disk_write_queue_bytes(),
-        utp_packet_loss_total: m.utp_packet_loss_total,
-        dht_dos_blocks_total: m.dht_dos_blocks_total,
+        utp_packet_loss_total: state.engine.utp_packet_loss_total(),
+        dht_dos_blocks_total: state.engine.dht_dos_blocks_total(),
+        event_bus_lag_total: m.event_bus_lag_total,
+        auth_failures_total: state.rate_limiter.total_failures(),
+        free_disk_space_bytes,
+        session_flush_duration_ms: m.last_flush_duration_ms,
+        rpc_sync_duration_ms: m.last_sync_duration_ms,
     };
 
     let text = render_prometheus_metrics(&snapshot);
@@ -2544,20 +3310,77 @@ mod tests {
 
     #[test]
     fn client_ip_ignores_a_spoofed_prefix_and_uses_the_hop_the_trusted_proxy_appended() {
+        let trusted = ["127.0.0.1".parse().unwrap()];
         let req = request_from_peer("127.0.0.1:1234", Some("203.0.113.9, 10.0.0.5"));
-        assert_eq!(extract_client_ip(&req), "203.0.113.9");
+        // Default empty trusted_proxies ignores XFF even on loopback.
+        assert_eq!(extract_client_ip(&req, &[]), "127.0.0.1");
+        assert_eq!(extract_client_ip(&req, &trusted), "203.0.113.9");
     }
 
     #[test]
     fn client_ip_falls_back_to_the_peer_when_forwarded_for_is_entirely_private() {
+        let trusted = ["127.0.0.1".parse().unwrap()];
         let req = request_from_peer("127.0.0.1:1234", Some("10.0.0.1, 10.0.0.2"));
-        assert_eq!(extract_client_ip(&req), "127.0.0.1");
+        assert_eq!(extract_client_ip(&req, &trusted), "127.0.0.1");
     }
 
     #[test]
     fn client_ip_from_an_untrusted_peer_ignores_forwarded_for_entirely() {
+        let trusted = ["127.0.0.1".parse().unwrap()];
         let req = request_from_peer("203.0.113.1:1234", Some("1.2.3.4"));
-        assert_eq!(extract_client_ip(&req), "203.0.113.1");
+        assert_eq!(extract_client_ip(&req, &trusted), "203.0.113.1");
+    }
+
+    #[tokio::test]
+    async fn get_dns_rebinding_and_origin_port_mismatch_and_relative_settings_are_handled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let disk = Arc::new(diskio::DiskEngine::auto().await);
+        let engine = Arc::new(SwarmEngine::new(disk, [0u8; 20]));
+        engine.settings().write().download_dir = tmp.path().to_path_buf();
+        let app = create_http_router(engine.clone());
+
+        // GET with non-loopback Host must be rejected (403) when unauthenticated.
+        let get_rebind = Request::builder()
+            .method("GET")
+            .uri("/api/v1/torrents")
+            .header("Host", "evil.example.com:8080")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(get_rebind).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+
+        // POST with matching host but wrong Origin port must be rejected (403).
+        let bad_port_origin = Request::builder()
+            .method("PATCH")
+            .uri("/api/v1/session")
+            .header("Host", "127.0.0.1:8080")
+            .header("Origin", "http://127.0.0.1:9999")
+            .header("Content-Type", "application/json")
+            .body(Body::from(r#"{"alt_speed_enabled": true}"#))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(bad_port_origin).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+
+        // PATCH with relative download_dir under base must persist canonicalized absolute path.
+        let canonical_base = std::fs::canonicalize(tmp.path()).unwrap();
+        let rel_patch = Request::builder()
+            .method("PATCH")
+            .uri("/api/v1/session")
+            .header("Host", "127.0.0.1:8080")
+            .header("Origin", "http://127.0.0.1:8080")
+            .header("Content-Type", "application/json")
+            .body(Body::from(r#"{"download_dir": "movies"}"#))
+            .unwrap();
+        let resp = app.oneshot(rel_patch).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            engine.settings().read().download_dir,
+            canonical_base.join("movies")
+        );
     }
 
     #[test]
@@ -2603,5 +3426,696 @@ mod tests {
             "repeated auth failures from one real peer must eventually be rate-limited \
              regardless of the X-Forwarded-For value they send"
         );
+    }
+
+    #[tokio::test]
+    async fn patch_metadata_explicit_null_clears_while_omitted_fields_stay_intact() {
+        let tmp = tempfile::tempdir().unwrap();
+        let disk = Arc::new(diskio::DiskEngine::auto().await);
+        let engine = Arc::new(SwarmEngine::new(disk, [0u8; 20]));
+        engine.settings().write().download_dir = tmp.path().to_path_buf();
+        let app = create_http_router(engine.clone());
+
+        let info = synapse_meta::Info::from_magnet(
+            "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=meta-test",
+        )
+        .unwrap();
+        let hash_hex = hex::encode(info.hash);
+        engine.add_torrent(Arc::new(info), tmp.path().to_path_buf(), None);
+
+        // Set all metadata fields first.
+        let set_req = Request::builder()
+            .method("PATCH")
+            .uri(format!("/api/v1/torrents/{hash_hex}/metadata"))
+            .header("Content-Type", "application/json")
+            .body(Body::from(
+                r#"{"category":"linux","tags":["iso"],"seed_ratio_limit":2.5,"seed_time_limit_secs":3600}"#,
+            ))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(set_req).await.unwrap().status(),
+            StatusCode::OK
+        );
+
+        // Explicitly pass `null` to clear category & seed_ratio_limit while omitting seed_time_limit_secs & tags.
+        let clear_req = Request::builder()
+            .method("PATCH")
+            .uri(format!("/api/v1/torrents/{hash_hex}/metadata"))
+            .header("Content-Type", "application/json")
+            .body(Body::from(r#"{"category":null,"seed_ratio_limit":null}"#))
+            .unwrap();
+        let resp = app.oneshot(clear_req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["metadata"]["category"], serde_json::Value::Null);
+        assert_eq!(
+            json["metadata"]["seed_ratio_limit"],
+            serde_json::Value::Null
+        );
+        assert_eq!(json["metadata"]["seed_time_limit_secs"], 3600);
+        assert_eq!(json["metadata"]["tags"], serde_json::json!(["iso"]));
+    }
+
+    #[tokio::test]
+    async fn body_limits_allow_large_torrents_and_cap_standard_routes() {
+        use base64::Engine;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let disk = Arc::new(diskio::DiskEngine::auto().await);
+        let engine = Arc::new(SwarmEngine::new(disk, [0u8; 20]));
+        engine.settings().write().download_dir = tmp.path().to_path_buf();
+        let app = create_http_router(engine.clone());
+
+        // > 2 MiB valid .torrent payload (120,000 pieces * 20 bytes = 2.4 MB).
+        let piece_count = 120_000usize;
+        let mut info_dict = std::collections::BTreeMap::new();
+        info_dict.insert(
+            b"name".to_vec(),
+            synapse_bencode::BEncode::String(b"large-meta.bin".to_vec()),
+        );
+        info_dict.insert(
+            b"piece length".to_vec(),
+            synapse_bencode::BEncode::Int(16_384),
+        );
+        info_dict.insert(
+            b"pieces".to_vec(),
+            synapse_bencode::BEncode::String(vec![0u8; piece_count * 20]),
+        );
+        info_dict.insert(
+            b"length".to_vec(),
+            synapse_bencode::BEncode::Int((piece_count * 16_384) as i64),
+        );
+        let mut root_dict = std::collections::BTreeMap::new();
+        root_dict.insert(b"info".to_vec(), synapse_bencode::BEncode::Dict(info_dict));
+        let mut torrent_bytes = Vec::new();
+        synapse_bencode::BEncode::Dict(root_dict)
+            .encode(&mut torrent_bytes)
+            .unwrap();
+        assert!(torrent_bytes.len() > 2 * 1024 * 1024);
+
+        let upload_req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/torrents/upload")
+            .body(Body::from(torrent_bytes.clone()))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(upload_req).await.unwrap().status(),
+            StatusCode::OK
+        );
+
+        let add_json = serde_json::json!({
+            "torrent_base64": base64::engine::general_purpose::STANDARD.encode(&torrent_bytes),
+        });
+        let add_req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/torrents")
+            .header("Content-Type", "application/json")
+            .body(Body::from(serde_json::to_vec(&add_json).unwrap()))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(add_req).await.unwrap().status(),
+            StatusCode::OK
+        );
+
+        // Standard route (> 64 KiB) must be rejected with 413 Payload Too Large.
+        let oversized_patch = vec![b' '; 70 * 1024];
+        let patch_req = Request::builder()
+            .method("PATCH")
+            .uri("/api/v1/session")
+            .header("Content-Type", "application/json")
+            .body(Body::from(oversized_patch))
+            .unwrap();
+        assert_eq!(
+            app.oneshot(patch_req).await.unwrap().status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+    }
+
+    #[tokio::test]
+    async fn metrics_handler_reports_live_utp_and_dht_counters() {
+        let disk = Arc::new(diskio::DiskEngine::auto().await);
+        let engine = Arc::new(SwarmEngine::new(disk, [0u8; 20]));
+        engine
+            .metrics_ref()
+            .utp_packet_loss_total
+            .store(7, std::sync::atomic::Ordering::Relaxed);
+        engine
+            .metrics_ref()
+            .dht_dos_blocks_total
+            .store(9, std::sync::atomic::Ordering::Relaxed);
+
+        let app = create_http_router(engine);
+        let req = Request::builder()
+            .uri("/metrics")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+        assert!(text.contains("synapse_utp_packet_loss_total 7"));
+        assert!(text.contains("synapse_dht_dos_blocked_total 9"));
+    }
+
+    #[tokio::test]
+    async fn list_torrents_caps_limit_at_500_and_preserves_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let disk = Arc::new(diskio::DiskEngine::auto().await);
+        let engine = Arc::new(SwarmEngine::new(disk, [0u8; 20]));
+        engine.settings().write().download_dir = dir.path().to_path_buf();
+
+        let mut info_dict = std::collections::BTreeMap::new();
+        info_dict.insert(
+            b"name".to_vec(),
+            synapse_bencode::BEncode::String(b"schema-test.bin".to_vec()),
+        );
+        info_dict.insert(
+            b"piece length".to_vec(),
+            synapse_bencode::BEncode::Int(16_384),
+        );
+        info_dict.insert(
+            b"pieces".to_vec(),
+            synapse_bencode::BEncode::String(vec![0u8; 20]),
+        );
+        info_dict.insert(b"length".to_vec(), synapse_bencode::BEncode::Int(16_384));
+        let mut root_dict = std::collections::BTreeMap::new();
+        root_dict.insert(b"info".to_vec(), synapse_bencode::BEncode::Dict(info_dict));
+        let info = Arc::new(
+            synapse_meta::Info::from_bencode(synapse_bencode::BEncode::Dict(root_dict)).unwrap(),
+        );
+        engine.add_torrent(info.clone(), dir.path().to_path_buf(), None);
+
+        let app = create_http_router(engine);
+        let req = Request::builder()
+            .uri("/api/v1/torrents?limit=10000")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(val["limit"], 500);
+        assert_eq!(val["total"], 1);
+        assert_eq!(val["page"], 1);
+        let item = &val["torrents"][0];
+        assert_eq!(item["info_hash"], hex::encode(info.hash));
+        assert_eq!(item["name"], "schema-test.bin");
+        assert_eq!(item["total_bytes"], 16_384);
+        assert!(item["state"].is_string());
+        assert!(item["tier"].is_string());
+
+        let stats_req = Request::builder()
+            .uri("/api/v1/session/stats")
+            .body(Body::empty())
+            .unwrap();
+        let stats_resp = app.oneshot(stats_req).await.unwrap();
+        assert_eq!(stats_resp.status(), StatusCode::OK);
+        let stats_body = axum::body::to_bytes(stats_resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let stats_val: serde_json::Value = serde_json::from_slice(&stats_body).unwrap();
+        assert_eq!(stats_val["total_torrents"], 1);
+        assert!(stats_val["dht_nodes"].is_u64());
+        assert!(stats_val["version"].is_string());
+    }
+
+    fn build_http_test_info(name: &str, tracker_url: Option<&str>) -> Arc<synapse_meta::Info> {
+        let mut info_dict = std::collections::BTreeMap::new();
+        info_dict.insert(
+            b"name".to_vec(),
+            synapse_bencode::BEncode::String(name.as_bytes().to_vec()),
+        );
+        info_dict.insert(
+            b"piece length".to_vec(),
+            synapse_bencode::BEncode::Int(16_384),
+        );
+        info_dict.insert(
+            b"pieces".to_vec(),
+            synapse_bencode::BEncode::String(vec![0u8; 20]),
+        );
+        info_dict.insert(b"length".to_vec(), synapse_bencode::BEncode::Int(16_384));
+        let mut root_dict = std::collections::BTreeMap::new();
+        if let Some(url) = tracker_url {
+            root_dict.insert(
+                b"announce".to_vec(),
+                synapse_bencode::BEncode::String(url.as_bytes().to_vec()),
+            );
+        }
+        root_dict.insert(b"info".to_vec(), synapse_bencode::BEncode::Dict(info_dict));
+        Arc::new(
+            synapse_meta::Info::from_bencode(synapse_bencode::BEncode::Dict(root_dict)).unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn session_and_detail_expose_new_parity_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let disk = Arc::new(diskio::DiskEngine::auto().await);
+        let engine = Arc::new(SwarmEngine::new(disk, [0u8; 20]));
+        engine.settings().write().download_dir = dir.path().to_path_buf();
+        {
+            let settings_lock = engine.settings();
+            let mut s = settings_lock.write();
+            s.dht_read_only = true;
+            s.zeroconf_enabled = false;
+            s.announce_ip = Some("127.0.0.1".parse().unwrap());
+            s.enable_utp = true;
+            s.unchoke_slots_global = 12;
+            s.seed_choking_algorithm = "fastest_upload".into();
+            s.unchoke_slot_bandwidth = 32_768;
+            s.limit_lan_peers = true;
+            s.rate_limit_ip_overhead = true;
+            s.max_concurrent_tracker_announces = 24;
+            s.max_concurrent_dht_announces = 12;
+            s.max_concurrent_lsd_announces = 6;
+        }
+
+        let info = build_http_test_info("parity-fields.bin", Some("http://127.0.0.1:9/announce"));
+        let hash_hex = hex::encode(info.hash);
+        engine.add_torrent(info, dir.path().to_path_buf(), None);
+        engine.tracker_circuit_breaker().force_trip("127.0.0.1");
+
+        let app = create_http_router(engine);
+
+        let sess_req = Request::builder()
+            .uri("/api/v1/session")
+            .body(Body::empty())
+            .unwrap();
+        let sess_resp = app.clone().oneshot(sess_req).await.unwrap();
+        assert_eq!(sess_resp.status(), StatusCode::OK);
+        let sess_body = axum::body::to_bytes(sess_resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let sess: serde_json::Value = serde_json::from_slice(&sess_body).unwrap();
+        assert_eq!(sess["dht_read_only"], true);
+        assert_eq!(sess["zeroconf_enabled"], false);
+        assert_eq!(sess["announce_ip"], "127.0.0.1");
+        assert_eq!(sess["enable_utp"], true);
+        assert_eq!(sess["unchoke_slots_global"], 12);
+        assert_eq!(sess["seed_choking_algorithm"], "fastest_upload");
+        assert_eq!(sess["unchoke_slot_bandwidth"], 32_768);
+        assert_eq!(sess["limit_lan_peers"], true);
+        assert_eq!(sess["rate_limit_ip_overhead"], true);
+        assert_eq!(sess["max_concurrent_tracker_announces"], 24);
+        assert_eq!(sess["max_concurrent_dht_announces"], 12);
+        assert_eq!(sess["max_concurrent_lsd_announces"], 6);
+
+        let det_req = Request::builder()
+            .uri(format!("/api/v1/torrents/{hash_hex}/detail"))
+            .body(Body::empty())
+            .unwrap();
+        let det_resp = app.oneshot(det_req).await.unwrap();
+        assert_eq!(det_resp.status(), StatusCode::OK);
+        let det_body = axum::body::to_bytes(det_resp.into_body(), 256 * 1024)
+            .await
+            .unwrap();
+        let det: serde_json::Value = serde_json::from_slice(&det_body).unwrap();
+        let trackers = det["trackers"].as_array().expect("trackers array");
+        assert_eq!(trackers.len(), 1);
+        let t_obj = trackers[0].as_object().unwrap();
+        assert!(t_obj.contains_key("is_circuit_broken"));
+        assert!(t_obj.contains_key("cb_state"));
+        assert!(t_obj.contains_key("recovery_progress_pct"));
+        assert!(t_obj.contains_key("last_announce_time"));
+    }
+
+    #[tokio::test]
+    async fn batch_torrent_endpoints_operate_cleanly_and_report_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let dl_dir = dir.path().join("dl");
+        std::fs::create_dir_all(&dl_dir).unwrap();
+
+        let disk = Arc::new(diskio::DiskEngine::auto().await);
+        let engine = Arc::new(SwarmEngine::new(disk, [0u8; 20]));
+        engine.settings().write().download_dir = dl_dir.clone();
+
+        let info_a = build_http_test_info("batch-a.bin", None);
+        let info_b = build_http_test_info("batch-b.bin", None);
+        let h_a = hex::encode(info_a.hash);
+        let h_b = hex::encode(info_b.hash);
+        engine.add_torrent(info_a.clone(), dl_dir.clone(), None);
+        engine.add_torrent(info_b, dl_dir.clone(), None);
+
+        let app = create_http_router(engine.clone());
+
+        // Malformed hash returns 400 BAD_REQUEST without side effects.
+        let bad_req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/torrents/batch/pause")
+            .header("Content-Type", "application/json")
+            .body(Body::from(r#"{"hashes":["not-hex"]}"#))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(bad_req).await.unwrap().status(),
+            StatusCode::BAD_REQUEST
+        );
+
+        let missing_hex = "ee".repeat(20);
+        let body_with_missing = serde_json::json!({
+            "hashes": [h_a, h_b, missing_hex],
+        })
+        .to_string();
+
+        for (uri, expected_state) in [
+            (
+                "/api/v1/torrents/batch/pause",
+                synapse_engine::SwarmState::Stopped,
+            ),
+            (
+                "/api/v1/torrents/batch/resume",
+                synapse_engine::SwarmState::Downloading,
+            ),
+            (
+                "/api/v1/torrents/batch/recheck",
+                synapse_engine::SwarmState::Checking,
+            ),
+        ] {
+            let req = Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("Content-Type", "application/json")
+                .body(Body::from(body_with_missing.clone()))
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            let parsed: BatchActionResponse = serde_json::from_slice(&bytes).unwrap();
+            assert!(!parsed.success);
+            assert_eq!(parsed.succeeded, 2);
+            assert_eq!(parsed.failed_hashes, vec![missing_hex.clone()]);
+            assert_eq!(
+                engine.get_torrent(&info_a.hash).unwrap().stats.read().state,
+                expected_state
+            );
+        }
+
+        let payload_a = dl_dir.join(&info_a.name);
+        std::fs::write(&payload_a, vec![0x33u8; 32]).unwrap();
+        let rem_req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/torrents/batch/remove")
+            .header("Content-Type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "hashes": [h_a, h_b, missing_hex],
+                    "delete_data": true,
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let rem_resp = app.oneshot(rem_req).await.unwrap();
+        assert_eq!(rem_resp.status(), StatusCode::OK);
+        let rem_bytes = axum::body::to_bytes(rem_resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let rem: BatchActionResponse = serde_json::from_slice(&rem_bytes).unwrap();
+        assert!(!rem.success);
+        assert_eq!(rem.succeeded, 2);
+        assert_eq!(rem.failed_hashes, vec![missing_hex]);
+        assert!(engine.list_torrents().is_empty());
+        assert!(!payload_a.exists());
+    }
+
+    #[tokio::test]
+    async fn torrents_stream_emits_initial_snapshot_and_incremental_deltas() {
+        use futures::StreamExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let disk = Arc::new(diskio::DiskEngine::auto().await);
+        let engine = Arc::new(SwarmEngine::new(disk, [0u8; 20]));
+        engine.settings().write().download_dir = dir.path().to_path_buf();
+
+        let info_1 = build_http_test_info("stream-one.bin", None);
+        let hash_1 = hex::encode(info_1.hash);
+        engine.add_torrent(info_1.clone(), dir.path().to_path_buf(), None);
+
+        let app = create_http_router(engine.clone());
+        let req = Request::builder()
+            .uri("/api/v1/torrents/stream?page=1&limit=25&interval_ms=250")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp.headers()["content-type"]
+            .to_str()
+            .unwrap()
+            .starts_with("text/event-stream"));
+
+        let mut stream = resp.into_body().into_data_stream();
+
+        let first = tokio::time::timeout(Duration::from_secs(3), stream.next())
+            .await
+            .expect("snapshot timed out")
+            .expect("stream closed")
+            .unwrap();
+        let first_text = String::from_utf8_lossy(&first).to_string();
+        assert!(first_text.contains("event: snapshot"), "{first_text}");
+        assert!(first_text.contains(&hash_1), "{first_text}");
+        assert!(first_text.contains("\"stats\""), "{first_text}");
+
+        // Pause torrent 1 and add torrent 2 -> must emit delta with updated/added.
+        engine.transition_to_cold(&info_1.hash);
+        let info_2 = build_http_test_info("stream-two.bin", None);
+        let hash_2 = hex::encode(info_2.hash);
+        engine.add_torrent(info_2.clone(), dir.path().to_path_buf(), None);
+
+        let mut collected = String::new();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while let Some(chunk) = stream.next().await {
+                let bytes = chunk.unwrap();
+                collected.push_str(&String::from_utf8_lossy(&bytes));
+                if collected.contains("event: delta")
+                    && collected.contains(&hash_2)
+                    && collected.contains(&hash_1)
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for add/update delta event");
+
+        // Remove torrent 2 -> must emit delta with removed=[hash_2].
+        engine.remove_torrent(&info_2.hash);
+        let mut removed_buf = String::new();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while let Some(chunk) = stream.next().await {
+                let bytes = chunk.unwrap();
+                removed_buf.push_str(&String::from_utf8_lossy(&bytes));
+                if removed_buf.contains("event: delta")
+                    && removed_buf.contains("\"removed\"")
+                    && removed_buf.contains(&hash_2)
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for remove delta event");
+    }
+
+    #[tokio::test]
+    async fn healthz_and_readyz_probes_distinguish_liveness_from_readiness() {
+        let dir = tempfile::tempdir().unwrap();
+        let dl_dir = dir.path().join("downloads");
+        let sess_dir = dir.path().join("session");
+        std::fs::create_dir_all(&dl_dir).unwrap();
+        let store =
+            Arc::new(synapse_engine::SessionStore::with_key(&sess_dir, [0x7Au8; 32]).unwrap());
+
+        let disk = Arc::new(diskio::DiskEngine::auto().await);
+        let engine = Arc::new(SwarmEngine::new(disk, [0u8; 20]).with_session_store(store));
+        engine.settings().write().download_dir = dl_dir.clone();
+        engine.set_listener_required(false);
+
+        let app = create_http_router(engine.clone());
+
+        // Healthy readyz + healthz
+        let live_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(live_resp.status(), StatusCode::OK);
+
+        let ready_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/readyz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ready_resp.status(), StatusCode::OK);
+        let ready_body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(ready_resp.into_body(), 16 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(ready_body["status"], "ready");
+        assert_eq!(ready_body["checks"]["download_dir"], true);
+        assert_eq!(ready_body["checks"]["session_db"], true);
+        assert_eq!(ready_body["checks"]["listener"], true);
+
+        // Require listener without binding -> healthz still 200 OK, readyz 503 with listener=false
+        engine.set_listener_required(true);
+        let live_resp2 = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(live_resp2.status(), StatusCode::OK);
+
+        let not_ready_listener = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/readyz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(not_ready_listener.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let listener_body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(not_ready_listener.into_body(), 16 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(listener_body["checks"]["listener"], false);
+
+        // Bind listener -> readyz recovers, then delete download_dir -> readyz fails with download_dir=false
+        engine
+            .clone()
+            .start_listener(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+        let recovered = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/readyz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(recovered.status(), StatusCode::OK);
+
+        std::fs::remove_dir_all(&dl_dir).unwrap();
+        let live_missing_dir = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(live_missing_dir.status(), StatusCode::OK);
+
+        let not_ready_dir = app
+            .oneshot(
+                Request::builder()
+                    .uri("/readyz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(not_ready_dir.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let dir_body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(not_ready_dir.into_body(), 16 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(dir_body["checks"]["download_dir"], false);
+        assert_eq!(dir_body["checks"]["listener"], true);
+    }
+
+    #[tokio::test]
+    async fn metrics_handler_exposes_extended_operational_metrics() {
+        let dir = tempfile::tempdir().unwrap();
+        let disk = Arc::new(diskio::DiskEngine::auto().await);
+        let engine = Arc::new(SwarmEngine::new(disk, [0u8; 20]));
+        engine.settings().write().download_dir = dir.path().to_path_buf();
+
+        // Trigger auth failure counter, lag counter, sync duration, and Checking state metric.
+        let app = create_http_router_with_auth(engine.clone(), Some("secret-token".to_string()));
+        let bad_auth = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/session")
+                    .header("Authorization", "Bearer wrong")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bad_auth.status(), StatusCode::UNAUTHORIZED);
+
+        engine.record_event_bus_lag(7);
+        engine.record_rpc_sync_duration_ms(12);
+        engine.metrics_ref().record_state_transition(
+            &synapse_engine::SwarmState::Downloading,
+            &synapse_engine::SwarmState::Checking,
+        );
+        engine
+            .metrics_ref()
+            .last_flush_duration_ms
+            .store(5, Ordering::Relaxed);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let text = String::from_utf8(
+            axum::body::to_bytes(resp.into_body(), 64 * 1024)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+
+        assert!(text.contains("synapse_torrents_total{state=\"queued\"} 0"));
+        assert!(text.contains("synapse_torrents_total{state=\"checking\"} 1"));
+        assert!(text.contains("synapse_torrents_total{state=\"error\"} 0"));
+        assert!(text.contains("synapse_event_bus_lag_total 7"));
+        assert!(text.contains("synapse_auth_failures_total 1"));
+        assert!(text.contains("synapse_free_disk_space_bytes "));
+        assert!(text.contains("synapse_session_flush_duration_ms 5"));
+        assert!(text.contains("synapse_rpc_sync_duration_ms 12"));
     }
 }

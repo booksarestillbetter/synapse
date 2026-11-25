@@ -20,7 +20,11 @@ pub mod udp;
 pub mod udp_ext;
 
 pub use breaker::{CanaryCircuitBreaker, CircuitState, HostCircuitInfo};
-pub use srv::{resolve_tracker_srv, SrvRecord};
+pub use srv::{
+    build_txt_query, parse_bep34_txt_strings, parse_txt_response_with_ttl, resolve_bep34_txt,
+    resolve_tracker_srv, Bep34TxtResult, SrvRecord, TrackerProto, TxtTrackerPreference,
+};
+pub use udp::UdpTrackerClient;
 pub use udp_ext::{decode_udp_options, encode_udp_options, UdpOption};
 
 use std::net::SocketAddr;
@@ -67,6 +71,8 @@ pub struct AnnounceResponse {
     pub warning: Option<String>,
     /// BEP 24 `external ip`: the address the tracker sees us at.
     pub external_ip: Option<std::net::IpAddr>,
+    /// Remote socket address the HTTP/UDP tracker transport connected to, if known.
+    pub remote_addr: Option<SocketAddr>,
 }
 
 /// Announces we accept at most this many peers from one tracker response.
@@ -136,7 +142,7 @@ fn is_sensitive_query_key(raw_key: &str) -> bool {
         || decoded.contains("signature")
         || matches!(
             decoded.as_str(),
-            "pid" | "pk" | "uid" | "hash" | "sig" | "ak" | "id"
+            "pid" | "pk" | "uid" | "uk" | "hash" | "sig" | "ak" | "tk" | "id" | "pw"
         )
 }
 
@@ -155,10 +161,11 @@ fn is_passkey_path_segment(seg: &str) -> bool {
     ) {
         return false;
     }
-    decoded.len() >= 16
-        && decoded
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    (decoded.len() >= 12 && decoded.bytes().all(|b| b.is_ascii_hexdigit()))
+        || (decoded.len() >= 16
+            && decoded
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'='))
 }
 
 /// Sanitizes tracker URLs for safe logging, masking passkeys, path tokens, userinfo, and authentication tokens.
@@ -269,5 +276,14 @@ mod privacy_tests {
         ] {
             assert!(!s4.contains(secret), "leaked {secret} in {s4}");
         }
+
+        // 4. Short 12-char hex path token and uk/tk query params
+        let u5 =
+            Url::parse("https://tracker.example.org/deadbeefcafe/announce?uk=secretuk&tk=secrettk")
+                .unwrap();
+        let s5 = sanitize_tracker_url(&u5);
+        assert!(!s5.contains("deadbeefcafe"), "{s5}");
+        assert!(!s5.contains("secretuk"), "{s5}");
+        assert!(!s5.contains("secrettk"), "{s5}");
     }
 }

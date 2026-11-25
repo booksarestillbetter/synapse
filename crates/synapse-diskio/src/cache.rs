@@ -7,119 +7,239 @@ use std::sync::{Arc, Mutex};
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OpenMode {
+    ReadOnly,
+    Write { file_len: u64 },
+}
+
 struct Entry {
+    path: PathBuf,
     file: Arc<File>,
+    writable: bool,
+    preallocated_len: u64,
     used: bool,
 }
 
-/// An open-file-descriptor cache with clock-hand ("second chance") eviction, capped at
-/// `max_open` entries.
-///
-/// Ports the fix landed in the pre-rewrite codebase's `src/disk/cache.rs::ensure_exists`
-/// (see `CHANGELOG.md`): the *first* unreferenced entry found while sweeping is evicted,
-/// not an arbitrary one found by scanning the whole map.
+struct CacheInner {
+    max_open: usize,
+    slots: Vec<Option<Entry>>,
+    index: HashMap<PathBuf, usize>,
+    clock_hand: usize,
+    evict_gen: u64,
+}
+
+impl CacheInner {
+    fn new(max_open: usize) -> Self {
+        Self {
+            max_open,
+            slots: Vec::with_capacity(max_open.min(1024)),
+            index: HashMap::with_capacity(max_open.min(1024)),
+            clock_hand: 0,
+            evict_gen: 0,
+        }
+    }
+
+    fn get_mut(&mut self, path: &Path) -> Option<&mut Entry> {
+        let idx = *self.index.get(path)?;
+        self.slots.get_mut(idx)?.as_mut()
+    }
+
+    fn insert_or_replace(&mut self, path: PathBuf, entry: Entry) {
+        if self.max_open == 0 {
+            return;
+        }
+        if let Some(&idx) = self.index.get(&path) {
+            self.slots[idx] = Some(entry);
+            return;
+        }
+        if self.slots.len() < self.max_open {
+            let idx = self.slots.len();
+            self.slots.push(Some(entry));
+            self.index.insert(path, idx);
+            return;
+        }
+        // Check if an evicted hole exists first (bounded scan), otherwise sweep with clock_hand.
+        let len = self.slots.len();
+        for _ in 0..len {
+            let idx = self.clock_hand % len;
+            self.clock_hand = (idx + 1) % len;
+            match &mut self.slots[idx] {
+                None => {
+                    self.slots[idx] = Some(entry);
+                    self.index.insert(path, idx);
+                    return;
+                }
+                Some(existing) if !existing.used => {
+                    self.index.remove(&existing.path);
+                    self.slots[idx] = Some(entry);
+                    self.index.insert(path, idx);
+                    return;
+                }
+                Some(existing) => {
+                    existing.used = false;
+                }
+            }
+        }
+        // Second hand after all entries had `used = true`: evict at current clock_hand.
+        let idx = self.clock_hand % len;
+        self.clock_hand = (idx + 1) % len;
+        if let Some(existing) = self.slots[idx].take() {
+            self.index.remove(&existing.path);
+        }
+        self.slots[idx] = Some(entry);
+        self.index.insert(path, idx);
+    }
+
+    fn remove(&mut self, path: &Path) {
+        self.evict_gen = self.evict_gen.wrapping_add(1);
+        if let Some(idx) = self.index.remove(path) {
+            if let Some(slot) = self.slots.get_mut(idx) {
+                *slot = None;
+            }
+        }
+    }
+}
+
+/// An open-file-descriptor cache with O(1) amortized clock-hand ("second chance")
+/// eviction, capped at `max_open` entries.
 ///
 /// `File`s are held behind `Arc` so callers can clone a handle out while holding the
-/// lock only briefly, then do the actual (blocking) I/O against their own `Arc<File>`
-/// clone without holding the cache lock for the duration - `File::write_at`/`read_at`
-/// (positioned I/O, `pwrite`/`pread` under the hood) are safe to call concurrently from
-/// multiple threads on a shared handle, so this doesn't need to serialize actual disk
-/// I/O through the cache's lock, only the "find or open the handle" step.
+/// lock only briefly, then do the actual positioned I/O (`pwrite`/`pread`) without
+/// holding the cache lock for the duration.
 pub struct FileCache {
-    max_open: usize,
-    files: Mutex<HashMap<PathBuf, Entry>>,
+    inner: Mutex<CacheInner>,
 }
 
 impl FileCache {
     pub fn new(max_open: usize) -> FileCache {
         FileCache {
-            max_open,
-            files: Mutex::new(HashMap::new()),
+            inner: Mutex::new(CacheInner::new(max_open)),
         }
     }
 
-    /// Returns a handle to `path`'s open file, opening (and creating/preallocating to
-    /// `file_len`, if given and the file doesn't already reach that length) it first if
-    /// necessary.
-    pub fn get_or_open(&self, path: &Path, file_len: Option<u64>) -> io::Result<Arc<File>> {
-        // Fast path: cached handle lookup under brief mutex hold
-        {
-            let mut files = self.files.lock().unwrap();
-            if let Some(entry) = files.get_mut(path) {
-                entry.used = true;
-                return Ok(entry.file.clone());
+    /// Returns a handle to `path`'s open file under the requested [`OpenMode`].
+    ///
+    /// - [`OpenMode::ReadOnly`]: opens read-only without creating missing parent directories
+    ///   or files (allows seeding read-only files/mounts and avoids creating empty ghost files
+    ///   when rechecking absent data).
+    /// - [`OpenMode::Write { file_len }`]: creates missing parents/file, upgrades a cached
+    ///   read-only handle if needed, and ensures real disk space is preallocated up to
+    ///   `file_len` if not already reserved through this handle.
+    pub fn get_or_open(&self, path: &Path, mode: OpenMode) -> io::Result<Arc<File>> {
+        // Fast path: cached handle lookup under brief mutex hold.
+        let (existing_upgrade, gen_before) = {
+            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let gen_before = inner.evict_gen;
+            if let Some(entry) = inner.get_mut(path) {
+                match mode {
+                    OpenMode::ReadOnly => {
+                        entry.used = true;
+                        return Ok(entry.file.clone());
+                    }
+                    OpenMode::Write { file_len }
+                        if entry.writable && entry.preallocated_len >= file_len =>
+                    {
+                        entry.used = true;
+                        return Ok(entry.file.clone());
+                    }
+                    OpenMode::Write { .. } if entry.writable => {
+                        entry.used = true;
+                        (Some(entry.file.clone()), gen_before)
+                    }
+                    OpenMode::Write { .. } => (None, gen_before),
+                }
+            } else {
+                (None, gen_before)
             }
+        };
+
+        // Fast upgrade when the file is already open read-write, just needs preallocation.
+        if let (Some(existing_file), OpenMode::Write { file_len }) = (existing_upgrade, mode) {
+            preallocate(&existing_file, file_len)?;
+            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            if inner.evict_gen == gen_before {
+                if let Some(entry) = inner.get_mut(path) {
+                    entry.preallocated_len = entry.preallocated_len.max(file_len);
+                    entry.used = true;
+                }
+            }
+            return Ok(existing_file);
         }
 
         // Slow path: perform directory creation, file opening, and disk preallocation
         // WITHOUT holding the cache mutex so concurrent cache hits and file accesses
         // across other swarms/threads are not blocked or serialized.
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        // `.truncate(false)` is explicit: this file may already hold partially-downloaded
-        // piece data from a previous run, and silently truncating it would lose data.
         let mut open_opts = OpenOptions::new();
-        open_opts
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false);
-        // `O_NOFOLLOW` closes the TOCTOU window between a caller's symlink check (e.g.
-        // `verify_no_symlinks_under`) and this open: if the final path component is a
-        // symlink planted after that check, the open fails with ELOOP instead of
-        // following it. `O_CREAT|O_NOFOLLOW` still creates a missing regular file fine.
-        #[cfg(unix)]
-        open_opts.custom_flags(libc::O_NOFOLLOW);
+        let (writable, preallocated_len) = match mode {
+            OpenMode::ReadOnly => {
+                open_opts.read(true);
+                #[cfg(unix)]
+                open_opts.custom_flags(libc::O_NOFOLLOW);
+                (false, 0)
+            }
+            OpenMode::Write { file_len } => {
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                // `.truncate(false)` is explicit: this file may already hold partially-downloaded
+                // piece data from a previous run, and silently truncating it would lose data.
+                open_opts
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(false);
+                #[cfg(unix)]
+                open_opts.custom_flags(libc::O_NOFOLLOW);
+                (true, file_len)
+            }
+        };
+
         let file = open_opts.open(path)?;
-        if let Some(len) = file_len {
-            preallocate(&file, len)?;
+        if let OpenMode::Write { file_len } = mode {
+            preallocate(&file, file_len)?;
         }
 
         let file = Arc::new(file);
-        let mut files = self.files.lock().unwrap();
-        // Check if another worker thread raced and cached this file handle while we opened it
-        if let Some(entry) = files.get_mut(path) {
-            entry.used = true;
-            return Ok(entry.file.clone());
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if inner.evict_gen != gen_before || inner.max_open == 0 {
+            return Ok(file);
         }
 
-        if files.len() >= self.max_open {
-            evict_one(&mut files);
+        // Check if another worker thread raced and cached an equal-or-stronger handle.
+        if let Some(entry) = inner.get_mut(path) {
+            let sufficient = match mode {
+                OpenMode::ReadOnly => true,
+                OpenMode::Write { file_len } => {
+                    entry.writable && entry.preallocated_len >= file_len
+                }
+            };
+            if sufficient {
+                entry.used = true;
+                return Ok(entry.file.clone());
+            }
         }
 
-        files.insert(
-            path.to_path_buf(),
+        let owned_path = path.to_path_buf();
+        inner.insert_or_replace(
+            owned_path.clone(),
             Entry {
+                path: owned_path,
                 file: file.clone(),
+                writable,
+                preallocated_len,
                 used: true,
             },
         );
         Ok(file)
     }
 
-    /// Drops the cached handle for `path`, if any (used on explicit file deletion).
+    /// Drops the cached handle for `path`, if any (used on explicit file deletion or move).
     pub fn evict(&self, path: &Path) {
-        self.files.lock().unwrap().remove(path);
-    }
-}
-
-fn evict_one(files: &mut HashMap<PathBuf, Entry>) {
-    if files.is_empty() {
-        return;
-    }
-    // Pass 1: find an entry whose used bit is false
-    for (path, entry) in files.iter_mut() {
-        if !entry.used {
-            let p = path.clone();
-            files.remove(&p);
-            return;
-        }
-        entry.used = false;
-    }
-    // Pass 2: all entries had used=true and are now reset to false; evict the first entry
-    if let Some(p) = files.keys().next().cloned() {
-        files.remove(&p);
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(path);
     }
 }
 
@@ -145,4 +265,59 @@ fn preallocate(file: &File, len: u64) -> io::Result<()> {
         file.set_len(len)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::tempdir;
+
+    #[test]
+    fn readonly_miss_does_not_create_empty_file_or_dirs() {
+        let dir = tempdir().unwrap();
+        let cache = FileCache::new(4);
+        let missing = dir.path().join("nonexistent_sub/file.bin");
+        let res = cache.get_or_open(&missing, OpenMode::ReadOnly);
+        assert!(res.is_err());
+        assert!(!missing.exists());
+        assert!(!dir.path().join("nonexistent_sub").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn readonly_file_can_be_opened_then_upgraded_on_write() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("ro.bin");
+        {
+            let mut f = File::create(&path).unwrap();
+            f.write_all(b"abcd").unwrap();
+        }
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+        let cache = FileCache::new(4);
+        let ro_handle = cache.get_or_open(&path, OpenMode::ReadOnly).unwrap();
+        assert_eq!(ro_handle.metadata().unwrap().len(), 4);
+
+        // Make writable and upgrade via Write mode; verify preallocation runs too.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let rw_handle = cache
+            .get_or_open(&path, OpenMode::Write { file_len: 128 })
+            .unwrap();
+        assert_eq!(rw_handle.metadata().unwrap().len(), 128);
+    }
+
+    #[test]
+    fn max_open_zero_does_not_cache() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("f.bin");
+        let cache = FileCache::new(0);
+        let _ = cache
+            .get_or_open(&path, OpenMode::Write { file_len: 4 })
+            .unwrap();
+        let inner = cache.inner.lock().unwrap();
+        assert!(inner.index.is_empty());
+        assert!(inner.slots.is_empty());
+    }
 }

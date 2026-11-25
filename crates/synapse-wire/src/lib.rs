@@ -44,7 +44,7 @@ pub mod udp_mux;
 pub mod utp;
 pub mod zeroconf;
 
-pub use bep40::{canonical_peer_priority, canonical_peer_score};
+pub use bep40::{bep40_peer_priority, canonical_peer_priority, canonical_peer_score, crc32c};
 pub use crypto::{
     mse_handshake_initiator, mse_handshake_receiver, mse_req2, EncryptedStream, EncryptionMode,
     Rc4Cipher, ReceiverHandshakeResult, CRYPTO_PLAINTEXT, CRYPTO_RC4,
@@ -55,16 +55,16 @@ pub use extension::{
 };
 pub use holepunch::{HolepunchMessage, HolepunchType};
 pub use lsd::{
-    format_lsd_announce, parse_lsd_announce, LsdAnnounce, LsdError, LSD_MULTICAST_IPV4,
-    LSD_MULTICAST_IPV6, LSD_PORT,
+    format_lsd_announce, format_lsd_announce_for_host, parse_lsd_announce, LsdAnnounce, LsdError,
+    LSD_MULTICAST_IPV4, LSD_MULTICAST_IPV6, LSD_PORT,
 };
 pub use pex::{
     UtPexMessage, PEX_FLAG_ENCRYPTION_PREFERRED, PEX_FLAG_SEEDER, PEX_FLAG_UTP_SUPPORTED,
 };
 pub use udp_mux::{UdpMux, UdpProtocol, UdpTransport};
 pub use utp::{
-    build_sack_bitmask, parse_sack_bitmask, UtpHeader, UtpPacket, UtpType, UTP_HEADER_LEN,
-    UTP_VERSION,
+    build_sack_bitmask, build_sack_bitmask_iter, parse_sack_bitmask, UtpHeader, UtpPacket, UtpType,
+    UTP_HEADER_LEN, UTP_VERSION,
 };
 
 const HANDSHAKE_LEN: usize = 68;
@@ -221,14 +221,21 @@ fn decode_message(src: &mut BytesMut) -> Result<Option<Message>, WireError> {
         src.advance(4);
         return Ok(Some(Message::KeepAlive));
     }
-    if len > MAX_MESSAGE_LEN {
+    if len > MAX_EXTENSION_LEN + 1 {
+        return Err(WireError::Protocol(
+            "message length exceeds MAX_EXTENSION_LEN",
+        ));
+    }
+    if src.len() >= 5 && src[4] != 20 && len > MAX_MESSAGE_LEN {
         return Err(WireError::Protocol(
             "message length exceeds MAX_MESSAGE_LEN",
         ));
     }
     let total = 4 + len as usize;
     if src.len() < total {
-        src.reserve(total - src.len());
+        // Bound speculative buffer reservations so a single length prefix cannot force
+        // an immediate multi-megabyte allocation before payload bytes arrive.
+        src.reserve((total - src.len()).min(64 * 1024));
         return Ok(None);
     }
 
@@ -741,10 +748,47 @@ mod tests {
     fn rejects_message_length_over_max() {
         let mut codec = PeerCodec::new();
         codec.handshake_read = true;
+
+        // Even before the message ID arrives, > MAX_EXTENSION_LEN + 1 is rejected.
         let mut buf = BytesMut::new();
-        buf.put_u32(MAX_MESSAGE_LEN + 1);
+        buf.put_u32(MAX_EXTENSION_LEN + 2);
         let err = codec.decode(&mut buf).unwrap_err();
         assert!(matches!(err, WireError::Protocol(_)));
+
+        // Non-extension messages remain capped at MAX_MESSAGE_LEN once the ID byte arrives.
+        let mut non_ext = BytesMut::new();
+        non_ext.put_u32(MAX_MESSAGE_LEN + 1);
+        non_ext.put_u8(5); // Bitfield
+        let err = codec.decode(&mut non_ext).unwrap_err();
+        assert!(matches!(err, WireError::Protocol(_)));
+    }
+
+    #[test]
+    fn decodes_large_extension_messages_up_to_max_extension_len_with_capped_reserve() {
+        let mut codec = PeerCodec::new();
+        codec.handshake_read = true;
+
+        // A partial 2 MiB extension header must not reserve the whole 2 MiB upfront.
+        let mut partial = BytesMut::with_capacity(64);
+        partial.put_u32(2 + (MAX_MESSAGE_LEN + 1024));
+        partial.put_u8(20);
+        partial.put_u8(1);
+        assert!(codec.decode(&mut partial).unwrap().is_none());
+        assert!(
+            partial.capacity() <= 128 * 1024,
+            "unexpectedly reserved {} bytes for partial frame",
+            partial.capacity()
+        );
+
+        // Full >1 MiB extension message up to MAX_EXTENSION_LEN decodes cleanly.
+        let payload = Bytes::from(vec![0xAB; MAX_MESSAGE_LEN as usize + 64]);
+        let msg = Message::Extension {
+            id: 2,
+            payload: payload.clone(),
+        };
+        let mut wire = BytesMut::new();
+        codec.encode(msg.clone(), &mut wire).unwrap();
+        assert_eq!(codec.decode(&mut wire).unwrap(), Some(msg));
     }
 
     #[test]

@@ -1,80 +1,88 @@
 //! BEP 41 UDP Tracker Protocol Extensions.
 //!
-//! Provides Type-Length-Value (TLV) extension option frames appended to BEP 15
-//! UDP tracker announce requests. Used for URLData (passkeys/auth tokens) and custom parameters.
+//! Provides Type-Length-Value (TLV) extension option frames appended directly after
+//! byte 98 of BEP 15 UDP tracker announce requests:
+//! - `0`: End of options (0 bytes, no length field)
+//! - `1`: NOP (1 byte, no length field)
+//! - `2`: URLData (`[type=2, len, ...bytes]`, consecutive segments concatenated)
+//! - `3`: Authentication (`[type=3, len, ...bytes]`)
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UdpOption {
-    /// Option 1: URLData (arbitrary query string / passkey data)
+    /// Option 2: URLData (arbitrary query string / passkey data)
     UrlData(String),
-    /// Option 2: Authentication token or credentials
+    /// Option 3: Authentication token or credentials
     Authentication(Vec<u8>),
     /// Generic or custom option
     Custom { option_type: u8, data: Vec<u8> },
 }
 
-pub const OPTION_URL_DATA: u8 = 1;
-pub const OPTION_AUTHENTICATION: u8 = 2;
+pub const OPTION_END: u8 = 0;
+pub const OPTION_NOP: u8 = 1;
+pub const OPTION_URL_DATA: u8 = 2;
+pub const OPTION_AUTHENTICATION: u8 = 3;
 
-/// Encodes a slice of BEP 41 options into a byte vector with the `0xBEFE` extension header.
+fn push_chunked_tlv(out: &mut Vec<u8>, option_type: u8, data: &[u8]) {
+    if data.is_empty() {
+        out.push(option_type);
+        out.push(0);
+        return;
+    }
+    for chunk in data.chunks(255) {
+        out.push(option_type);
+        out.push(chunk.len() as u8);
+        out.extend_from_slice(chunk);
+    }
+}
+
+/// Encodes a slice of BEP 41 options into a raw TLV byte vector (no magic prefix).
 pub fn encode_udp_options(options: &[UdpOption]) -> Vec<u8> {
     if options.is_empty() {
         return Vec::new();
     }
 
     let mut out = Vec::new();
-    // BEP 41 magic header
-    out.extend_from_slice(&0xBEFEu16.to_be_bytes());
 
     for opt in options {
         match opt {
             UdpOption::UrlData(ref s) => {
-                let bytes = s.as_bytes();
-                out.push(OPTION_URL_DATA);
-                out.push(bytes.len() as u8);
-                out.extend_from_slice(bytes);
+                push_chunked_tlv(&mut out, OPTION_URL_DATA, s.as_bytes());
             }
             UdpOption::Authentication(ref b) => {
-                out.push(OPTION_AUTHENTICATION);
-                out.push(b.len() as u8);
-                out.extend_from_slice(b);
+                push_chunked_tlv(&mut out, OPTION_AUTHENTICATION, b);
             }
             UdpOption::Custom {
                 option_type,
                 ref data,
-            } => {
-                out.push(*option_type);
-                out.push(data.len() as u8);
-                out.extend_from_slice(data);
-            }
+            } => match *option_type {
+                OPTION_END => out.push(OPTION_END),
+                OPTION_NOP => out.push(OPTION_NOP),
+                other => push_chunked_tlv(&mut out, other, data),
+            },
         }
     }
 
     // Trailing 0x00 option to indicate end of extension options
-    out.push(0x00);
+    out.push(OPTION_END);
     out
 }
 
-/// Decodes BEP 41 options from raw trailing bytes.
+/// Decodes BEP 41 options from raw trailing bytes (after the 98-byte BEP 15 header).
 pub fn decode_udp_options(data: &[u8]) -> Result<Vec<UdpOption>, &'static str> {
-    if data.len() < 2 {
-        return Ok(Vec::new());
-    }
-
-    let magic = u16::from_be_bytes([data[0], data[1]]);
-    if magic != 0xBEFE {
-        return Ok(Vec::new()); // No extension header
-    }
-
     let mut options = Vec::new();
-    let mut cursor = 2;
+    let mut pending_url: Option<Vec<u8>> = None;
+    let mut cursor = 0;
 
     while cursor < data.len() {
         let opt_type = data[cursor];
-        if opt_type == 0x00 {
-            break; // End of options
-        }
         cursor += 1;
+
+        if opt_type == OPTION_END {
+            break;
+        }
+        if opt_type == OPTION_NOP {
+            continue;
+        }
 
         if cursor >= data.len() {
             return Err("unexpected EOF reading option length");
@@ -88,11 +96,20 @@ pub fn decode_udp_options(data: &[u8]) -> Result<Vec<UdpOption>, &'static str> {
         let val_bytes = &data[cursor..cursor + opt_len];
         cursor += opt_len;
 
+        if opt_type == OPTION_URL_DATA {
+            pending_url
+                .get_or_insert_with(Vec::new)
+                .extend_from_slice(val_bytes);
+            continue;
+        }
+
+        if let Some(url_bytes) = pending_url.take() {
+            options.push(UdpOption::UrlData(
+                String::from_utf8_lossy(&url_bytes).to_string(),
+            ));
+        }
+
         match opt_type {
-            OPTION_URL_DATA => {
-                let s = String::from_utf8_lossy(val_bytes).to_string();
-                options.push(UdpOption::UrlData(s));
-            }
             OPTION_AUTHENTICATION => {
                 options.push(UdpOption::Authentication(val_bytes.to_vec()));
             }
@@ -103,6 +120,12 @@ pub fn decode_udp_options(data: &[u8]) -> Result<Vec<UdpOption>, &'static str> {
                 });
             }
         }
+    }
+
+    if let Some(url_bytes) = pending_url.take() {
+        options.push(UdpOption::UrlData(
+            String::from_utf8_lossy(&url_bytes).to_string(),
+        ));
     }
 
     Ok(options)
@@ -124,9 +147,54 @@ mod tests {
         ];
 
         let encoded = encode_udp_options(&options);
-        assert!(encoded.starts_with(&0xBEFEu16.to_be_bytes()));
+        assert_eq!(encoded[0], OPTION_URL_DATA);
+        assert_eq!(encoded[1] as usize, "passkey=abc123xyz".len());
+        assert_eq!(encoded.last().copied(), Some(OPTION_END));
 
         let decoded = decode_udp_options(&encoded).unwrap();
         assert_eq!(decoded, options);
+    }
+
+    #[test]
+    fn bep41_url_data_over_255_bytes_chunks_and_reassembles() {
+        let long_path = format!("/announce?token={}", "x".repeat(300));
+        let encoded = encode_udp_options(&[UdpOption::UrlData(long_path.clone())]);
+
+        // Must start directly with option type 2 and max first segment length 255.
+        assert_eq!(encoded[0], OPTION_URL_DATA);
+        assert_eq!(encoded[1], 255);
+        assert_eq!(encoded[2 + 255], OPTION_URL_DATA);
+
+        let decoded = decode_udp_options(&encoded).unwrap();
+        assert_eq!(decoded, vec![UdpOption::UrlData(long_path)]);
+    }
+
+    #[test]
+    fn bep41_skips_nop_and_stops_at_end_or_eof() {
+        let mut wire = vec![
+            OPTION_NOP,
+            OPTION_URL_DATA,
+            5,
+            b'h',
+            b'e',
+            b'l',
+            b'l',
+            b'o',
+            OPTION_NOP,
+            OPTION_END,
+            0x99, // trailing garbage after End must be ignored
+            0x01,
+        ];
+        assert_eq!(
+            decode_udp_options(&wire).unwrap(),
+            vec![UdpOption::UrlData("hello".to_string())]
+        );
+
+        // Without explicit End marker, EOF ends cleanly.
+        wire.truncate(9);
+        assert_eq!(
+            decode_udp_options(&wire).unwrap(),
+            vec![UdpOption::UrlData("hello".to_string())]
+        );
     }
 }

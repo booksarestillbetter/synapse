@@ -3,6 +3,7 @@ use rand::RngCore;
 use sha1::{Digest, Sha1};
 use std::io;
 use std::pin::Pin;
+use std::sync::OnceLock;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
@@ -40,6 +41,32 @@ pub const PRIME_P_HEX: &str = "\
 pub const CRYPTO_PLAINTEXT: u32 = 0x01;
 pub const CRYPTO_RC4: u32 = 0x02;
 
+fn prime_p() -> &'static BigUint {
+    static PRIME_P: OnceLock<BigUint> = OnceLock::new();
+    PRIME_P.get_or_init(|| {
+        let p_bytes = hex::decode(PRIME_P_HEX).expect("valid hex for prime P");
+        BigUint::from_bytes_be(&p_bytes)
+    })
+}
+
+fn prime_p_minus_2() -> &'static BigUint {
+    static PRIME_P_MINUS_2: OnceLock<BigUint> = OnceLock::new();
+    PRIME_P_MINUS_2.get_or_init(|| prime_p() - BigUint::from(2u32))
+}
+
+/// Rejects degenerate/small-subgroup DH public keys (`Y < 2` or `Y > P - 2`)
+/// before modular exponentiation so peers cannot force predictable secrets (`0`, `1`, `P - 1`).
+pub fn validate_dh_public_key(remote_public: &[u8; 96]) -> Result<(), io::Error> {
+    let y = BigUint::from_bytes_be(remote_public);
+    if y < BigUint::from(2u32) || &y > prime_p_minus_2() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "MSE DH public key out of range [2, P-2]",
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub struct DhKeyPair {
     pub private_key: BigUint,
@@ -51,13 +78,16 @@ impl DhKeyPair {
         let mut rng = rand::thread_rng();
         let mut priv_bytes = [0u8; 20];
         rng.fill_bytes(&mut priv_bytes);
-        let private_key = BigUint::from_bytes_be(&priv_bytes);
+        let mut private_key = BigUint::from_bytes_be(&priv_bytes);
+        let two = BigUint::from(2u32);
+        if private_key < two {
+            private_key += two;
+        }
 
-        let p_bytes = hex::decode(PRIME_P_HEX).expect("valid hex for prime P");
-        let p = BigUint::from_bytes_be(&p_bytes);
+        let p = prime_p();
         let g = BigUint::from(2u32);
 
-        let pub_big = g.modpow(&private_key, &p);
+        let pub_big = g.modpow(&private_key, p);
         let pub_raw = pub_big.to_bytes_be();
         let mut public_key = [0u8; 96];
         if pub_raw.len() <= 96 {
@@ -73,11 +103,10 @@ impl DhKeyPair {
     }
 
     pub fn compute_shared_secret(&self, remote_public: &[u8; 96]) -> [u8; 96] {
-        let p_bytes = hex::decode(PRIME_P_HEX).expect("valid hex for prime P");
-        let p = BigUint::from_bytes_be(&p_bytes);
+        let p = prime_p();
         let remote_big = BigUint::from_bytes_be(remote_public);
 
-        let secret_big = remote_big.modpow(&self.private_key, &p);
+        let secret_big = remote_big.modpow(&self.private_key, p);
         let secret_raw = secret_big.to_bytes_be();
         let mut secret = [0u8; 96];
         if secret_raw.len() <= 96 {
@@ -154,7 +183,7 @@ impl Rc4Cipher {
     }
 
     pub fn discard(&mut self, count: usize) {
-        let mut dummy = vec![0u8; count.min(1024)];
+        let mut dummy = [0u8; 256];
         let mut remaining = count;
         while remaining > 0 {
             let chunk = remaining.min(dummy.len());
@@ -314,6 +343,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for EncryptedStream<S> {
                 Poll::Ready(Ok(n)) => {
                     *write_offset += n;
                 }
+                Poll::Ready(Err(e)) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Pending => return Poll::Pending,
             }
@@ -327,27 +357,48 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for EncryptedStream<S> {
         }
 
         if let Some(enc) = encryptor {
-            let mut encrypted = buf.to_vec();
-            enc.apply_keystream(&mut encrypted);
+            write_buf.extend_from_slice(buf);
+            enc.apply_keystream(write_buf);
 
-            // Attempt immediate write to underlying stream
-            match Pin::new(&mut *stream).poll_write(cx, &encrypted) {
-                Poll::Ready(Ok(n)) => {
-                    if n < encrypted.len() {
-                        *write_buf = encrypted;
-                        *write_offset = n;
+            // Attempt immediate write to underlying stream (retrying EINTR while ciphertext is staged)
+            loop {
+                match Pin::new(&mut *stream).poll_write(cx, write_buf) {
+                    Poll::Ready(Ok(0)) => {
+                        write_buf.clear();
+                        *write_offset = 0;
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::WriteZero,
+                            "failed to write encrypted data to stream",
+                        )));
                     }
-                    Poll::Ready(Ok(buf.len()))
-                }
-                Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-                Poll::Pending => {
-                    *write_buf = encrypted;
-                    *write_offset = 0;
-                    Poll::Ready(Ok(buf.len()))
+                    Poll::Ready(Ok(n)) => {
+                        if n >= write_buf.len() {
+                            write_buf.clear();
+                            *write_offset = 0;
+                        } else {
+                            *write_offset = n;
+                        }
+                        return Poll::Ready(Ok(buf.len()));
+                    }
+                    Poll::Ready(Err(e)) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Poll::Ready(Err(e)) => {
+                        write_buf.clear();
+                        *write_offset = 0;
+                        return Poll::Ready(Err(e));
+                    }
+                    Poll::Pending => {
+                        *write_offset = 0;
+                        return Poll::Ready(Ok(buf.len()));
+                    }
                 }
             }
         } else {
-            Pin::new(&mut *stream).poll_write(cx, buf)
+            loop {
+                match Pin::new(&mut *stream).poll_write(cx, buf) {
+                    Poll::Ready(Err(e)) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    other => return other,
+                }
+            }
         }
     }
 
@@ -371,6 +422,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for EncryptedStream<S> {
                 Poll::Ready(Ok(n)) => {
                     *write_offset += n;
                 }
+                Poll::Ready(Err(e)) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Pending => return Poll::Pending,
             }
@@ -381,8 +433,11 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for EncryptedStream<S> {
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let _ = self.as_mut().poll_flush(cx);
-        Pin::new(&mut self.get_mut().stream).poll_shutdown(cx)
+        match self.as_mut().poll_flush(cx) {
+            Poll::Ready(Ok(())) => Pin::new(&mut self.get_mut().stream).poll_shutdown(cx),
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
 
@@ -400,7 +455,9 @@ where
         return Ok(EncryptedStream::new_plain(stream));
     }
 
-    let dh = DhKeyPair::generate();
+    let dh = tokio::task::spawn_blocking(DhKeyPair::generate)
+        .await
+        .map_err(io::Error::other)?;
     // Step 1: Send Ya (96 bytes)
     stream.write_all(&dh.public_key).await?;
     stream.flush().await?;
@@ -408,9 +465,12 @@ where
     // Step 2: Read Yb (96 bytes)
     let mut their_pub = [0u8; 96];
     stream.read_exact(&mut their_pub).await?;
+    validate_dh_public_key(&their_pub)?;
 
     // Compute S and keys
-    let s = dh.compute_shared_secret(&their_pub);
+    let s = tokio::task::spawn_blocking(move || dh.compute_shared_secret(&their_pub))
+        .await
+        .map_err(io::Error::other)?;
     let (key_a, key_b) = mse_derive_keys(&s, &info_hash);
 
     let req1 = mse_req1(&s);
@@ -428,7 +488,7 @@ where
     };
 
     // Encrypt: VC (8 zeros) + crypto_provide (4 bytes) + len(PadC) (2 bytes = 0) + len(IA) (2 bytes) + IA
-    let mut encrypted_payload = Vec::new();
+    let mut encrypted_payload = Vec::with_capacity(16 + initial_payload.len());
     encrypted_payload.extend_from_slice(&[0u8; 8]); // VC
     encrypted_payload.extend_from_slice(&crypto_provide.to_be_bytes());
     encrypted_payload.extend_from_slice(&0u16.to_be_bytes()); // PadC len = 0
@@ -485,9 +545,9 @@ where
         ));
     }
     if pad_d_len > 0 {
-        let mut pad_d = vec![0u8; pad_d_len];
-        stream.read_exact(&mut pad_d).await?;
-        dec_b.apply_keystream(&mut pad_d);
+        let mut pad_d = [0u8; 512];
+        stream.read_exact(&mut pad_d[..pad_d_len]).await?;
+        dec_b.apply_keystream(&mut pad_d[..pad_d_len]);
     }
 
     match crypto_select {
@@ -564,12 +624,18 @@ where
     let mut ya = [0u8; 96];
     ya[..20].copy_from_slice(&initial_20);
     stream.read_exact(&mut ya[20..]).await?;
+    validate_dh_public_key(&ya)?;
 
-    let dh = DhKeyPair::generate();
-    let s = dh.compute_shared_secret(&ya);
+    let (public_key, s) = tokio::task::spawn_blocking(move || {
+        let dh = DhKeyPair::generate();
+        let s = dh.compute_shared_secret(&ya);
+        (dh.public_key, s)
+    })
+    .await
+    .map_err(io::Error::other)?;
 
     // Send Yb (96 bytes)
-    stream.write_all(&dh.public_key).await?;
+    stream.write_all(&public_key).await?;
     stream.flush().await?;
 
     let req1 = mse_req1(&s);
@@ -636,9 +702,9 @@ where
         ));
     }
     if pad_c_len > 0 {
-        let mut pad_c = vec![0u8; pad_c_len];
-        stream.read_exact(&mut pad_c).await?;
-        dec_a.apply_keystream(&mut pad_c);
+        let mut pad_c = [0u8; 512];
+        stream.read_exact(&mut pad_c[..pad_c_len]).await?;
+        dec_a.apply_keystream(&mut pad_c[..pad_c_len]);
     }
 
     // Decrypt len(IA) (2 bytes)
@@ -668,10 +734,8 @@ where
     };
 
     // Send receiver response: encrypted VC (8 bytes) + crypto_select (4 bytes) + len(PadD) (0)
-    let mut resp = Vec::new();
-    resp.extend_from_slice(&[0u8; 8]);
-    resp.extend_from_slice(&crypto_select.to_be_bytes());
-    resp.extend_from_slice(&0u16.to_be_bytes());
+    let mut resp = [0u8; 14];
+    resp[8..12].copy_from_slice(&crypto_select.to_be_bytes());
     enc_b.apply_keystream(&mut resp);
 
     stream.write_all(&resp).await?;
@@ -1015,5 +1079,104 @@ mod tests {
         assert_eq!(PRIME_P_HEX.len(), 192);
         assert!(PRIME_P_HEX.ends_with("36210000000000090563"));
         assert!(!PRIME_P_HEX.ends_with("3620FFFFFFFFFFFFFFFF"));
+    }
+
+    #[test]
+    fn validate_dh_public_key_rejects_degenerate_and_out_of_range_keys() {
+        let zero = [0u8; 96];
+        assert!(validate_dh_public_key(&zero).is_err());
+
+        let mut one = [0u8; 96];
+        one[95] = 1;
+        assert!(validate_dh_public_key(&one).is_err());
+
+        let all_ff = [0xFFu8; 96];
+        assert!(validate_dh_public_key(&all_ff).is_err());
+
+        let p_bytes = hex::decode(PRIME_P_HEX).unwrap();
+        let p_arr: [u8; 96] = p_bytes.clone().try_into().unwrap();
+        assert!(validate_dh_public_key(&p_arr).is_err());
+
+        let p_minus_1 = (BigUint::from_bytes_be(&p_arr) - BigUint::from(1u32)).to_bytes_be();
+        let p_minus_1_arr: [u8; 96] = p_minus_1.try_into().unwrap();
+        assert!(validate_dh_public_key(&p_minus_1_arr).is_err());
+
+        let mut two = [0u8; 96];
+        two[95] = 2;
+        assert!(validate_dh_public_key(&two).is_ok());
+        assert!(validate_dh_public_key(&DhKeyPair::generate().public_key).is_ok());
+    }
+
+    #[tokio::test]
+    async fn encrypted_stream_flushes_pending_buffer_across_eintr_before_shutdown() {
+        struct FlakySink {
+            written: Vec<u8>,
+            calls: usize,
+            shutdown_called: bool,
+        }
+
+        impl AsyncWrite for FlakySink {
+            fn poll_write(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                self.calls += 1;
+                match self.calls {
+                    // First immediate write sees Pending -> data stays buffered in write_buf.
+                    1 => {
+                        cx.waker().wake_by_ref();
+                        Poll::Pending
+                    }
+                    // Second attempt gets EINTR, must retry cleanly without losing keystream.
+                    2 => Poll::Ready(Err(io::Error::new(io::ErrorKind::Interrupted, "eintr"))),
+                    // Third attempt writes half.
+                    3 => {
+                        let half = (buf.len() / 2).max(1);
+                        self.written.extend_from_slice(&buf[..half]);
+                        cx.waker().wake_by_ref();
+                        Poll::Ready(Ok(half))
+                    }
+                    // Fourth attempt drains the rest.
+                    _ => {
+                        self.written.extend_from_slice(buf);
+                        Poll::Ready(Ok(buf.len()))
+                    }
+                }
+            }
+
+            fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn poll_shutdown(
+                mut self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<io::Result<()>> {
+                assert!(
+                    !self.written.is_empty(),
+                    "poll_shutdown ran before buffered ciphertext finished flushing"
+                );
+                self.shutdown_called = true;
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        let sink = FlakySink {
+            written: Vec::new(),
+            calls: 0,
+            shutdown_called: false,
+        };
+        let key = b"stream-key-1234567890";
+        let mut enc = EncryptedStream::new_encrypted(sink, key, key);
+        let msg = b"hello encrypted shutdown world!";
+        enc.write_all(msg).await.unwrap();
+        enc.shutdown().await.unwrap();
+
+        let inner = enc.get_ref();
+        assert!(inner.shutdown_called);
+        let mut plain = inner.written.clone();
+        Rc4Cipher::new(key).apply_keystream(&mut plain);
+        assert_eq!(&plain, msg);
     }
 }

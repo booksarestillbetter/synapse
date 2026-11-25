@@ -24,8 +24,10 @@ const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 /// torrent's announce URL cannot be aimed at an arbitrary local service.
 const TRACKER_PATH_SEGMENTS: &[&str] = &["announce", "scrape"];
 
-/// GETs `url` through the SSRF-checked, size-capped client and returns the body of a 200.
-pub(crate) async fn fetch_tracker_body(url: reqwest::Url) -> Result<Vec<u8>, TrackerError> {
+/// GETs `url` through the SSRF-checked, size-capped client and returns the body and remote address of a 200.
+pub(crate) async fn fetch_tracker_body_with_addr(
+    url: reqwest::Url,
+) -> Result<(Vec<u8>, Option<SocketAddr>), TrackerError> {
     let opts = FetchOptions {
         timeout: REQUEST_TIMEOUT,
         max_body: MAX_RESPONSE_BYTES,
@@ -39,7 +41,13 @@ pub(crate) async fn fetch_tracker_body(url: reqwest::Url) -> Result<Vec<u8>, Tra
     if fetched.status != 200 {
         return Err(TrackerError::Malformed("tracker did not return HTTP 200"));
     }
-    Ok(fetched.body)
+    Ok((fetched.body, fetched.remote_addr))
+}
+
+pub(crate) async fn fetch_tracker_body(url: reqwest::Url) -> Result<Vec<u8>, TrackerError> {
+    fetch_tracker_body_with_addr(url)
+        .await
+        .map(|(body, _)| body)
 }
 
 fn map_fetch_error(e: FetchError) -> TrackerError {
@@ -49,6 +57,7 @@ fn map_fetch_error(e: FetchError) -> TrackerError {
         FetchError::Blocked(why) => TrackerError::InvalidUrl(why),
         FetchError::InvalidUrl(why) => TrackerError::InvalidUrl(why),
         FetchError::TooManyRedirects => TrackerError::Malformed("too many redirects"),
+        FetchError::Timeout => TrackerError::Timeout,
         FetchError::Resolve => TrackerError::Network("could not resolve tracker host".into()),
     }
 }
@@ -62,9 +71,11 @@ pub async fn announce(url: &Url, req: &AnnounceRequest) -> Result<AnnounceRespon
     }
 
     let target_url = build_announce_url(url, req)?;
-    let bytes = fetch_tracker_body(target_url).await?;
+    let (bytes, remote_addr) = fetch_tracker_body_with_addr(target_url).await?;
 
-    parse_response(&bytes)
+    let mut resp = parse_response(&bytes)?;
+    resp.remote_addr = remote_addr;
+    Ok(resp)
 }
 
 pub async fn scrape(
@@ -139,7 +150,28 @@ fn build_scrape_url(url: &Url, info_hashes: &[[u8; 20]]) -> Result<reqwest::Url,
         Some((base, _)) => base,
         None => url_str,
     };
-    let scrape_base = base_no_frag.replace("/announce", "/scrape");
+    let (path_part, existing_query) = match base_no_frag.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (base_no_frag, None),
+    };
+    let scheme_end = path_part.find("://").map_or(0, |i| i + 3);
+    let last_slash = path_part[scheme_end..]
+        .rfind('/')
+        .map(|i| scheme_end + i)
+        .ok_or(TrackerError::InvalidUrl(
+            "tracker URL does not support scrape",
+        ))?;
+    let tail = &path_part[last_slash + 1..];
+    let suffix = tail
+        .strip_prefix("announce")
+        .ok_or(TrackerError::InvalidUrl(
+            "tracker URL does not support scrape",
+        ))?;
+    let scrape_base = match existing_query {
+        Some(q) => format!("{}scrape{suffix}?{q}", &path_part[..last_slash + 1]),
+        None => format!("{}scrape{suffix}", &path_part[..last_slash + 1]),
+    };
+
     let mut query = String::new();
     for (i, hash) in info_hashes.iter().enumerate() {
         if i > 0 {
@@ -165,6 +197,7 @@ fn build_scrape_url(url: &Url, info_hashes: &[[u8; 20]]) -> Result<reqwest::Url,
 }
 
 fn map_reqwest_error(e: reqwest::Error) -> TrackerError {
+    let e = e.without_url();
     if e.is_timeout() {
         TrackerError::Timeout
     } else {
@@ -345,6 +378,7 @@ pub fn parse_response(data: &[u8]) -> Result<AnnounceResponse, TrackerError> {
         tracker_id,
         warning,
         external_ip,
+        remote_addr: None,
     })
 }
 
@@ -600,5 +634,24 @@ mod tests {
             q.contains("&ipv6=2001%3Adb8%3A%3A5") || q.contains("&ipv6=2001:db8::5"),
             "{q}"
         );
+    }
+
+    #[test]
+    fn build_scrape_url_replaces_only_final_announce_segment_and_rejects_unsupported() {
+        let hash = [0x12u8; 20];
+        let u = Url::parse("http://127.0.0.1:8080/announce/passkey123/announce.php?x=1").unwrap();
+        let scrape = build_scrape_url(&u, &[hash]).unwrap();
+        assert_eq!(
+            scrape.path(),
+            "/announce/passkey123/scrape.php",
+            "only final path segment should be replaced"
+        );
+        assert!(scrape.query().unwrap().starts_with("x=1&info_hash="));
+
+        let no_announce = Url::parse("http://127.0.0.1:8080/tracker/custom").unwrap();
+        assert!(matches!(
+            build_scrape_url(&no_announce, &[hash]),
+            Err(TrackerError::InvalidUrl(_))
+        ));
     }
 }

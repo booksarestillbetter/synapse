@@ -25,21 +25,41 @@ impl SuperSeeder {
 
     /// Selects the next unique piece to offer to a peer.
     pub fn assign_piece_to_peer(&mut self, peer_id: u64) -> Option<u32> {
-        if self.confirmed_distributed.len() == self.total_pieces as usize {
-            // All pieces are distributed to the swarm, normal seeding can resume
+        self.assign_piece_to_peer_filtered(peer_id, |_| false)
+    }
+
+    /// Selects the next unique unconfirmed and unassigned piece that `peer_already_has` does not hold.
+    pub fn assign_piece_to_peer_filtered<F>(
+        &mut self,
+        peer_id: u64,
+        peer_already_has: F,
+    ) -> Option<u32>
+    where
+        F: Fn(u32) -> bool,
+    {
+        if self.total_pieces == 0 || self.confirmed_distributed.len() == self.total_pieces as usize
+        {
             return None;
         }
 
         if let Some(&already_assigned) = self.assigned_pieces.get(&peer_id) {
-            return Some(already_assigned);
+            if !self.confirmed_distributed.contains(&already_assigned)
+                && !peer_already_has(already_assigned)
+            {
+                return Some(already_assigned);
+            }
+            self.assigned_pieces.remove(&peer_id);
         }
 
-        // Find a piece that hasn't been confirmed yet
+        // Find a piece that is neither confirmed nor currently assigned to another peer.
         for _ in 0..self.total_pieces {
             let candidate = self.next_piece_cursor;
             self.next_piece_cursor = (self.next_piece_cursor + 1) % self.total_pieces;
 
-            if !self.confirmed_distributed.contains(&candidate) {
+            if !self.confirmed_distributed.contains(&candidate)
+                && !peer_already_has(candidate)
+                && !self.assigned_pieces.values().any(|&p| p == candidate)
+            {
                 self.assigned_pieces.insert(peer_id, candidate);
                 return Some(candidate);
             }
@@ -103,5 +123,23 @@ mod tests {
         // Now Peer 1 can be assigned a new piece (piece 2)
         let p2 = ss.assign_piece_to_peer(1).unwrap();
         assert_eq!(p2, 2);
+    }
+
+    #[test]
+    fn super_seeder_avoids_double_assignment_and_skips_held_pieces_and_empty_torrents() {
+        let mut empty = SuperSeeder::new(0);
+        assert_eq!(empty.assign_piece_to_peer(1), None);
+
+        let mut ss = SuperSeeder::new(3);
+        let p1 = ss.assign_piece_to_peer(1).unwrap();
+        assert_eq!(p1, 0);
+        // Peer 2 already holds piece 1, so skip to unassigned piece 2.
+        let p2 = ss.assign_piece_to_peer_filtered(2, |idx| idx == 1).unwrap();
+        assert_eq!(p2, 2);
+        // Peer 3 cannot get 0 or 2 (already assigned to peers 1 and 2); only piece 1 is free.
+        let p3 = ss.assign_piece_to_peer(3).unwrap();
+        assert_eq!(p3, 1);
+        // Peer 4 gets None while all unconfirmed pieces are actively assigned.
+        assert_eq!(ss.assign_piece_to_peer(4), None);
     }
 }

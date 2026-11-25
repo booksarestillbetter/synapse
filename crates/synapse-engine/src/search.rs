@@ -51,18 +51,50 @@ impl SearchManager {
         self.allow_local_for_tests
             .store(allow, std::sync::atomic::Ordering::Relaxed);
     }
+    /// Loads a `.btsearch` description strictly from an `http://` or `https://` URL (safe
+    /// for remote HTTP/RPC callers; local file paths are refused).
+    pub async fn add_url_source(&self, source: &str) -> Result<SearchEngine, String> {
+        let trimmed = source.trim();
+        if !trimmed.starts_with("http://") && !trimmed.starts_with("https://") {
+            return Err("only http:// and https:// .btsearch URLs are permitted".into());
+        }
+        let url = url::Url::parse(trimmed).map_err(|e| format!("bad URL: {e}"))?;
+        let policy = if self
+            .allow_local_for_tests
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            LocalPolicy::AllowAny
+        } else {
+            LocalPolicy::Deny
+        };
+        let fetched = fetch(&url, &options(MAX_DESCRIPTION_BYTES, policy))
+            .await
+            .map_err(|e| format!("could not fetch the description: {e}"))?;
+        if !(200..300).contains(&fetched.status) {
+            return Err(format!("the server answered HTTP {}", fetched.status));
+        }
+        let text = String::from_utf8_lossy(&fetched.body).into_owned();
+        self.register_engine_xml(trimmed, &text)
+    }
+
+    fn register_engine_xml(&self, source: &str, text: &str) -> Result<SearchEngine, String> {
+        let engine = SearchEngine::from_xml(text).map_err(|e| e.to_string())?;
+        let mut engines = self.engines.write();
+        engines.retain(|(_, e)| e.short_name != engine.short_name);
+        if engines.len() >= MAX_ENGINES {
+            return Err(format!(
+                "at most {MAX_ENGINES} search engines can be configured"
+            ));
+        }
+        engines.push((source.to_string(), engine.clone()));
+        Ok(engine)
+    }
+
     /// Loads a `.btsearch` description from a file path or an http(s) URL and registers it,
     /// replacing an engine of the same name.
     pub async fn add_source(&self, source: &str) -> Result<SearchEngine, String> {
         let text = if source.starts_with("http://") || source.starts_with("https://") {
-            let url = url::Url::parse(source).map_err(|e| format!("bad URL: {e}"))?;
-            let fetched = fetch(&url, &options(MAX_DESCRIPTION_BYTES, LocalPolicy::Deny))
-                .await
-                .map_err(|e| format!("could not fetch the description: {e}"))?;
-            if !(200..300).contains(&fetched.status) {
-                return Err(format!("the server answered HTTP {}", fetched.status));
-            }
-            String::from_utf8_lossy(&fetched.body).into_owned()
+            return self.add_url_source(source).await;
         } else {
             let path = Path::new(source);
             if path.components().any(|c| matches!(c, Component::ParentDir)) {
@@ -92,16 +124,7 @@ impl SearchManager {
             }
             String::from_utf8_lossy(&bytes).into_owned()
         };
-        let engine = SearchEngine::from_xml(&text).map_err(|e| e.to_string())?;
-        let mut engines = self.engines.write();
-        engines.retain(|(_, e)| e.short_name != engine.short_name);
-        if engines.len() >= MAX_ENGINES {
-            return Err(format!(
-                "at most {MAX_ENGINES} search engines can be configured"
-            ));
-        }
-        engines.push((source.to_string(), engine.clone()));
-        Ok(engine)
+        self.register_engine_xml(source, &text)
     }
 
     pub fn remove(&self, name: &str) -> bool {

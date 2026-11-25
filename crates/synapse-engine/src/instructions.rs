@@ -112,17 +112,20 @@ impl FileOp {
                     format!("destination {:?} is a symlink or directory", dst),
                 ));
             }
+            if StagingPlugin::is_same_file(&src_meta, &dst_meta, src, dst) {
+                return Ok(());
+            }
         }
         match self {
             FileOp::Hardlink => StagingPlugin::link_or_copy(src, dst),
-            FileOp::Copy => {
-                std::fs::copy(src, dst)?;
-                Ok(())
-            }
+            FileOp::Copy => StagingPlugin::copy_via_temp_and_rename(src, dst),
             FileOp::Move => match std::fs::rename(src, dst) {
                 Ok(()) => Ok(()),
-                Err(e) if e.raw_os_error() == Some(18) /* EXDEV */ => {
-                    std::fs::copy(src, dst)?;
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::CrossesDevices
+                        || e.raw_os_error() == Some(18) =>
+                {
+                    StagingPlugin::copy_via_temp_and_rename(src, dst)?;
                     std::fs::remove_file(src)?;
                     Ok(())
                 }
@@ -362,5 +365,33 @@ impl LifecyclePlugin for InstructionsWebhookPlugin {
             },
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_op_copy_and_move_preserve_same_file_and_existing_dst_on_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("movie.mkv");
+        std::fs::write(&src, b"payload bytes").unwrap();
+
+        // Copy onto itself / same inode must succeed cleanly without truncating data.
+        FileOp::Copy.apply(&src, &src).unwrap();
+        assert_eq!(std::fs::read(&src).unwrap(), b"payload bytes");
+
+        // Move onto itself must preserve data.
+        FileOp::Move.apply(&src, &src).unwrap();
+        assert_eq!(std::fs::read(&src).unwrap(), b"payload bytes");
+
+        // Failed copy preserves existing destination.
+        let dst = dir.path().join("existing.mkv");
+        std::fs::write(&dst, b"keep").unwrap();
+        assert!(FileOp::Copy
+            .apply(&dir.path().join("missing.mkv"), &dst)
+            .is_err());
+        assert_eq!(std::fs::read(&dst).unwrap(), b"keep");
     }
 }

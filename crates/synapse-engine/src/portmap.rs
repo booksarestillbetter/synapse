@@ -86,7 +86,7 @@ pub fn decode_pcp_map_response(
         // A NAT-PMP-only gateway answers an unknown version with "unsupported version".
         return Err(PcpError::UnsupportedVersion);
     }
-    if buf.len() < PCP_MAP_LEN {
+    if buf.len() < 24 {
         return Err(PcpError::Malformed("PCP response too short"));
     }
     if buf[0] != 2 {
@@ -101,6 +101,9 @@ pub fn decode_pcp_map_response(
     }
     if result != 0 {
         return Err(PcpError::Refused(result));
+    }
+    if buf.len() < PCP_MAP_LEN {
+        return Err(PcpError::Malformed("PCP MAP response too short"));
     }
     // The response must echo our nonce, protocol and internal port: it is the only thing tying
     // it to our request.
@@ -130,9 +133,30 @@ pub async fn local_ip_towards(target: SocketAddr) -> std::io::Result<IpAddr> {
     Ok(sock.local_addr()?.ip())
 }
 
-/// Requests a PCP mapping from `gateway`.
+/// Requests a PCP mapping from `gateway` using a fresh random mapping nonce.
 pub async fn send_pcp_mapping(
     gateway: SocketAddr,
+    protocol: PortProtocol,
+    internal_port: u16,
+    suggested_external_port: u16,
+    lifetime_secs: u32,
+) -> Result<PcpMapping, PcpError> {
+    send_pcp_mapping_with_nonce(
+        gateway,
+        rand::random(),
+        protocol,
+        internal_port,
+        suggested_external_port,
+        lifetime_secs,
+    )
+    .await
+}
+
+/// Requests, renews, or deletes a PCP mapping from `gateway` with an explicit 12-byte
+/// mapping nonce (RFC 6887 §11.1 requires reusing the original nonce when renewing or deleting).
+pub async fn send_pcp_mapping_with_nonce(
+    gateway: SocketAddr,
+    nonce: [u8; 12],
     protocol: PortProtocol,
     internal_port: u16,
     suggested_external_port: u16,
@@ -155,7 +179,6 @@ pub async fn send_pcp_mapping(
         .local_addr()
         .map_err(|_| PcpError::Malformed("no local address"))?
         .ip();
-    let nonce: [u8; 12] = rand::random();
     let req = encode_pcp_map_request(
         &nonce,
         client_ip,
@@ -332,6 +355,7 @@ pub fn parse_soap_error_code(body: &str) -> Option<u32> {
 
 fn http_client() -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
+        .no_proxy()
         .timeout(HTTP_TIMEOUT)
         .redirect(reqwest::redirect::Policy::none())
         .build()
@@ -522,6 +546,15 @@ pub struct Mapping {
     /// Seconds until the mapping expires (0 = permanent).
     pub lifetime_secs: u32,
     pub gateway: IpAddr,
+    /// RFC 6887 PCP mapping nonce preserved for renewals and releases.
+    pcp_nonce: Option<[u8; 12]>,
+}
+
+impl Mapping {
+    /// Returns the 12-byte PCP mapping nonce when mapped via [`Method::Pcp`].
+    pub fn pcp_nonce(&self) -> Option<[u8; 12]> {
+        self.pcp_nonce
+    }
 }
 
 /// Where to look for a gateway.
@@ -564,7 +597,8 @@ impl Discovery {
 
 const LEASE_SECS: u32 = 3600;
 
-/// Obtains a mapping for `port`, trying PCP, then NAT-PMP, then UPnP against every candidate.
+/// Obtains a mapping for `port`, probing candidate PCP/NAT-PMP gateways concurrently before
+/// falling back to UPnP IGD discovery.
 pub async fn acquire(
     discovery: &Discovery,
     protocol: PortProtocol,
@@ -572,29 +606,46 @@ pub async fn acquire(
     description: &str,
 ) -> Result<Mapping, String> {
     let mut errors: Vec<String> = Vec::new();
-    for gw in &discovery.gateways {
-        match send_pcp_mapping(*gw, protocol, port, port, LEASE_SECS).await {
-            Ok(m) => {
-                return Ok(Mapping {
-                    method: Method::Pcp(*gw),
+    let mut probes = tokio::task::JoinSet::new();
+    for &gw in &discovery.gateways {
+        probes.spawn(async move {
+            let mut errs: Vec<String> = Vec::new();
+            let nonce: [u8; 12] = rand::random();
+            match send_pcp_mapping_with_nonce(gw, nonce, protocol, port, port, LEASE_SECS).await {
+                Ok(m) => {
+                    return Ok(Mapping {
+                        method: Method::Pcp(gw),
+                        external_port: m.external_port,
+                        lifetime_secs: m.lifetime_secs,
+                        gateway: gw.ip(),
+                        pcp_nonce: Some(nonce),
+                    })
+                }
+                Err(PcpError::UnsupportedVersion) | Err(PcpError::Malformed(_)) => {}
+                Err(PcpError::Refused(code)) => {
+                    errs.push(format!("PCP refused with result {code}"))
+                }
+            }
+            match send_natpmp_mapping(gw, protocol, port, port, LEASE_SECS).await {
+                Ok(m) => Ok(Mapping {
+                    method: Method::NatPmp(gw),
                     external_port: m.external_port,
                     lifetime_secs: m.lifetime_secs,
                     gateway: gw.ip(),
-                })
+                    pcp_nonce: None,
+                }),
+                Err(e) => {
+                    errs.push(e);
+                    Err(errs)
+                }
             }
-            Err(PcpError::UnsupportedVersion) | Err(PcpError::Malformed(_)) => {}
-            Err(PcpError::Refused(code)) => errors.push(format!("PCP refused with result {code}")),
-        }
-        match send_natpmp_mapping(*gw, protocol, port, port, LEASE_SECS).await {
-            Ok(m) => {
-                return Ok(Mapping {
-                    method: Method::NatPmp(*gw),
-                    external_port: m.external_port,
-                    lifetime_secs: m.lifetime_secs,
-                    gateway: gw.ip(),
-                })
-            }
-            Err(e) => errors.push(e),
+        });
+    }
+    while let Some(res) = probes.join_next().await {
+        match res {
+            Ok(Ok(mapping)) => return Ok(mapping),
+            Ok(Err(mut errs)) => errors.append(&mut errs),
+            Err(_) => {}
         }
     }
     for (location, gateway_ip) in discover_igd(discovery.ssdp_target, discovery.ssdp_timeout).await
@@ -608,6 +659,7 @@ pub async fn acquire(
                             external_port: port,
                             lifetime_secs: lease,
                             gateway: gateway_ip,
+                            pcp_nonce: None,
                         })
                     }
                     Err(e) => errors.push(e),
@@ -634,11 +686,20 @@ pub async fn renew(
     let mut next = mapping.clone();
     match &mapping.method {
         Method::Pcp(gw) => {
-            let m = send_pcp_mapping(*gw, protocol, port, mapping.external_port, LEASE_SECS)
-                .await
-                .map_err(|e| format!("{e:?}"))?;
+            let nonce = mapping.pcp_nonce.unwrap_or_else(rand::random);
+            let m = send_pcp_mapping_with_nonce(
+                *gw,
+                nonce,
+                protocol,
+                port,
+                mapping.external_port,
+                LEASE_SECS,
+            )
+            .await
+            .map_err(|e| format!("{e:?}"))?;
             next.external_port = m.external_port;
             next.lifetime_secs = m.lifetime_secs;
+            next.pcp_nonce = Some(nonce);
         }
         Method::NatPmp(gw) => {
             let m =
@@ -658,7 +719,10 @@ pub async fn renew(
 pub async fn release(mapping: &Mapping, protocol: PortProtocol, port: u16) {
     match &mapping.method {
         Method::Pcp(gw) => {
-            let _ = send_pcp_mapping(*gw, protocol, port, mapping.external_port, 0).await;
+            let nonce = mapping.pcp_nonce.unwrap_or_else(rand::random);
+            let _ =
+                send_pcp_mapping_with_nonce(*gw, nonce, protocol, port, mapping.external_port, 0)
+                    .await;
         }
         Method::NatPmp(gw) => {
             let _ = send_natpmp_mapping(*gw, protocol, port, mapping.external_port, 0).await;
@@ -842,5 +906,65 @@ mod tests {
             parse_igd_description(&injected, &loc, gw).is_none(),
             "serviceType outside the strict URN allowlist must be rejected"
         );
+    }
+
+    #[tokio::test]
+    async fn pcp_decodes_24_byte_error_replies_and_reuses_nonce_across_lifecycle() {
+        let mut unsup = [0u8; 24];
+        unsup[0] = 2;
+        unsup[1] = 0x81;
+        unsup[3] = 1;
+        assert_eq!(
+            decode_pcp_map_response(&unsup, &[1; 12], PortProtocol::Tcp, 6881),
+            Err(PcpError::UnsupportedVersion)
+        );
+        let mut refused = [0u8; 24];
+        refused[0] = 2;
+        refused[1] = 0x81;
+        refused[3] = 4; // NO_RESOURCES
+        assert_eq!(
+            decode_pcp_map_response(&refused, &[1; 12], PortProtocol::Tcp, 6881),
+            Err(PcpError::Refused(4))
+        );
+
+        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let gw = sock.local_addr().unwrap();
+        let seen_nonces = std::sync::Arc::new(std::sync::Mutex::new(Vec::<([u8; 12], u32)>::new()));
+        let seen_clone = seen_nonces.clone();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 128];
+            for _ in 0..3 {
+                let Ok((n, from)) = sock.recv_from(&mut buf).await else {
+                    return;
+                };
+                assert_eq!(n, PCP_MAP_LEN);
+                let mut nonce = [0u8; 12];
+                nonce.copy_from_slice(&buf[24..36]);
+                let lifetime = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
+                seen_clone.lock().unwrap().push((nonce, lifetime));
+                let mut resp = buf[..60].to_vec();
+                resp[1] = 0x81;
+                resp[3] = 0;
+                resp[42..44].copy_from_slice(&45000u16.to_be_bytes());
+                let _ = sock.send_to(&resp, from).await;
+            }
+        });
+
+        let disc = Discovery {
+            gateways: vec![gw],
+            ssdp_target: "127.0.0.1:9".parse().unwrap(),
+            ssdp_timeout: Duration::from_millis(50),
+        };
+        let mapping = acquire(&disc, PortProtocol::Tcp, 6881, "t").await.unwrap();
+        let expected_nonce = mapping.pcp_nonce().expect("PCP mapping carries nonce");
+        let renewed = renew(&mapping, PortProtocol::Tcp, 6881, "t").await.unwrap();
+        assert_eq!(renewed.pcp_nonce(), Some(expected_nonce));
+        release(&renewed, PortProtocol::Tcp, 6881).await;
+
+        let log = seen_nonces.lock().unwrap();
+        assert_eq!(log.len(), 3);
+        assert_eq!(log[0], (expected_nonce, LEASE_SECS));
+        assert_eq!(log[1], (expected_nonce, LEASE_SECS));
+        assert_eq!(log[2], (expected_nonce, 0));
     }
 }

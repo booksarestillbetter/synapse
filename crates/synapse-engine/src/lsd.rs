@@ -9,8 +9,14 @@
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
-use synapse_wire::{format_lsd_announce, parse_lsd_announce};
+#[cfg(test)]
+use synapse_wire::format_lsd_announce;
+use synapse_wire::{format_lsd_announce_for_host, parse_lsd_announce, LSD_MULTICAST_IPV4};
 use tracing::debug;
+
+/// BEP 14 recommends at most 5 `Infohash` headers per LSD multicast datagram so packets stay
+/// well within standard Ethernet MTU even at 50k active swarms.
+const MAX_LSD_HASHES_PER_PACKET: usize = 5;
 
 /// Announcements accepted from one source address per `SOURCE_WINDOW`. Honest clients
 /// announce every few minutes, so this only ever affects a flooder.
@@ -91,19 +97,30 @@ impl LsdManager {
         self.known_peers.remove(info_hash);
     }
 
-    /// Builds a multicast announcement packet string containing all active public torrents.
-    /// Returns None if there are no public torrents to announce.
+    /// Builds a multicast announcement packet string containing up to 5 public torrents.
+    /// Returns `None` if there are no public torrents to announce.
     pub fn build_announce_packet(&self) -> Option<String> {
-        if self.public_torrents.is_empty() {
-            return None;
-        }
+        self.build_announce_packets().into_iter().next()
+    }
 
+    /// Builds MTU-safe chunked LSD announcement packets (`<= 5` hashes each) for the default
+    /// IPv4 multicast host.
+    pub fn build_announce_packets(&self) -> Vec<String> {
+        self.build_announce_packets_for_host(LSD_MULTICAST_IPV4)
+    }
+
+    /// Builds MTU-safe chunked LSD announcement packets (`<= 5` hashes each) targeting `host`.
+    pub fn build_announce_packets_for_host(&self, host: &str) -> Vec<String> {
+        if self.public_torrents.is_empty() {
+            return Vec::new();
+        }
         let hashes: Vec<[u8; 20]> = self.public_torrents.iter().copied().collect();
-        Some(format_lsd_announce(
-            self.listen_port,
-            &hashes,
-            Some(&self.cookie),
-        ))
+        hashes
+            .chunks(MAX_LSD_HASHES_PER_PACKET)
+            .map(|chunk| {
+                format_lsd_announce_for_host(host, self.listen_port, chunk, Some(&self.cookie))
+            })
+            .collect()
     }
 
     /// Ingests a received raw multicast packet from `sender_ip` and returns newly discovered peers.
@@ -263,6 +280,31 @@ mod tests {
             )
             .len(),
             1
+        );
+    }
+
+    #[test]
+    fn large_swarm_announce_chunks_packets_at_5_hashes_and_uses_requested_host() {
+        let mut mgr = LsdManager::new(6881, "cookie_chunk".into());
+        for i in 0..12u8 {
+            mgr.register_torrent([i; 20], false);
+        }
+        let v6_packets = mgr.build_announce_packets_for_host(synapse_wire::LSD_MULTICAST_IPV6);
+        assert_eq!(v6_packets.len(), 3);
+        assert!(v6_packets[0].contains(&format!("Host: {}\r\n", synapse_wire::LSD_MULTICAST_IPV6)));
+        assert_eq!(
+            parse_lsd_announce(&v6_packets[0])
+                .unwrap()
+                .info_hashes
+                .len(),
+            5
+        );
+        assert_eq!(
+            parse_lsd_announce(&v6_packets[2])
+                .unwrap()
+                .info_hashes
+                .len(),
+            2
         );
     }
 }

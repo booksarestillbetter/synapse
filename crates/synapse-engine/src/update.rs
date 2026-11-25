@@ -287,10 +287,7 @@ mod tests {
         assert_eq!(bad.update_url, None);
         // The extra keys are part of the identity, and survive persistence.
         assert_ne!(old.hash, torrent(false, None).hash);
-        let back = Info::from_persisted_bencode(
-            synapse_bencode::decode_buf(&old.to_torrent_bytes()).unwrap(),
-        )
-        .unwrap();
+        let back = Info::from_persisted_bencode(&old.to_torrent_bytes()).unwrap();
         assert_eq!(back.hash, old.hash);
         assert_eq!(back.update_url, old.update_url);
     }

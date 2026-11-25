@@ -211,31 +211,26 @@ pub struct SessionSettingsUpdate {
     pub http_listen_addr: Option<String>,
 }
 
+/// Computes UTC minute of day and day-of-week bitmask (Sun=1 .. Sat=64) from Unix seconds.
+pub fn time_mins_and_day_from_unix_secs(secs: u64) -> (u32, u32) {
+    let day_secs = secs % 86400;
+    let mins = (day_secs / 60) as u32;
+
+    let days_since_epoch = secs / 86400;
+    // 1970-01-01 was Thursday (index 4 in Sun=0 .. Sat=6).
+    let weekday_sun0 = (days_since_epoch + 4) % 7;
+    let day_mask = 1u32 << weekday_sun0;
+
+    (mins, day_mask)
+}
+
 /// Computes current UTC minute of day and day-of-week bitmask without external dependencies.
 pub fn current_time_mins_and_day() -> (u32, u32) {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-
-    let day_secs = secs % 86400;
-    let mins = (day_secs / 60) as u32;
-
-    let days_since_epoch = secs / 86400;
-    // 1970-01-01 was Thursday. 0=Thu, 1=Fri, 2=Sat, 3=Sun, 4=Mon, 5=Tue, 6=Wed
-    let weekday_idx = (days_since_epoch + 4) % 7;
-    let day_mask = match weekday_idx {
-        3 => 1,  // Sun
-        4 => 2,  // Mon
-        5 => 4,  // Tue
-        6 => 8,  // Wed
-        0 => 16, // Thu
-        1 => 32, // Fri
-        2 => 64, // Sat
-        _ => 1,
-    };
-
-    (mins, day_mask)
+    time_mins_and_day_from_unix_secs(secs)
 }
 
 /// Checks if the given minute of day and day mask fall within the scheduled turtle mode window.
@@ -246,15 +241,18 @@ pub fn is_in_alt_speed_schedule(
     end_mins: u32,
     days_mask: u32,
 ) -> bool {
-    if (days_mask & current_day_mask) == 0 {
-        return false;
-    }
-
     if begin_mins <= end_mins {
-        current_mins >= begin_mins && current_mins < end_mins
+        (days_mask & current_day_mask) != 0 && current_mins >= begin_mins && current_mins < end_mins
     } else {
-        // Wraps around midnight (e.g. 22:00 to 06:00)
-        current_mins >= begin_mins || current_mins < end_mins
+        // Wraps around midnight (e.g. Fri 22:00 to Sat 06:00): evening belongs to `today`,
+        // post-midnight hours (< end_mins) belong to `yesterday`'s schedule bit.
+        let yesterday_mask = if current_day_mask <= 1 {
+            64
+        } else {
+            current_day_mask >> 1
+        };
+        ((days_mask & current_day_mask) != 0 && current_mins >= begin_mins)
+            || ((days_mask & yesterday_mask) != 0 && current_mins < end_mins)
     }
 }
 
@@ -277,6 +275,19 @@ mod tests {
         // Day of week mask: weekdays only (62 = Mon..Fri)
         assert!(is_in_alt_speed_schedule(600, 2, 540, 1020, 62)); // Monday (2) -> in
         assert!(!is_in_alt_speed_schedule(600, 1, 540, 1020, 62)); // Sunday (1) -> out
+
+        // Weekday mapping from Unix timestamps:
+        // 1970-01-01 00:00:00 UTC was Thursday (bit 16).
+        assert_eq!(time_mins_and_day_from_unix_secs(0), (0, 16));
+        // 1970-01-05 12:30:00 UTC was Monday (bit 2).
+        assert_eq!(
+            time_mins_and_day_from_unix_secs(4 * 86400 + 12 * 3600 + 30 * 60),
+            (750, 2)
+        );
+        // Friday (32) 22:00 -> Saturday (64) 06:00 wraparound on Friday-only mask (32).
+        assert!(is_in_alt_speed_schedule(1350, 32, 1320, 360, 32)); // Fri 22:30 -> in
+        assert!(is_in_alt_speed_schedule(100, 64, 1320, 360, 32)); // Sat 01:40 -> in
+        assert!(!is_in_alt_speed_schedule(100, 32, 1320, 360, 32)); // Fri 01:40 -> out
     }
 
     #[test]

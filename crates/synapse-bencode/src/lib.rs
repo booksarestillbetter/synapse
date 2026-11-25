@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::error::Error;
-use std::io::{self, Cursor};
+use std::io;
 use std::{cmp, fmt, str};
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -141,9 +141,9 @@ impl BEncode {
     }
 
     pub fn encode_to_buf(&self) -> Vec<u8> {
-        let mut buf = Cursor::new(Vec::new());
+        let mut buf = Vec::new();
         self.encode(&mut buf).unwrap();
-        buf.into_inner()
+        buf
     }
 
     pub fn encode<W: io::Write>(&self, w: &mut W) -> io::Result<()> {
@@ -157,19 +157,19 @@ impl BEncode {
         while let Some(tok) = toks.pop() {
             match tok {
                 Token::B(BEncode::Int(i)) => {
-                    write!(w, "i{}e", i)?;
+                    write_bencode_int(w, *i)?;
                 }
                 Token::B(BEncode::String(s)) => {
-                    write!(w, "{}:", s.len())?;
+                    write_bencode_len_prefix(w, s.len())?;
                     w.write_all(s)?;
                 }
                 Token::B(BEncode::List(v)) => {
-                    write!(w, "l")?;
+                    w.write_all(b"l")?;
                     toks.push(Token::E);
                     toks.extend(v.iter().rev().map(Token::B));
                 }
                 Token::B(BEncode::Dict(d)) => {
-                    write!(w, "d")?;
+                    w.write_all(b"d")?;
                     toks.push(Token::E);
                     for (k, v) in d.iter().rev() {
                         toks.push(Token::B(v));
@@ -177,11 +177,11 @@ impl BEncode {
                     }
                 }
                 Token::OS(s) => {
-                    write!(w, "{}:", s.len())?;
+                    write_bencode_len_prefix(w, s.len())?;
                     w.write_all(s)?;
                 }
                 Token::E => {
-                    write!(w, "e")?;
+                    w.write_all(b"e")?;
                 }
             }
         }
@@ -189,12 +189,52 @@ impl BEncode {
     }
 }
 
+fn write_u64_digits(buf: &mut [u8], mut n: u64) -> usize {
+    let mut i = buf.len();
+    loop {
+        i -= 1;
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    i
+}
+
+fn write_bencode_int<W: io::Write>(w: &mut W, val: i64) -> io::Result<()> {
+    let mut buf = [0u8; 24];
+    buf[23] = b'e';
+    let mag = val.unsigned_abs();
+    let mut start = write_u64_digits(&mut buf[..23], mag);
+    if val < 0 {
+        start -= 1;
+        buf[start] = b'-';
+    }
+    start -= 1;
+    buf[start] = b'i';
+    w.write_all(&buf[start..24])
+}
+
+fn write_bencode_len_prefix<W: io::Write>(w: &mut W, len: usize) -> io::Result<()> {
+    let mut buf = [0u8; 24];
+    buf[23] = b':';
+    let start = write_u64_digits(&mut buf[..23], len as u64);
+    w.write_all(&buf[start..24])
+}
+
 pub fn decode_buf(bytes: &[u8]) -> Result<BEncode, BError> {
-    decode(&mut Cursor::new(bytes))
+    do_decode_slice_with_pos(bytes, false, MAX_DEPTH, MAX_TOKENS).map(|(v, _)| v)
 }
 
 pub fn decode_buf_first(bytes: &[u8]) -> Result<BEncode, BError> {
-    decode_first(&mut Cursor::new(bytes))
+    do_decode_slice_with_pos(bytes, true, MAX_DEPTH, MAX_TOKENS).map(|(v, _)| v)
+}
+
+/// Decodes the first bencoded value at the start of `bytes`, returning both the
+/// decoded value and the exact byte offset where the value ended.
+pub fn decode_buf_prefix(bytes: &[u8]) -> Result<(BEncode, usize), BError> {
+    do_decode_slice_with_pos(bytes, true, MAX_DEPTH, MAX_TOKENS)
 }
 
 pub fn decode_first<R: io::Read>(bytes: &mut R) -> Result<BEncode, BError> {
@@ -212,12 +252,314 @@ pub fn decode_buf_limited(
     max_depth: usize,
     max_tokens: usize,
 ) -> Result<BEncode, BError> {
-    do_decode(
-        &mut Cursor::new(bytes),
+    do_decode_slice_with_pos(
+        bytes,
         false,
         max_depth.min(MAX_DEPTH),
         max_tokens.min(MAX_TOKENS),
     )
+    .map(|(v, _)| v)
+}
+
+/// Scans a top-level bencoded dictionary without decoding or re-sorting its contents and
+/// returns the raw byte slice corresponding to `target_key`'s value (for example `b"info"`).
+/// Preserving raw wire order is necessary for hashing/verifying torrents whose `info` keys
+/// are not in canonical sorted order.
+pub fn extract_raw_dict_value<'a>(
+    data: &'a [u8],
+    target_key: &[u8],
+) -> Result<Option<&'a [u8]>, BError> {
+    if data.is_empty() {
+        return Err(BError::EOF);
+    }
+    if data[0] != b'd' {
+        return Err(BError::InvalidDict);
+    }
+    let mut pos = 1usize;
+    let mut tokens = 1usize;
+
+    while pos < data.len() {
+        if data[pos] == b'e' {
+            return Ok(None);
+        }
+        if !data[pos].is_ascii_digit() {
+            return Err(BError::InvalidDict);
+        }
+        tokens += 1;
+        if tokens > MAX_TOKENS {
+            return Err(BError::TooManyTokens);
+        }
+        let len_bytes = read_until_slice(data, &mut pos, b':', MAX_INT_LITERAL.saturating_sub(1))?;
+        let len = decode_int_slice(len_bytes)?;
+        if len < 0 {
+            return Err(BError::ParseInt);
+        }
+        let len_usize = len as usize;
+        if len_usize > MAX_STRING_LEN {
+            return Err(BError::StringTooLong);
+        }
+        if len_usize > data.len() - pos {
+            return Err(BError::EOF);
+        }
+        let key = &data[pos..pos + len_usize];
+        pos += len_usize;
+
+        let val_start = pos;
+        skip_one_value(data, &mut pos, MAX_DEPTH, &mut tokens)?;
+        if key == target_key {
+            return Ok(Some(&data[val_start..pos]));
+        }
+    }
+    Err(BError::EOF)
+}
+
+fn skip_one_value(
+    data: &[u8],
+    pos: &mut usize,
+    max_depth: usize,
+    tokens: &mut usize,
+) -> Result<(), BError> {
+    enum Frame {
+        List,
+        Dict { expecting_key: bool },
+    }
+
+    let mut stack: Vec<Frame> = Vec::new();
+    loop {
+        if *pos >= data.len() {
+            return Err(BError::EOF);
+        }
+        let next = data[*pos];
+        if next == b'e' {
+            *pos += 1;
+            match stack.pop() {
+                Some(Frame::List) => {}
+                Some(Frame::Dict {
+                    expecting_key: true,
+                }) => {}
+                Some(Frame::Dict {
+                    expecting_key: false,
+                }) => return Err(BError::InvalidDict),
+                None => return Err(BError::InvalidChar(b'e')),
+            }
+            if stack.is_empty() {
+                return Ok(());
+            }
+            if let Some(Frame::Dict { expecting_key }) = stack.last_mut() {
+                *expecting_key = !*expecting_key;
+            }
+            continue;
+        }
+
+        *tokens += 1;
+        if *tokens > MAX_TOKENS {
+            return Err(BError::TooManyTokens);
+        }
+        let expecting_dict_key = matches!(
+            stack.last(),
+            Some(Frame::Dict {
+                expecting_key: true
+            })
+        );
+
+        match next {
+            b'i' => {
+                if expecting_dict_key {
+                    return Err(BError::InvalidDict);
+                }
+                *pos += 1;
+                let s = read_until_slice(data, pos, b'e', MAX_INT_LITERAL)?;
+                let _ = decode_int_slice(s)?;
+                if stack.is_empty() {
+                    return Ok(());
+                }
+                if let Some(Frame::Dict { expecting_key }) = stack.last_mut() {
+                    *expecting_key = !*expecting_key;
+                }
+            }
+            b'l' => {
+                if expecting_dict_key {
+                    return Err(BError::InvalidDict);
+                }
+                if stack.len() >= max_depth {
+                    return Err(BError::MaxDepthExceeded);
+                }
+                *pos += 1;
+                stack.push(Frame::List);
+            }
+            b'd' => {
+                if expecting_dict_key {
+                    return Err(BError::InvalidDict);
+                }
+                if stack.len() >= max_depth {
+                    return Err(BError::MaxDepthExceeded);
+                }
+                *pos += 1;
+                stack.push(Frame::Dict {
+                    expecting_key: true,
+                });
+            }
+            b'0'..=b'9' => {
+                let len_bytes =
+                    read_until_slice(data, pos, b':', MAX_INT_LITERAL.saturating_sub(1))?;
+                let len = decode_int_slice(len_bytes)?;
+                if len < 0 {
+                    return Err(BError::ParseInt);
+                }
+                let len_usize = len as usize;
+                if len_usize > MAX_STRING_LEN {
+                    return Err(BError::StringTooLong);
+                }
+                if len_usize > data.len() - *pos {
+                    return Err(BError::EOF);
+                }
+                *pos += len_usize;
+                if stack.is_empty() {
+                    return Ok(());
+                }
+                if let Some(Frame::Dict { expecting_key }) = stack.last_mut() {
+                    *expecting_key = !*expecting_key;
+                }
+            }
+            c => return Err(BError::InvalidChar(c)),
+        }
+    }
+}
+
+fn do_decode_slice_with_pos(
+    data: &[u8],
+    first: bool,
+    max_depth: usize,
+    max_tokens: usize,
+) -> Result<(BEncode, usize), BError> {
+    enum Kind {
+        Dict(usize),
+        List(usize),
+    }
+    let mut cstack = Vec::new();
+    let mut vstack = Vec::new();
+    let mut pos = 0usize;
+    let mut tokens = 0usize;
+
+    while !(first && cstack.is_empty() && vstack.len() == 1) {
+        if pos >= data.len() {
+            break;
+        }
+        let next = data[pos];
+        pos += 1;
+
+        if next != b'e' {
+            tokens += 1;
+            if tokens > max_tokens {
+                return Err(BError::TooManyTokens);
+            }
+        }
+
+        match next {
+            b'i' => {
+                if cstack.is_empty() && !vstack.is_empty() {
+                    return Err(BError::EOF);
+                }
+                let s = read_until_slice(data, &mut pos, b'e', MAX_INT_LITERAL)?;
+                vstack.push(BEncode::Int(decode_int_slice(s)?));
+            }
+            b'l' => {
+                if cstack.is_empty() && !vstack.is_empty() {
+                    return Err(BError::EOF);
+                }
+                if cstack.len() >= max_depth {
+                    return Err(BError::MaxDepthExceeded);
+                }
+                cstack.push(Kind::List(vstack.len()));
+            }
+            b'd' => {
+                if cstack.is_empty() && !vstack.is_empty() {
+                    return Err(BError::EOF);
+                }
+                if cstack.len() >= max_depth {
+                    return Err(BError::MaxDepthExceeded);
+                }
+                cstack.push(Kind::Dict(vstack.len()));
+            }
+            b'e' => match cstack.pop() {
+                Some(Kind::List(i)) => {
+                    let l: Vec<BEncode> = vstack.drain(i..).collect();
+                    vstack.push(BEncode::List(l));
+                }
+                Some(Kind::Dict(i)) => {
+                    let mut d = BTreeMap::new();
+                    if (vstack.len() - i) % 2 != 0 {
+                        return Err(BError::InvalidDict);
+                    }
+                    while vstack.len() > i {
+                        let val = vstack.pop().unwrap();
+                        match vstack.pop().and_then(BEncode::into_bytes) {
+                            Some(key) => {
+                                if d.insert(key, val).is_some() {
+                                    return Err(BError::InvalidDict);
+                                }
+                            }
+                            None => return Err(BError::InvalidDict),
+                        }
+                    }
+                    vstack.push(BEncode::Dict(d));
+                }
+                None => return Err(BError::InvalidChar(b'e')),
+            },
+            _d @ b'0'..=b'9' => {
+                if cstack.is_empty() && !vstack.is_empty() {
+                    return Err(BError::EOF);
+                }
+                let start = pos - 1;
+                let _rest =
+                    read_until_slice(data, &mut pos, b':', MAX_INT_LITERAL.saturating_sub(1))?;
+                let len_bytes = &data[start..pos - 1];
+                let len = decode_int_slice(len_bytes)?;
+                if len < 0 {
+                    return Err(BError::ParseInt);
+                }
+                let len_usize = len as usize;
+                if len_usize > MAX_STRING_LEN {
+                    return Err(BError::StringTooLong);
+                }
+                // Check remaining slice length BEFORE allocating anything so a hostile prefix
+                // like `67108864:` fails in O(1) with zero heap allocation.
+                let remaining = data.len() - pos;
+                if len_usize > remaining {
+                    return Err(BError::EOF);
+                }
+                let s = data[pos..pos + len_usize].to_vec();
+                pos += len_usize;
+                vstack.push(BEncode::String(s));
+            }
+            c => return Err(BError::InvalidChar(c)),
+        }
+    }
+
+    if cstack.is_empty() && vstack.len() == 1 {
+        Ok((vstack.into_iter().next().unwrap(), pos))
+    } else {
+        Err(BError::EOF)
+    }
+}
+
+fn read_until_slice<'a>(
+    data: &'a [u8],
+    pos: &mut usize,
+    delim: u8,
+    max: usize,
+) -> Result<&'a [u8], BError> {
+    let start = *pos;
+    let search_end = data.len().min(start.saturating_add(max).saturating_add(1));
+    if let Some(rel) = data[start..search_end].iter().position(|&b| b == delim) {
+        let end = start + rel;
+        *pos = end + 1;
+        Ok(&data[start..end])
+    } else if data.len() - start > max {
+        Err(BError::ParseInt)
+    } else {
+        Err(BError::EOF)
+    }
 }
 
 fn do_decode<R: io::Read>(
@@ -248,8 +590,9 @@ fn do_decode<R: io::Read>(
                 if cstack.is_empty() && !vstack.is_empty() {
                     return Err(BError::EOF);
                 }
-                let s = read_until(bytes, b'e', &mut buf, MAX_INT_LITERAL)?;
-                vstack.push(BEncode::Int(decode_int(s)?));
+                let mut scratch = [0u8; MAX_INT_LITERAL];
+                let n = read_until_stack(bytes, b'e', &mut buf, &mut scratch, 0, MAX_INT_LITERAL)?;
+                vstack.push(BEncode::Int(decode_int_slice(&scratch[..n])?));
             }
             Ok(b'l') => {
                 if cstack.is_empty() && !vstack.is_empty() {
@@ -272,11 +615,7 @@ fn do_decode<R: io::Read>(
             Err(BError::EOF) => break,
             Ok(b'e') => match cstack.pop() {
                 Some(Kind::List(i)) => {
-                    let mut l = Vec::with_capacity(vstack.len() - i);
-                    while vstack.len() > i {
-                        l.push(vstack.pop().unwrap());
-                    }
-                    l.reverse();
+                    let l: Vec<BEncode> = vstack.drain(i..).collect();
                     vstack.push(BEncode::List(l));
                 }
                 Some(Kind::Dict(i)) => {
@@ -303,9 +642,17 @@ fn do_decode<R: io::Read>(
                 if cstack.is_empty() && !vstack.is_empty() {
                     return Err(BError::EOF);
                 }
-                let mut slen = read_until(bytes, b':', &mut buf, MAX_INT_LITERAL)?;
-                slen.insert(0, d);
-                let len = decode_int(slen)?;
+                let mut scratch = [0u8; MAX_INT_LITERAL];
+                scratch[0] = d;
+                let n = read_until_stack(
+                    bytes,
+                    b':',
+                    &mut buf,
+                    &mut scratch,
+                    1,
+                    MAX_INT_LITERAL.saturating_sub(1),
+                )?;
+                let len = decode_int_slice(&scratch[..n])?;
                 if len < 0 {
                     return Err(BError::ParseInt);
                 }
@@ -313,15 +660,22 @@ fn do_decode<R: io::Read>(
                 if len_usize > MAX_STRING_LEN {
                     return Err(BError::StringTooLong);
                 }
-                let mut v = vec![];
+                let mut v = Vec::new();
+                let mut chunk_limit = 4096usize;
                 while v.len() < len_usize {
-                    let to_read = cmp::min(MAX_ALLOC_LEN, len_usize - v.len());
-                    v.resize(v.len() + to_read, 0u8);
-                    let read_start = v.len() - to_read;
+                    let to_read =
+                        cmp::min(cmp::min(chunk_limit, MAX_ALLOC_LEN), len_usize - v.len());
+                    let read_start = v.len();
+                    v.resize(read_start + to_read, 0u8);
                     let read_end = v.len();
-                    bytes
-                        .read_exact(&mut v[read_start..read_end])
-                        .map_err(|_| BError::EOF)?;
+                    if let Err(e) = bytes.read_exact(&mut v[read_start..read_end]) {
+                        return Err(if e.kind() == io::ErrorKind::UnexpectedEof {
+                            BError::EOF
+                        } else {
+                            BError::IO
+                        });
+                    }
+                    chunk_limit = cmp::min(chunk_limit.saturating_mul(2), MAX_ALLOC_LEN);
                 }
                 vstack.push(BEncode::String(v));
             }
@@ -338,47 +692,56 @@ fn do_decode<R: io::Read>(
 }
 
 fn next_byte<R: io::Read>(r: &mut R, buf: &mut [u8; 1]) -> Result<u8, BError> {
-    let amnt = r.read(buf).map_err(|_| BError::IO)?;
-    if amnt == 0 {
-        Err(BError::EOF)
-    } else {
-        Ok(buf[0])
+    loop {
+        match r.read(buf) {
+            Ok(0) => return Err(BError::EOF),
+            Ok(_) => return Ok(buf[0]),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Err(BError::EOF),
+            Err(_) => return Err(BError::IO),
+        }
     }
 }
 
-fn read_until<R: io::Read>(
+fn read_until_stack<R: io::Read>(
     r: &mut R,
     b: u8,
     buf: &mut [u8; 1],
+    out: &mut [u8; MAX_INT_LITERAL],
+    start_offset: usize,
     max: usize,
-) -> Result<Vec<u8>, BError> {
-    let mut v = vec![];
+) -> Result<usize, BError> {
+    let mut len = start_offset;
+    let max_total = (start_offset + max).min(out.len());
     loop {
         let n = next_byte(r, buf)?;
         if b == n {
-            return Ok(v);
+            return Ok(len);
         }
-        if v.len() >= max {
+        if len >= max_total {
             return Err(BError::ParseInt);
         }
-        v.push(n);
+        out[len] = n;
+        len += 1;
     }
 }
 
 /// Parses a canonical bencode integer: an optional `-`, then `0` or digits with no leading
 /// zero, and never `-0`. Non-canonical spellings (`+5`, `007`, `-0`) re-encode to different
 /// bytes, which would silently change a re-serialized document's hash.
-fn decode_int(v: Vec<u8>) -> Result<i64, BError> {
-    let digits = v.strip_prefix(b"-").unwrap_or(&v);
+fn decode_int_slice(digits_with_sign: &[u8]) -> Result<i64, BError> {
+    let digits = digits_with_sign
+        .strip_prefix(b"-")
+        .unwrap_or(digits_with_sign);
     let canonical = match digits {
         [] => false,
-        [b'0'] => v.len() == 1,
+        [b'0'] => digits_with_sign.len() == 1,
         [first, rest @ ..] => (b'1'..=b'9').contains(first) && rest.iter().all(u8::is_ascii_digit),
     };
     if !canonical {
         return Err(BError::ParseInt);
     }
-    String::from_utf8(v)
+    str::from_utf8(digits_with_sign)
         .map_err(|_| BError::UTF8Decode)
         .and_then(|i| i.parse().map_err(|_| BError::ParseInt))
 }
@@ -580,5 +943,73 @@ mod tests {
             Err(BError::TooManyTokens)
         );
         assert!(decode_buf_limited(&wide, 10, 1000).is_ok());
+    }
+
+    #[test]
+    fn truncated_large_string_prefix_fails_with_eof_without_large_alloc() {
+        assert_eq!(decode_buf(b"67108864:"), Err(BError::EOF));
+        assert_eq!(decode_buf(b"5:ab"), Err(BError::EOF));
+        assert_eq!(decode_buf(b"67108865:abc"), Err(BError::StringTooLong));
+
+        struct FailReader;
+        impl std::io::Read for FailReader {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("disk broke"))
+            }
+        }
+        assert_eq!(super::decode(&mut FailReader), Err(BError::IO));
+    }
+
+    #[test]
+    fn extract_raw_dict_value_preserves_unsorted_wire_bytes() {
+        let unsorted_info = b"d1:zi9e1:ai1e4:listl3:onei2ee4:dictd1:k1:vee";
+        assert!(decode_buf(unsorted_info).is_ok());
+        let mut doc = b"d8:announce10:http://a/b4:info".to_vec();
+        doc.extend_from_slice(unsorted_info);
+        doc.extend_from_slice(b"7:comment2:hie");
+
+        assert_eq!(
+            super::extract_raw_dict_value(&doc, b"info").unwrap(),
+            Some(&unsorted_info[..])
+        );
+        assert_eq!(
+            super::extract_raw_dict_value(&doc, b"comment").unwrap(),
+            Some(&b"2:hi"[..])
+        );
+        assert_eq!(
+            super::extract_raw_dict_value(&doc, b"missing").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn decode_buf_prefix_returns_exact_offset_before_trailing_bytes() {
+        let header = b"d8:msg_typei1e5:piecei0ee";
+        let mut payload = header.to_vec();
+        payload.extend_from_slice(b"\x00\xffBINARY_TRAILING");
+        let (val, used) = super::decode_buf_prefix(&payload).unwrap();
+        let dict = val.as_dict().unwrap();
+        assert_eq!(
+            dict.get(b"msg_type".as_ref()).and_then(|v| v.as_int()),
+            Some(&1)
+        );
+        assert_eq!(used, header.len());
+        assert_eq!(&payload[used..], b"\x00\xffBINARY_TRAILING");
+
+        let (v2, used2) = super::decode_buf_prefix(b"3:abc999").unwrap();
+        assert_eq!(v2.as_str(), Some("abc"));
+        assert_eq!(used2, 5);
+    }
+
+    #[test]
+    fn encode_handles_extreme_integers_and_empty_string() {
+        for v in [0i64, 1, -1, 42, -987654321, i64::MAX, i64::MIN] {
+            let encoded = BEncode::Int(v).encode_to_buf();
+            assert_eq!(encoded, format!("i{v}e").into_bytes());
+            assert_eq!(decode_buf(&encoded).unwrap(), BEncode::Int(v));
+        }
+        let empty = BEncode::String(Vec::new()).encode_to_buf();
+        assert_eq!(empty, b"0:");
+        assert_eq!(decode_buf(&empty).unwrap(), BEncode::String(Vec::new()));
     }
 }

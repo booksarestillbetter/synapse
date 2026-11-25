@@ -10,6 +10,130 @@ use synapse_proto::v2::add_torrent_request::Source;
 use synapse_proto::v2::synapse_control_client::SynapseControlClient;
 use synapse_proto::v2::*;
 
+const MAX_GRPC_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Builder for configuring timeouts, keep-alives, and frame size limits on [`SynapseClient`].
+#[derive(Debug, Clone)]
+pub struct SynapseClientBuilder {
+    endpoint: String,
+    auth_token: Option<String>,
+    connect_timeout: Duration,
+    request_timeout: Duration,
+    tcp_keepalive: Option<Duration>,
+    http2_keep_alive_interval: Option<Duration>,
+    keep_alive_timeout: Option<Duration>,
+    keep_alive_while_idle: bool,
+    max_decoding_message_size: usize,
+    max_encoding_message_size: usize,
+}
+
+impl SynapseClientBuilder {
+    /// Creates a new builder targeting `endpoint` (e.g. `http://127.0.0.1:50051`).
+    pub fn new(endpoint: impl Into<String>) -> Self {
+        Self {
+            endpoint: endpoint.into(),
+            auth_token: None,
+            connect_timeout: Duration::from_secs(10),
+            request_timeout: Duration::from_secs(30),
+            tcp_keepalive: Some(Duration::from_secs(60)),
+            http2_keep_alive_interval: Some(Duration::from_secs(30)),
+            keep_alive_timeout: Some(Duration::from_secs(10)),
+            keep_alive_while_idle: true,
+            max_decoding_message_size: MAX_GRPC_MESSAGE_BYTES,
+            max_encoding_message_size: MAX_GRPC_MESSAGE_BYTES,
+        }
+    }
+
+    pub fn auth_token(mut self, token: impl Into<String>) -> Self {
+        self.auth_token = Some(token.into());
+        self
+    }
+
+    pub fn connect_timeout(mut self, timeout: Duration) -> Self {
+        self.connect_timeout = timeout;
+        self
+    }
+
+    pub fn request_timeout(mut self, timeout: Duration) -> Self {
+        self.request_timeout = timeout;
+        self
+    }
+
+    pub fn tcp_keepalive(mut self, interval: Option<Duration>) -> Self {
+        self.tcp_keepalive = interval;
+        self
+    }
+
+    pub fn http2_keep_alive_interval(mut self, interval: Option<Duration>) -> Self {
+        self.http2_keep_alive_interval = interval;
+        self
+    }
+
+    pub fn keep_alive_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.keep_alive_timeout = timeout;
+        self
+    }
+
+    pub fn keep_alive_while_idle(mut self, enabled: bool) -> Self {
+        self.keep_alive_while_idle = enabled;
+        self
+    }
+
+    pub fn max_decoding_message_size(mut self, limit_bytes: usize) -> Self {
+        self.max_decoding_message_size = limit_bytes;
+        self
+    }
+
+    pub fn max_encoding_message_size(mut self, limit_bytes: usize) -> Self {
+        self.max_encoding_message_size = limit_bytes;
+        self
+    }
+
+    fn build_endpoint(&self) -> Result<Endpoint> {
+        let mut ep = Endpoint::from_shared(self.endpoint.clone())
+            .map_err(|e| SynapseClientError::InvalidEndpoint(e.to_string()))?
+            .connect_timeout(self.connect_timeout)
+            .timeout(self.request_timeout)
+            .tcp_keepalive(self.tcp_keepalive)
+            .keep_alive_while_idle(self.keep_alive_while_idle);
+        if let Some(interval) = self.http2_keep_alive_interval {
+            ep = ep.http2_keep_alive_interval(interval);
+        }
+        if let Some(timeout) = self.keep_alive_timeout {
+            ep = ep.keep_alive_timeout(timeout);
+        }
+        Ok(ep)
+    }
+
+    /// Eagerly connects to the configured Synapse daemon gRPC endpoint.
+    pub async fn connect(self) -> Result<SynapseClient> {
+        let ep = self.build_endpoint()?;
+        let channel = ep.connect().await?;
+        let inner = SynapseControlClient::new(channel)
+            .max_decoding_message_size(self.max_decoding_message_size)
+            .max_encoding_message_size(self.max_encoding_message_size);
+        Ok(SynapseClient {
+            endpoint: self.endpoint,
+            auth_token: self.auth_token,
+            inner,
+        })
+    }
+
+    /// Lazily connects to the configured Synapse daemon gRPC endpoint without blocking on I/O.
+    pub fn connect_lazy(self) -> Result<SynapseClient> {
+        let ep = self.build_endpoint()?;
+        let channel = ep.connect_lazy();
+        let inner = SynapseControlClient::new(channel)
+            .max_decoding_message_size(self.max_decoding_message_size)
+            .max_encoding_message_size(self.max_encoding_message_size);
+        Ok(SynapseClient {
+            endpoint: self.endpoint,
+            auth_token: self.auth_token,
+            inner,
+        })
+    }
+}
+
 /// High-level client for the Synapse 2.0 BitTorrent Daemon control plane.
 #[derive(Clone)]
 pub struct SynapseClient {
@@ -19,43 +143,27 @@ pub struct SynapseClient {
 }
 
 impl SynapseClient {
+    /// Returns a [`SynapseClientBuilder`] for customizing timeouts, keep-alives, and message limits.
+    pub fn builder(endpoint: impl Into<String>) -> SynapseClientBuilder {
+        SynapseClientBuilder::new(endpoint)
+    }
+
     /// Connects to a Synapse daemon gRPC endpoint (e.g. `http://127.0.0.1:50051`).
     pub async fn connect(endpoint: impl Into<String>) -> Result<Self> {
-        let endpoint_str = endpoint.into();
-        let channel = Endpoint::from_shared(endpoint_str.clone())
-            .map_err(|e| SynapseClientError::InvalidEndpoint(e.to_string()))?
-            .timeout(Duration::from_secs(30))
-            .connect()
-            .await?;
-
-        let inner = SynapseControlClient::new(channel);
-        Ok(Self {
-            endpoint: endpoint_str,
-            auth_token: None,
-            inner,
-        })
+        Self::builder(endpoint).connect().await
     }
 
     /// Lazily connects to a Synapse daemon gRPC endpoint without blocking on initial I/O.
     pub fn connect_lazy(endpoint: impl Into<String>) -> Result<Self> {
-        let endpoint_str = endpoint.into();
-        let channel = Endpoint::from_shared(endpoint_str.clone())
-            .map_err(|e| SynapseClientError::InvalidEndpoint(e.to_string()))?
-            .timeout(Duration::from_secs(30))
-            .connect_lazy();
-
-        let inner = SynapseControlClient::new(channel);
-        Ok(Self {
-            endpoint: endpoint_str,
-            auth_token: None,
-            inner,
-        })
+        Self::builder(endpoint).connect_lazy()
     }
 
     /// Constructs a SynapseClient from an existing Tonic Channel.
     pub fn from_channel(endpoint: impl Into<String>, channel: Channel) -> Self {
         let endpoint_str = endpoint.into();
-        let inner = SynapseControlClient::new(channel);
+        let inner = SynapseControlClient::new(channel)
+            .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
+            .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES);
         Self {
             endpoint: endpoint_str,
             auth_token: None,
@@ -221,7 +329,7 @@ impl SynapseClient {
         let req = self.request(SetLocationRequest {
             hash: hash.to_string(),
             new_download_dir: new_download_dir.to_string(),
-            move_existing_files,
+            move_existing_files: Some(move_existing_files),
         });
         let resp = self.inner.clone().set_location(req).await?;
         Ok(resp.into_inner())
@@ -393,6 +501,153 @@ impl SynapseClient {
             action: circuit_breaker_action_request::Action::Reset as i32,
         });
         let resp = self.inner.clone().force_circuit_breaker_action(req).await?;
+        Ok(resp.into_inner())
+    }
+
+    // --- Alerts, Queue, Picking, Trackers, Filter, Metadata & Export ---
+
+    /// Subscribes to the live engine alert stream, optionally filtered to one `info_hash`.
+    pub async fn subscribe_alerts(
+        &self,
+        info_hash: Option<String>,
+    ) -> Result<tonic::Streaming<AlertEvent>> {
+        let req = self.request(SubscribeAlertsRequest { info_hash });
+        let resp = self.inner.clone().subscribe_alerts(req).await?;
+        Ok(resp.into_inner())
+    }
+
+    /// Moves one or more torrents within the download queue.
+    pub async fn move_in_queue(
+        &self,
+        hashes: Vec<String>,
+        direction: move_in_queue_request::Direction,
+    ) -> Result<CommandResponse> {
+        let req = self.request(MoveInQueueRequest {
+            hashes,
+            direction: direction as i32,
+        });
+        let resp = self.inner.clone().move_in_queue(req).await?;
+        Ok(resp.into_inner())
+    }
+
+    /// Toggles sequential piece picking for one or more torrents.
+    pub async fn set_sequential_download(
+        &self,
+        hashes: Vec<String>,
+        enabled: bool,
+    ) -> Result<CommandResponse> {
+        let req = self.request(SequentialDownloadRequest { hashes, enabled });
+        let resp = self.inner.clone().set_sequential_download(req).await?;
+        Ok(resp.into_inner())
+    }
+
+    /// Immediately re-announces one or more active torrents to their trackers.
+    pub async fn reannounce_torrents(&self, hashes: Vec<String>) -> Result<CommandResponse> {
+        let req = self.request(TorrentHashesRequest { hashes });
+        let resp = self.inner.clone().reannounce_torrents(req).await?;
+        Ok(resp.into_inner())
+    }
+
+    /// Replaces the tracker list for a torrent (empty list restores metainfo trackers).
+    pub async fn replace_trackers(
+        &self,
+        hash: &str,
+        trackers: Vec<String>,
+    ) -> Result<CommandResponse> {
+        let req = self.request(ReplaceTrackersRequest {
+            hash: hash.to_string(),
+            trackers,
+        });
+        let resp = self.inner.clone().replace_trackers(req).await?;
+        Ok(resp.into_inner())
+    }
+
+    /// Reloads the daemon's IP filter blocklist from disk and returns the active rule count.
+    pub async fn reload_ip_filter(&self) -> Result<ReloadIpFilterResponse> {
+        let req = self.request(Empty {});
+        let resp = self.inner.clone().reload_ip_filter(req).await?;
+        Ok(resp.into_inner())
+    }
+
+    /// Toggles BEP 16 super-seeding mode for one or more torrents.
+    pub async fn set_super_seeding(
+        &self,
+        hashes: Vec<String>,
+        enabled: bool,
+    ) -> Result<CommandResponse> {
+        let req = self.request(SuperSeedingRequest { hashes, enabled });
+        let resp = self.inner.clone().set_super_seeding(req).await?;
+        Ok(resp.into_inner())
+    }
+
+    /// Toggles first/last piece priority for one or more torrents.
+    pub async fn set_first_last_piece_priority(
+        &self,
+        hashes: Vec<String>,
+        enabled: bool,
+    ) -> Result<CommandResponse> {
+        let req = self.request(FirstLastPiecePriorityRequest { hashes, enabled });
+        let resp = self
+            .inner
+            .clone()
+            .set_first_last_piece_priority(req)
+            .await?;
+        Ok(resp.into_inner())
+    }
+
+    /// Updates category, tags, or per-torrent seed limits for a torrent.
+    pub async fn update_torrent_metadata(
+        &self,
+        update: UpdateTorrentMetadataRequest,
+    ) -> Result<TorrentMetadataResponse> {
+        let req = self.request(update);
+        let resp = self.inner.clone().update_torrent_metadata(req).await?;
+        Ok(resp.into_inner())
+    }
+
+    /// Exports the `.torrent` metainfo bytes and suggested filename for a torrent.
+    pub async fn export_torrent(&self, hash: &str) -> Result<ExportTorrentResponse> {
+        let req = self.request(ExportTorrentRequest {
+            hash: hash.to_string(),
+        });
+        let resp = self.inner.clone().export_torrent(req).await?;
+        Ok(resp.into_inner())
+    }
+
+    // --- Bulk Batch Swarm Operations ---
+
+    /// Pauses multiple torrents in a single RPC call.
+    pub async fn pause_torrents(&self, hashes: Vec<String>) -> Result<BatchCommandResponse> {
+        let req = self.request(TorrentHashesRequest { hashes });
+        let resp = self.inner.clone().pause_torrents(req).await?;
+        Ok(resp.into_inner())
+    }
+
+    /// Resumes multiple torrents in a single RPC call.
+    pub async fn resume_torrents(&self, hashes: Vec<String>) -> Result<BatchCommandResponse> {
+        let req = self.request(TorrentHashesRequest { hashes });
+        let resp = self.inner.clone().resume_torrents(req).await?;
+        Ok(resp.into_inner())
+    }
+
+    /// Removes multiple torrents in a single RPC call, optionally deleting their data on disk.
+    pub async fn remove_torrents(
+        &self,
+        hashes: Vec<String>,
+        delete_data: bool,
+    ) -> Result<BatchCommandResponse> {
+        let req = self.request(RemoveTorrentsRequest {
+            hashes,
+            delete_data,
+        });
+        let resp = self.inner.clone().remove_torrents(req).await?;
+        Ok(resp.into_inner())
+    }
+
+    /// Starts piece verification recheck on multiple torrents in a single RPC call.
+    pub async fn recheck_torrents(&self, hashes: Vec<String>) -> Result<BatchCommandResponse> {
+        let req = self.request(TorrentHashesRequest { hashes });
+        let resp = self.inner.clone().recheck_torrents(req).await?;
         Ok(resp.into_inner())
     }
 }

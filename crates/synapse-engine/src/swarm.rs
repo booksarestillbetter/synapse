@@ -1,16 +1,17 @@
 use crate::atomic_compat::FetchUpdateCompat;
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use parking_lot::{Mutex, RwLock};
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
 
-use diskio::DiskEngine;
+use diskio::{DiskEngine, ReadJob};
+use sha1::{Digest, Sha1};
 use synapse_meta::Info;
 use synapse_picker::Bitfield;
 
@@ -133,6 +134,8 @@ pub struct GlobalEngineMetrics {
     pub seeding_count: AtomicUsize,
     pub paused_count: AtomicUsize,
     pub queued_count: AtomicUsize,
+    pub checking_count: AtomicUsize,
+    pub error_count: AtomicUsize,
     pub total_downloaded_bytes: AtomicU64,
     pub total_uploaded_bytes: AtomicU64,
     pub global_download_rate: AtomicU64,
@@ -148,6 +151,9 @@ pub struct GlobalEngineMetrics {
     pub hash_fails_total: AtomicU64,
     pub utp_packet_loss_total: AtomicU64,
     pub dht_dos_blocks_total: AtomicU64,
+    pub event_bus_lag_total: AtomicU64,
+    pub last_flush_duration_ms: AtomicU64,
+    pub last_sync_duration_ms: AtomicU64,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -157,6 +163,10 @@ pub struct EngineMetricsSnapshot {
     pub seeding_torrents: usize,
     pub paused_torrents: usize,
     pub queued_torrents: usize,
+    #[serde(default)]
+    pub checking_torrents: usize,
+    #[serde(default)]
+    pub error_torrents: usize,
     pub downloaded_bytes: u64,
     pub uploaded_bytes: u64,
     pub download_rate: u64,
@@ -179,6 +189,12 @@ pub struct EngineMetricsSnapshot {
     pub utp_packet_loss_total: u64,
     #[serde(default)]
     pub dht_dos_blocks_total: u64,
+    #[serde(default)]
+    pub event_bus_lag_total: u64,
+    #[serde(default)]
+    pub last_flush_duration_ms: u64,
+    #[serde(default)]
+    pub last_sync_duration_ms: u64,
 }
 
 impl GlobalEngineMetrics {
@@ -189,6 +205,8 @@ impl GlobalEngineMetrics {
             seeding_torrents: self.seeding_count.load(Ordering::Relaxed),
             paused_torrents: self.paused_count.load(Ordering::Relaxed),
             queued_torrents: self.queued_count.load(Ordering::Relaxed),
+            checking_torrents: self.checking_count.load(Ordering::Relaxed),
+            error_torrents: self.error_count.load(Ordering::Relaxed),
             downloaded_bytes: self.total_downloaded_bytes.load(Ordering::Relaxed),
             uploaded_bytes: self.total_uploaded_bytes.load(Ordering::Relaxed),
             download_rate: self.global_download_rate.load(Ordering::Relaxed),
@@ -203,10 +221,13 @@ impl GlobalEngineMetrics {
             hash_fails_total: self.hash_fails_total.load(Ordering::Relaxed),
             utp_packet_loss_total: self.utp_packet_loss_total.load(Ordering::Relaxed),
             dht_dos_blocks_total: self.dht_dos_blocks_total.load(Ordering::Relaxed),
+            event_bus_lag_total: self.event_bus_lag_total.load(Ordering::Relaxed),
+            last_flush_duration_ms: self.last_flush_duration_ms.load(Ordering::Relaxed),
+            last_sync_duration_ms: self.last_sync_duration_ms.load(Ordering::Relaxed),
         }
     }
 
-    pub fn record_add(&self, state: &SwarmState, tier: SwarmTier, downloaded: u64, uploaded: u64) {
+    pub fn record_add(&self, state: &SwarmState, _tier: SwarmTier, downloaded: u64, uploaded: u64) {
         self.total_torrents.fetch_add(1, Ordering::Relaxed);
         self.total_downloaded_bytes
             .fetch_add(downloaded, Ordering::Relaxed);
@@ -225,10 +246,11 @@ impl GlobalEngineMetrics {
             SwarmState::Stopped => {
                 self.paused_count.fetch_add(1, Ordering::Relaxed);
             }
-            _ => {
-                if tier == SwarmTier::Cold {
-                    self.paused_count.fetch_add(1, Ordering::Relaxed);
-                }
+            SwarmState::Checking => {
+                self.checking_count.fetch_add(1, Ordering::Relaxed);
+            }
+            SwarmState::Error(_) => {
+                self.error_count.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
@@ -294,20 +316,25 @@ impl GlobalEngineMetrics {
                     |v| Some(v.saturating_sub(1)),
                 );
             }
-            _ => {
-                if s.tier == SwarmTier::Cold {
-                    let _ = self.paused_count.fetch_update_compat(
-                        Ordering::Relaxed,
-                        Ordering::Relaxed,
-                        |v| Some(v.saturating_sub(1)),
-                    );
-                }
+            SwarmState::Checking => {
+                let _ = self.checking_count.fetch_update_compat(
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                    |v| Some(v.saturating_sub(1)),
+                );
+            }
+            SwarmState::Error(_) => {
+                let _ = self.error_count.fetch_update_compat(
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                    |v| Some(v.saturating_sub(1)),
+                );
             }
         }
     }
 
     pub fn record_state_transition(&self, old_state: &SwarmState, new_state: &SwarmState) {
-        if old_state == new_state {
+        if std::mem::discriminant(old_state) == std::mem::discriminant(new_state) {
             return;
         }
         match old_state {
@@ -339,7 +366,20 @@ impl GlobalEngineMetrics {
                     |v| Some(v.saturating_sub(1)),
                 );
             }
-            _ => {}
+            SwarmState::Checking => {
+                let _ = self.checking_count.fetch_update_compat(
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                    |v| Some(v.saturating_sub(1)),
+                );
+            }
+            SwarmState::Error(_) => {
+                let _ = self.error_count.fetch_update_compat(
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                    |v| Some(v.saturating_sub(1)),
+                );
+            }
         }
         match new_state {
             SwarmState::Downloading => {
@@ -354,7 +394,12 @@ impl GlobalEngineMetrics {
             SwarmState::Stopped => {
                 self.paused_count.fetch_add(1, Ordering::Relaxed);
             }
-            _ => {}
+            SwarmState::Checking => {
+                self.checking_count.fetch_add(1, Ordering::Relaxed);
+            }
+            SwarmState::Error(_) => {
+                self.error_count.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 
@@ -430,6 +475,8 @@ pub struct SwarmStats {
     pub piece_size: u32,
 }
 
+type WatchDirIndex = std::collections::HashMap<[u8; 20], (Info, Vec<u8>)>;
+
 /// Parses user-supplied tracker URLs, dropping blanks and anything that isn't a valid URL.
 fn parse_tracker_urls(list: &[String]) -> Vec<url::Url> {
     let mut out: Vec<url::Url> = Vec::new();
@@ -481,6 +528,12 @@ pub struct SwarmResumeOptions {
     pub seed_time_limit_secs: Option<u64>,
     pub super_seeding: bool,
     pub first_last_piece_priority: bool,
+    pub magnet_uri: Option<String>,
+    pub queue_position: Option<u32>,
+    /// Per-torrent download rate limit in bytes/sec (0 = unlimited), set through the API.
+    pub download_limit_bytes: u64,
+    /// Per-torrent upload rate limit in bytes/sec (0 = unlimited), set through the API.
+    pub upload_limit_bytes: u64,
 }
 
 /// Which way to move torrents in the download queue.
@@ -556,7 +609,7 @@ pub struct SwarmDiscoveryStats {
 pub struct ActiveActor {
     pub peer_event_tx: mpsc::Sender<PeerEvent>,
     pub command_tx: mpsc::Sender<TorrentCommand>,
-    pub stop_tx: Option<Arc<oneshot::Sender<()>>>,
+    pub stop_tx: tokio::sync::watch::Sender<bool>,
 }
 
 pub struct TorrentHandle {
@@ -574,13 +627,54 @@ pub struct TorrentHandle {
     pub first_last_piece_priority: Arc<std::sync::atomic::AtomicBool>,
     /// BEP super-seeding mode toggle.
     pub super_seeding: Arc<std::sync::atomic::AtomicBool>,
+    /// Original magnet URI while metadata is unresolved, so unresolved magnets survive restart.
+    pub magnet_uri: Arc<RwLock<Option<String>>>,
     /// User-assigned category, tags, and per-torrent seed limits.
     pub metadata: Arc<RwLock<TorrentMetadata>>,
     /// API-set replacement tracker list, kept as strings so it can be saved with the session.
     pub tracker_override: Arc<RwLock<Option<Vec<String>>>>,
+    /// Per-torrent download speed limit in bytes/sec (0 = unlimited).
+    pub download_limit_bytes: Arc<std::sync::atomic::AtomicU64>,
+    /// Per-torrent upload speed limit in bytes/sec (0 = unlimited).
+    pub upload_limit_bytes: Arc<std::sync::atomic::AtomicU64>,
+    /// Tracks whether mutable session state changed since the last persisted flush.
+    pub dirty: Arc<AtomicBool>,
+    /// Last `downloaded_bytes` value persisted to `SessionStore`.
+    pub last_flushed_downloaded: Arc<AtomicU64>,
+    /// Last `uploaded_bytes` value persisted to `SessionStore`.
+    pub last_flushed_uploaded: Arc<AtomicU64>,
+    /// Incrementally maintained missing bytes across wanted files for O(1) announce `left`.
+    pub missing_wanted_bytes: Arc<AtomicU64>,
+    /// If `incomplete_dir_enabled` routed this torrent into a staging directory, holds the
+    /// target final destination until completion relocates the files and clears it.
+    pub final_download_dir: Arc<RwLock<Option<PathBuf>>>,
 }
 
 impl TorrentHandle {
+    pub fn mark_dirty(&self) {
+        self.dirty.store(true, Ordering::Release);
+    }
+
+    /// Returns a cloned piece availability vector, synthesizing a uniform view on demand for
+    /// dormant Warm/Cold torrents whose `piece_availability` allocation was elided/reclaimed.
+    pub fn piece_availability_snapshot(&self) -> Vec<u32> {
+        {
+            let guard = self.piece_availability.read();
+            if !guard.is_empty() {
+                return guard.clone();
+            }
+        }
+        let pieces = self.info.pieces() as usize;
+        if pieces == 0 {
+            return Vec::new();
+        }
+        let is_seeding = {
+            let s = self.stats.read();
+            s.state == SwarmState::Seeding || s.progress >= 1.0
+        };
+        vec![if is_seeding { 1 } else { 0 }; pieces]
+    }
+
     pub fn peer_event_tx(&self) -> Option<mpsc::Sender<PeerEvent>> {
         self.active_actor
             .read()
@@ -605,9 +699,19 @@ impl TorrentHandle {
     /// Cleanly terminates the running torrent actor task, closing all peer sockets and releasing FDs.
     pub fn stop_actor(&self) {
         if let Some(actor) = self.active_actor.write().take() {
+            let _ = actor.stop_tx.send(true);
             let _ = actor.command_tx.try_send(TorrentCommand::Stop);
         }
-        self.live_peers.write().clear();
+        {
+            let mut lp = self.live_peers.write();
+            lp.clear();
+            lp.shrink_to_fit();
+        }
+        {
+            let mut pa = self.piece_availability.write();
+            pa.clear();
+            pa.shrink_to_fit();
+        }
     }
 
     pub fn is_private(&self) -> bool {
@@ -634,6 +738,22 @@ pub struct SwarmEngine {
     /// MSE `req2` hash -> info hash, for every registered torrent, so an inbound encrypted
     /// handshake resolves its torrent in O(1) instead of hashing every torrent.
     mse_req2_index: Arc<DashMap<[u8; 20], [u8; 20]>>,
+    /// Active Hot-tier torrents with running actor loops, for O(active) choker/queue ticks.
+    active_torrents: Arc<DashSet<[u8; 20]>>,
+    /// Currently downloading torrents, for O(downloading) queue reconciliation.
+    downloading_torrents: Arc<DashSet<[u8; 20]>>,
+    /// Currently queued torrents awaiting download slots.
+    queued_torrents: Arc<DashSet<[u8; 20]>>,
+    /// Seeding torrents carrying per-torrent ratio or idle-seed-time limits.
+    limited_seeds: Arc<DashSet<[u8; 20]>>,
+    /// Insertion-ordered list of registered info-hashes for O(1) slice pagination.
+    torrent_order: Arc<RwLock<Vec<[u8; 20]>>>,
+    /// Serializes full session flushes against each other cleanly.
+    persist_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Monotonic version bumped whenever torrents are added, removed, or replaced.
+    roster_version: Arc<AtomicU64>,
+    /// Monotonic version bumped whenever torrent queue ordering changes.
+    queue_version: Arc<AtomicU64>,
     disk: Arc<DiskEngine>,
     peer_id: [u8; 20],
     listen_port: Arc<RwLock<u16>>,
@@ -687,6 +807,11 @@ pub struct SwarmEngine {
     signature_policy: Arc<RwLock<SignaturePolicy>>,
     pub search_manager: Arc<crate::search::SearchManager>,
     pub(crate) update_manager: Arc<crate::update::UpdateManager>,
+    free_disk_cache: Arc<parking_lot::Mutex<Option<(PathBuf, Instant, u64)>>>,
+    free_disk_refreshing: Arc<AtomicBool>,
+    dht_concurrency_notify: Arc<tokio::sync::Notify>,
+    local_webseed_resolver: Arc<RwLock<Option<Arc<crate::local_webseed::LocalWebSeedResolver>>>>,
+    listener_required: Arc<AtomicBool>,
 }
 
 /// BEP 35: which signers are trusted, and whether unsigned torrents are refused.
@@ -716,9 +841,10 @@ impl SwarmEngine {
                 .with_nat_manager(nat_manager.clone())
                 .with_settings(settings.clone()),
         );
+        let initial_tracker_conc = settings.read().max_concurrent_tracker_announces.max(1);
         let announce_scheduler = AnnounceScheduler::new(
             announcer,
-            32,
+            initial_tracker_conc,
             Duration::from_secs(1800),
             Duration::from_secs(600),
         );
@@ -743,6 +869,14 @@ impl SwarmEngine {
             torrents: Arc::new(DashMap::new()),
             v2_torrents: Arc::new(DashMap::new()),
             mse_req2_index: Arc::new(DashMap::new()),
+            active_torrents: Arc::new(DashSet::new()),
+            downloading_torrents: Arc::new(DashSet::new()),
+            queued_torrents: Arc::new(DashSet::new()),
+            limited_seeds: Arc::new(DashSet::new()),
+            torrent_order: Arc::new(RwLock::new(Vec::new())),
+            persist_lock: Arc::new(tokio::sync::Mutex::new(())),
+            roster_version: Arc::new(AtomicU64::new(1)),
+            queue_version: Arc::new(AtomicU64::new(1)),
             disk,
             peer_id,
             listen_port,
@@ -782,12 +916,18 @@ impl SwarmEngine {
             signature_policy: Arc::new(RwLock::new(SignaturePolicy::default())),
             search_manager: Arc::new(crate::search::SearchManager::default()),
             update_manager: Arc::new(crate::update::UpdateManager::default()),
+            free_disk_cache: Arc::new(parking_lot::Mutex::new(None)),
+            free_disk_refreshing: Arc::new(AtomicBool::new(false)),
+            dht_concurrency_notify: Arc::new(tokio::sync::Notify::new()),
+            local_webseed_resolver: Arc::new(RwLock::new(None)),
+            listener_required: Arc::new(AtomicBool::new(false)),
         };
 
         let engine_clone = engine.clone();
         announce_scheduler
             .set_peer_router(Arc::new(move |hash| engine_clone.get_or_wake_torrent(hash)));
         announce_scheduler.set_alert_sender(engine.alert_stream.sender());
+        announce_scheduler.set_alert_category_mask(engine.alert_stream.category_mask_handle());
 
         engine
     }
@@ -825,6 +965,32 @@ impl SwarmEngine {
         self
     }
 
+    /// Configures local cache directories consulted by `LocalWebSeedResolver` when starting a swarm.
+    pub fn with_local_webseed_dirs(self, dirs: Vec<PathBuf>) -> Self {
+        self.set_local_webseed_dirs(dirs);
+        self
+    }
+
+    /// Dynamically updates the local cache directories used by `LocalWebSeedResolver`.
+    pub fn set_local_webseed_dirs(&self, dirs: Vec<PathBuf>) {
+        *self.local_webseed_resolver.write() = if dirs.is_empty() {
+            None
+        } else {
+            Some(Arc::new(crate::local_webseed::LocalWebSeedResolver::new(
+                dirs,
+            )))
+        };
+    }
+
+    fn is_safe_storage_dir(dir: &std::path::Path) -> bool {
+        !dir.as_os_str().is_empty()
+            && dir.is_absolute()
+            && !dir
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+            && !std::fs::symlink_metadata(dir).is_ok_and(|m| m.file_type().is_symlink())
+    }
+
     /// Whether a torrent may be added under the signature policy. Call before `add_torrent`.
     pub fn check_signature_policy(&self, info: &Info) -> Result<(), String> {
         let policy = self.signature_policy.read();
@@ -858,7 +1024,7 @@ impl SwarmEngine {
         &self,
         info_hash: &[u8; 20],
     ) -> Option<Vec<(String, synapse_meta::SignatureStatus)>> {
-        let handle = self.torrents.get(info_hash)?;
+        let handle = self.torrents.get(info_hash).map(|r| r.value().clone())?;
         Some(
             handle
                 .info
@@ -930,17 +1096,10 @@ impl SwarmEngine {
     pub fn try_recover_info(&self, info_hash: &[u8; 20]) -> Option<Info> {
         // 1. Try session store
         if let Some(ref store) = self.session_store {
-            let hex_hash = hex::encode(info_hash);
-            if let Ok(Some(state)) = store.load_torrent(&hex_hash) {
-                if let Some(ref raw_hex) = state.raw_bencode_hex {
-                    if let Ok(bytes) = hex::decode(raw_hex) {
-                        if let Ok(bencode) = synapse_bencode::decode_buf(&bytes) {
-                            if let Ok(reloaded) = Info::from_persisted_bencode(bencode) {
-                                if &reloaded.hash == info_hash && reloaded.has_piece_hashes() {
-                                    return Some(reloaded);
-                                }
-                            }
-                        }
+            if let Ok(Some(bytes)) = store.load_metadata(info_hash) {
+                if let Ok(reloaded) = Info::from_persisted_bencode(&bytes) {
+                    if &reloaded.hash == info_hash && reloaded.has_piece_hashes() {
+                        return Some(reloaded);
                     }
                 }
             }
@@ -959,30 +1118,20 @@ impl SwarmEngine {
                         let path = entry.path();
                         if path.is_file() {
                             if let Ok(bytes) = std::fs::read(&path) {
-                                if let Ok(bencode) = synapse_bencode::decode_buf(&bytes) {
-                                    if let Ok(reloaded) = Info::from_persisted_bencode(bencode) {
-                                        if &reloaded.hash == info_hash
-                                            && reloaded.has_piece_hashes()
-                                        {
-                                            tracing::info!(
-                                                "Auto-healed corrupted session metadata for '{}' ({}) from {}",
-                                                reloaded.name,
-                                                hex::encode(info_hash),
-                                                path.display()
-                                            );
-                                            // Repair session store so subsequent restarts don't need to rescan
-                                            if let Some(ref store) = self.session_store {
-                                                let hex_hash = hex::encode(info_hash);
-                                                if let Ok(Some(mut state)) =
-                                                    store.load_torrent(&hex_hash)
-                                                {
-                                                    state.raw_bencode_hex =
-                                                        Some(hex::encode(&bytes));
-                                                    let _ = store.save_torrent(&state);
-                                                }
-                                            }
-                                            return Some(reloaded);
+                                if let Ok(reloaded) = Info::from_persisted_bencode(&bytes) {
+                                    if &reloaded.hash == info_hash && reloaded.has_piece_hashes()
+                                    {
+                                        tracing::info!(
+                                            "Auto-healed corrupted session metadata for '{}' ({}) from {}",
+                                            reloaded.name,
+                                            hex::encode(info_hash),
+                                            path.display()
+                                        );
+                                        // Repair session store so subsequent restarts don't need to rescan
+                                        if let Some(ref store) = self.session_store {
+                                            let _ = store.save_metadata(info_hash, &bytes);
                                         }
+                                        return Some(reloaded);
                                     }
                                 }
                             }
@@ -1039,6 +1188,7 @@ impl SwarmEngine {
     pub fn update_settings(&self, settings: DynamicSessionSettings) {
         *self.settings.write() = settings.clone();
         *self.queue_manager.write() = QueueManager::new(settings.queue);
+        self.dht_concurrency_notify.notify_waiters();
         self.recalculate_effective_rate_limits();
     }
 
@@ -1073,6 +1223,27 @@ impl SwarmEngine {
 
     pub fn listen_port(&self) -> u16 {
         *self.listen_port.read()
+    }
+
+    pub fn set_listener_required(&self, required: bool) {
+        self.listener_required.store(required, Ordering::Relaxed);
+    }
+
+    pub fn is_listener_required(&self) -> bool {
+        self.listener_required.load(Ordering::Relaxed)
+    }
+
+    pub fn is_session_store_configured(&self) -> bool {
+        self.session_store.is_some()
+    }
+
+    pub async fn is_session_store_healthy(&self) -> bool {
+        let Some(store) = self.session_store.clone() else {
+            return true;
+        };
+        tokio::task::spawn_blocking(move || store.is_healthy())
+            .await
+            .unwrap_or(false)
     }
 
     pub fn mapped_external_port(
@@ -1227,8 +1398,28 @@ impl SwarmEngine {
         &self.metrics
     }
 
+    pub fn record_event_bus_lag(&self, skipped: u64) {
+        self.metrics
+            .event_bus_lag_total
+            .fetch_add(skipped, Ordering::Relaxed);
+    }
+
+    pub fn record_rpc_sync_duration_ms(&self, ms: u64) {
+        self.metrics
+            .last_sync_duration_ms
+            .store(ms, Ordering::Relaxed);
+    }
+
     pub fn subscribe_alerts(&self) -> tokio::sync::broadcast::Receiver<crate::alert::Alert> {
         self.alert_stream.subscribe()
+    }
+
+    pub fn set_alert_category_mask(&self, mask: crate::alert::AlertCategory) {
+        self.alert_stream.set_category_mask(mask);
+    }
+
+    pub fn alert_category_mask(&self) -> crate::alert::AlertCategory {
+        self.alert_stream.category_mask()
     }
 
     pub fn post_alert(&self, alert: crate::alert::Alert) {
@@ -1262,33 +1453,51 @@ impl SwarmEngine {
     }
 
     /// Returns the live tracker status reports for the specified torrent info hash.
+    ///
+    /// Looks the handle up from `self.torrents`; a caller that already has the handle (e.g.
+    /// while iterating it via [`SwarmEngine::for_each_torrent_handle`]) must use
+    /// [`SwarmEngine::tracker_reports_for_handle`] instead, since a nested `self.torrents.get`
+    /// while that same shard's iterator guard is still held on this thread can deadlock behind
+    /// a concurrent writer.
     pub fn get_tracker_reports(&self, info_hash: &[u8; 20]) -> Vec<TrackerReport> {
         let reports = self.announce_scheduler.get_tracker_reports(info_hash);
         if !reports.is_empty() {
             return reports;
         }
-        if let Some(handle) = self.torrents.get(info_hash) {
-            let candidate_urls = self
-                .announce_scheduler
-                .announcer()
-                .trackers_for(&handle.info);
-            candidate_urls
-                .into_iter()
-                .map(|u| TrackerReport {
-                    url: u.to_string(),
-                    status: "Stopped".into(),
-                    seeders: 0,
-                    leechers: 0,
-                    next_announce_in: 0,
-                    failure_reason: None,
-                    is_circuit_broken: false,
-                    cb_state: None,
-                    recovery_progress_pct: None,
-                })
-                .collect()
-        } else {
-            Vec::new()
+        match self.torrents.get(info_hash).map(|r| r.value().clone()) {
+            Some(handle) => self.tracker_reports_for_handle(&handle),
+            None => Vec::new(),
         }
+    }
+
+    /// Same fallback as [`SwarmEngine::get_tracker_reports`], but for a handle the caller
+    /// already has in hand instead of looking it up from `self.torrents`.
+    pub fn tracker_reports_for_handle(&self, handle: &TorrentHandle) -> Vec<TrackerReport> {
+        let reports = self
+            .announce_scheduler
+            .get_tracker_reports(&handle.info.hash);
+        if !reports.is_empty() {
+            return reports;
+        }
+        let candidate_urls = self
+            .announce_scheduler
+            .announcer()
+            .trackers_for(&handle.info);
+        candidate_urls
+            .into_iter()
+            .map(|u| TrackerReport {
+                url: u.to_string(),
+                status: "Stopped".into(),
+                seeders: 0,
+                leechers: 0,
+                next_announce_in: 0,
+                failure_reason: None,
+                is_circuit_broken: false,
+                cb_state: None,
+                recovery_progress_pct: None,
+                last_announce_time: None,
+            })
+            .collect()
     }
 
     /// Scrapes a tracker URL (HTTP or UDP) for one or more info hashes (BEP 48).
@@ -1312,15 +1521,116 @@ impl SwarmEngine {
         for entry in self.torrents.iter() {
             entry.value().stop_actor();
         }
+        self.active_torrents.clear();
+    }
+
+    fn sync_tracking_sets(
+        &self,
+        hash: &[u8; 20],
+        state: &SwarmState,
+        tier: SwarmTier,
+        handle: Option<&TorrentHandle>,
+    ) {
+        let has_limits = handle.is_some_and(|h| {
+            let meta = h.metadata.read();
+            meta.seed_ratio_limit.is_some() || meta.seed_time_limit_secs.is_some()
+        });
+        match state {
+            SwarmState::Downloading => {
+                self.downloading_torrents.insert(*hash);
+                self.queued_torrents.remove(hash);
+                if has_limits {
+                    self.limited_seeds.insert(*hash);
+                } else {
+                    self.limited_seeds.remove(hash);
+                }
+            }
+            SwarmState::Queued => {
+                self.queued_torrents.insert(*hash);
+                self.downloading_torrents.remove(hash);
+                if has_limits {
+                    self.limited_seeds.insert(*hash);
+                } else {
+                    self.limited_seeds.remove(hash);
+                }
+            }
+            SwarmState::Seeding => {
+                self.downloading_torrents.remove(hash);
+                self.queued_torrents.remove(hash);
+                if has_limits {
+                    self.limited_seeds.insert(*hash);
+                } else {
+                    self.limited_seeds.remove(hash);
+                }
+            }
+            _ => {
+                self.downloading_torrents.remove(hash);
+                self.queued_torrents.remove(hash);
+                self.limited_seeds.remove(hash);
+            }
+        }
+        if tier == SwarmTier::Hot {
+            self.active_torrents.insert(*hash);
+        } else {
+            self.active_torrents.remove(hash);
+        }
+    }
+
+    fn remove_from_tracking_sets(&self, hash: &[u8; 20]) {
+        self.active_torrents.remove(hash);
+        self.downloading_torrents.remove(hash);
+        self.queued_torrents.remove(hash);
+        self.limited_seeds.remove(hash);
+    }
+
+    fn snapshot_handle_state(
+        h: &TorrentHandle,
+        queue_position: Option<u32>,
+    ) -> TorrentSessionState {
+        let s = h.stats.read().clone();
+        let bf = h.compressed_bitfield.read().clone();
+        let bitfield_hex = bf
+            .map(|b| hex::encode(b.to_bitfield().as_bytes()))
+            .unwrap_or_default();
+        let meta = h.metadata.read().clone();
+        TorrentSessionState {
+            info_hash_hex: hex::encode(s.info_hash),
+            name: s.name,
+            download_dir: s.download_dir,
+            bitfield_hex,
+            total_pieces: h.info.pieces() as usize,
+            total_size: s.total_size,
+            uploaded_bytes: s.uploaded_bytes,
+            downloaded_bytes: s.downloaded_bytes,
+            added_at: s.added_at,
+            is_paused: s.state == SwarmState::Stopped,
+            ratio: Some(s.ratio),
+            magnet_uri: h.magnet_uri.read().clone(),
+            raw_bencode_hex: None,
+            file_priorities: h.file_priorities.read().clone(),
+            sequential: h.sequential.load(Ordering::Relaxed),
+            tracker_override: h.tracker_override.read().clone(),
+            category: meta.category,
+            tags: meta.tags,
+            seed_ratio_limit: meta.seed_ratio_limit,
+            seed_time_limit_secs: meta.seed_time_limit_secs,
+            super_seeding: h.super_seeding.load(Ordering::Relaxed),
+            first_last_piece_priority: h.first_last_piece_priority.load(Ordering::Relaxed),
+            queue_position,
+            download_limit_bytes: h.download_limit_bytes.load(Ordering::Relaxed),
+            upload_limit_bytes: h.upload_limit_bytes.load(Ordering::Relaxed),
+        }
     }
 
     /// Dynamically awakens a Warm torrent into the Hot tier and returns its peer event sender.
-    /// Cold/stopped torrents are never woken automatically.
+    /// Cold/stopped or queued torrents are never woken automatically.
     pub fn get_or_wake_torrent(&self, info_hash: &[u8; 20]) -> Option<mpsc::Sender<PeerEvent>> {
-        let handle = self.torrents.get(info_hash)?;
+        let handle = self.torrents.get(info_hash).map(|r| r.value().clone())?;
         {
             let stats = handle.stats.read();
-            if stats.tier == SwarmTier::Cold || stats.state == SwarmState::Stopped {
+            if stats.tier == SwarmTier::Cold
+                || matches!(stats.state, SwarmState::Stopped | SwarmState::Queued)
+            {
                 return None;
             }
         }
@@ -1332,8 +1642,7 @@ impl SwarmEngine {
                 }
             }
         }
-        self.wake_torrent_internal(handle.value())
-            .map(|a| a.peer_event_tx)
+        self.wake_torrent_internal(&handle).map(|a| a.peer_event_tx)
     }
 
     /// Dynamically awakens a Warm torrent into the Hot tier and returns its command sender.
@@ -1342,7 +1651,7 @@ impl SwarmEngine {
         &self,
         info_hash: &[u8; 20],
     ) -> Option<mpsc::Sender<TorrentCommand>> {
-        let handle = self.torrents.get(info_hash)?;
+        let handle = self.torrents.get(info_hash).map(|r| r.value().clone())?;
         {
             let stats = handle.stats.read();
             if stats.tier == SwarmTier::Cold || stats.state == SwarmState::Stopped {
@@ -1357,8 +1666,7 @@ impl SwarmEngine {
                 }
             }
         }
-        self.wake_torrent_internal(handle.value())
-            .map(|a| a.command_tx)
+        self.wake_torrent_internal(&handle).map(|a| a.command_tx)
     }
 
     /// Explicitly awakens a torrent into the Hot tier and returns its handle.
@@ -1403,39 +1711,48 @@ impl SwarmEngine {
         let (piece_tx, mut piece_rx) = mpsc::channel(128);
         let (pex_tx, mut pex_rx) = mpsc::channel::<Vec<SocketAddr>>(32);
         let (metadata_tx, metadata_rx) = oneshot::channel::<Info>();
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
 
         let (complete_tx, complete_rx) = oneshot::channel();
-        if let Some(lifecycle) = self.lifecycle.clone() {
+        {
             let info_clone = info.clone();
-            let dl_dir = download_dir.clone();
+            let handle_complete = handle.clone();
+            let scheduler_complete = self.announce_scheduler.clone();
+            let hash_complete = info.hash;
+            let lifecycle_opt = self.lifecycle.clone();
             tokio::spawn(async move {
                 if complete_rx.await.is_ok() {
-                    info!(
-                        "Torrent {} completed! Triggering lifecycle dispatcher",
-                        info_clone.name
-                    );
-                    let mut trackers: Vec<String> = Vec::new();
-                    if let Some(ref a) = info_clone.announce {
-                        trackers.push(a.to_string());
-                    }
-                    for tier in &info_clone.url_list {
-                        for url in tier {
-                            let s = url.to_string();
-                            if !trackers.contains(&s) {
-                                trackers.push(s);
+                    *handle_complete.final_download_dir.write() = None;
+                    let completed_dir = PathBuf::from(&handle_complete.stats.read().download_dir);
+                    scheduler_complete.notify_completed(&hash_complete);
+                    if let Some(lifecycle) = lifecycle_opt {
+                        info!(
+                            "Torrent {} completed! Triggering lifecycle dispatcher",
+                            info_clone.name
+                        );
+                        let mut trackers: Vec<String> = Vec::new();
+                        if let Some(ref a) = info_clone.announce {
+                            trackers.push(a.to_string());
+                        }
+                        for tier in &info_clone.url_list {
+                            for url in tier {
+                                let s = url.to_string();
+                                if !trackers.contains(&s) {
+                                    trackers.push(s);
+                                }
                             }
                         }
+                        let _ = lifecycle
+                            .on_torrent_completed(
+                                info_clone.hash,
+                                &info_clone.name,
+                                info_clone.total_len,
+                                &completed_dir,
+                                &info_clone.files,
+                                &trackers,
+                            )
+                            .await;
                     }
-                    let _ = lifecycle
-                        .on_torrent_completed(
-                            info_clone.hash,
-                            &info_clone.name,
-                            info_clone.total_len,
-                            &dl_dir,
-                            &info_clone.files,
-                            &trackers,
-                        )
-                        .await;
                 }
             });
         }
@@ -1470,13 +1787,39 @@ impl SwarmEngine {
             ban_list: self.ban_list.clone(),
             ip_filter: self.ip_filter.clone(),
             super_seeding: handle.super_seeding.load(Ordering::Relaxed),
-            local_webseed_resolver: None,
+            local_webseed_resolver: self.local_webseed_resolver.read().clone(),
             alert_sender: Some(self.alert_stream.sender()),
         };
 
+        {
+            let pieces = info.pieces() as usize;
+            let is_seeding = handle.stats.read().state == SwarmState::Seeding;
+            let mut pa = handle.piece_availability.write();
+            if pa.len() != pieces {
+                pa.resize(pieces, if is_seeding { 1 } else { 0 });
+            }
+        }
+
         let mut torrent = Torrent::new(config, have.as_ref());
+        torrent.set_stop_signal(stop_rx);
+        torrent.set_alert_category_mask(self.alert_stream.category_mask_handle());
+        torrent.set_active_torrents(self.active_torrents.clone());
+        torrent.set_downloading_torrents(self.downloading_torrents.clone());
+        torrent.set_dirty_flag(handle.dirty.clone());
+        torrent.set_missing_wanted_bytes(handle.missing_wanted_bytes.clone());
+        if let Some(dest_dir) = handle.final_download_dir.read().clone() {
+            torrent.set_final_download_dir(dest_dir);
+        }
+        if let Some(ref store) = self.session_store {
+            torrent.set_session_store(store.clone());
+        }
         if handle.first_last_piece_priority.load(Ordering::Relaxed) {
             torrent.set_first_last_piece_priority(true);
+        }
+        let torrent_dl = handle.download_limit_bytes.load(Ordering::Relaxed);
+        let torrent_ul = handle.upload_limit_bytes.load(Ordering::Relaxed);
+        if torrent_dl > 0 || torrent_ul > 0 {
+            torrent.set_torrent_rate_limits(torrent_dl, torrent_ul);
         }
         // Skip/priority choices live on the handle so they survive the actor being evicted and
         // woken again, and (via the session store) a daemon restart.
@@ -1487,6 +1830,7 @@ impl SwarmEngine {
             }
         }
         self.metrics.active_actors.fetch_add(1, Ordering::Relaxed);
+        self.active_torrents.insert(info.hash);
         {
             let mut s = handle.stats.write();
             s.tier = SwarmTier::Hot;
@@ -1531,44 +1875,62 @@ impl SwarmEngine {
 
         let bitfield_worker = handle.compressed_bitfield.clone();
         let stats_worker = handle.stats.clone();
-        let metrics_worker = self.metrics.clone();
-        let scheduler_worker = self.announce_scheduler.clone();
         let total_pieces = info.pieces() as usize;
         let total_len = info.total_len;
         let hash_worker = info.hash;
+        let info_worker = info.clone();
         let store_worker = self.session_store.clone();
         let name_worker = info.name.clone();
         let dl_dir_str = download_dir.to_string_lossy().to_string();
-        let raw_bencode_hex_worker = if info.has_piece_hashes() {
-            Some(hex::encode(info.to_torrent_bytes()))
-        } else {
-            None
-        };
         let added_at = handle.stats.read().added_at;
 
+        let magnet_uri_worker = handle.magnet_uri.clone();
         let priorities_worker = handle.file_priorities.clone();
         let sequential_worker = handle.sequential.clone();
         let first_last_worker = handle.first_last_piece_priority.clone();
         let super_seeding_worker = handle.super_seeding.clone();
+        let download_limit_worker = handle.download_limit_bytes.clone();
+        let upload_limit_worker = handle.upload_limit_bytes.clone();
         let metadata_worker = handle.metadata.clone();
         let tracker_override_worker = handle.tracker_override.clone();
+        let dirty_worker = handle.dirty.clone();
+        let last_flushed_dl_worker = handle.last_flushed_downloaded.clone();
+        let last_flushed_ul_worker = handle.last_flushed_uploaded.clone();
+        let missing_worker = handle.missing_wanted_bytes.clone();
+        let dl_set_worker = self.downloading_torrents.clone();
+        let limited_seeds_worker = self.limited_seeds.clone();
+        let scheduler_worker = self.announce_scheduler.clone();
         let last_saved_secs = Arc::new(AtomicU64::new(0));
         const SAVE_THROTTLE: Duration = Duration::from_secs(5);
 
         tokio::spawn(async move {
             while let Some(piece_idx) = piece_rx.recv().await {
-                let completed_count = {
+                let (completed_count, newly_added) = {
                     let mut bf_guard = bitfield_worker.write();
                     if let Some(ref mut bf) = *bf_guard {
+                        let was_set = bf.has(piece_idx as usize);
                         bf.set(piece_idx as usize);
-                        bf.count_ones()
+                        (bf.count_ones(), !was_set)
                     } else {
                         let mut bf = synapse_picker::RoaringBitfield::new(total_pieces);
                         bf.set(piece_idx as usize);
                         *bf_guard = Some(bf);
-                        1
+                        (1, true)
                     }
                 };
+
+                if newly_added {
+                    let prios_guard = priorities_worker.read();
+                    if crate::announcer::is_piece_wanted(&info_worker, &prios_guard, piece_idx) {
+                        let piece_len = info_worker.piece_len(piece_idx) as u64;
+                        let _ = missing_worker.fetch_update_compat(
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                            |m| Some(m.saturating_sub(piece_len)),
+                        );
+                    }
+                }
+                dirty_worker.store(true, Ordering::Release);
 
                 let progress = if total_pieces > 0 {
                     (completed_count as f32) / (total_pieces as f32)
@@ -1577,20 +1939,22 @@ impl SwarmEngine {
                 };
                 let dl_bytes = ((progress as f64) * (total_len as f64)) as u64;
 
-                let was_dl = {
+                {
                     let mut s = stats_worker.write();
-                    let was_downloading = s.state == SwarmState::Downloading;
                     s.progress = progress;
                     s.downloaded_bytes = dl_bytes;
                     if progress >= 1.0 {
                         s.state = SwarmState::Seeding;
                     }
-                    was_downloading
-                };
-                if was_dl && progress >= 1.0 {
-                    metrics_worker
-                        .record_state_transition(&SwarmState::Downloading, &SwarmState::Seeding);
-                    scheduler_worker.notify_completed(&hash_worker);
+                }
+                if progress >= 1.0 {
+                    missing_worker.store(0, Ordering::Release);
+                    dl_set_worker.remove(&hash_worker);
+                    scheduler_worker.mark_seeding(&hash_worker);
+                    let m = metadata_worker.read();
+                    if m.seed_ratio_limit.is_some() || m.seed_time_limit_secs.is_some() {
+                        limited_seeds_worker.insert(hash_worker);
+                    }
                 }
 
                 if let Some(ref store) = store_worker {
@@ -1608,17 +1972,23 @@ impl SwarmEngine {
                         let bf_snapshot = bitfield_worker.read().clone();
                         let name_c = name_worker.clone();
                         let dl_dir_c = dl_dir_str.clone();
-                        let raw_hex_c = raw_bencode_hex_worker.clone();
+                        let magnet_c = magnet_uri_worker.read().clone();
                         let prios_c = priorities_worker.read().clone();
                         let sequential_c = sequential_worker.load(Ordering::Relaxed);
                         let first_last_c = first_last_worker.load(Ordering::Relaxed);
                         let super_seeding_c = super_seeding_worker.load(Ordering::Relaxed);
+                        let download_limit_c = download_limit_worker.load(Ordering::Relaxed);
+                        let upload_limit_c = upload_limit_worker.load(Ordering::Relaxed);
                         let meta_c = metadata_worker.read().clone();
                         let tracker_override_c = tracker_override_worker.read().clone();
                         let (uploaded_bytes, current_ratio) = {
                             let s = stats_worker.read();
                             (s.uploaded_bytes, s.ratio)
                         };
+                        let dirty_c = dirty_worker.clone();
+                        let dl_flush_c = last_flushed_dl_worker.clone();
+                        let ul_flush_c = last_flushed_ul_worker.clone();
+                        dirty_c.store(false, Ordering::Release);
                         tokio::task::spawn_blocking(move || {
                             let bitfield_hex = bf_snapshot
                                 .map(|b| hex::encode(b.to_bitfield().as_bytes()))
@@ -1635,8 +2005,8 @@ impl SwarmEngine {
                                 added_at,
                                 is_paused: false,
                                 ratio: Some(current_ratio),
-                                magnet_uri: None,
-                                raw_bencode_hex: raw_hex_c,
+                                magnet_uri: magnet_c,
+                                raw_bencode_hex: None,
                                 file_priorities: prios_c,
                                 sequential: sequential_c,
                                 tracker_override: tracker_override_c,
@@ -1646,8 +2016,16 @@ impl SwarmEngine {
                                 seed_time_limit_secs: meta_c.seed_time_limit_secs,
                                 super_seeding: super_seeding_c,
                                 first_last_piece_priority: first_last_c,
+                                queue_position: None,
+                                download_limit_bytes: download_limit_c,
+                                upload_limit_bytes: upload_limit_c,
                             };
-                            let _ = store.save_torrent(&state);
+                            if store.save_states_batch(&[state]).is_ok() {
+                                dl_flush_c.store(dl_bytes, Ordering::Relaxed);
+                                ul_flush_c.store(uploaded_bytes, Ordering::Relaxed);
+                            } else {
+                                dirty_c.store(true, Ordering::Release);
+                            }
                         });
                     }
                 }
@@ -1657,7 +2035,7 @@ impl SwarmEngine {
         let actor = ActiveActor {
             peer_event_tx: peer_tx,
             command_tx,
-            stop_tx: None,
+            stop_tx,
         };
         *actor_guard = Some(actor.clone());
         Some(actor)
@@ -1666,7 +2044,8 @@ impl SwarmEngine {
     /// Transmission-style queue reconciliation: detects stalled downloads and promotes queued torrents.
     pub fn reconcile_queue(&self) {
         let qm = self.queue_manager.read();
-        let mut active_non_stalled = 0;
+        let mut active_non_stalled = 0usize;
+        let mut active_seeds = 0usize;
         let mut queued_hashes = Vec::new();
 
         let now_secs = SystemTime::now()
@@ -1675,57 +2054,107 @@ impl SwarmEngine {
             .as_secs();
         let now = Instant::now();
         let mut first_seen = self.download_first_seen.lock();
-        first_seen.retain(|hash, _| {
-            self.torrents
-                .get(hash)
-                .is_some_and(|h| h.stats.read().state == SwarmState::Downloading)
-        });
+        first_seen.retain(|hash, _| self.downloading_torrents.contains(hash));
 
-        for entry in self.torrents.iter() {
-            let handle = entry.value();
-            let mut stats = handle.stats.write();
-            if stats.state == SwarmState::Downloading {
-                let last_activity = if stats.last_transfer_at > 0 {
-                    stats.last_transfer_at as u64
-                } else {
-                    stats.added_at as u64
-                };
-                let elapsed_secs = now_secs.saturating_sub(last_activity);
-                let stalled = qm.is_stalled(
+        let mut stop_handles: Vec<Arc<TorrentHandle>> = Vec::new();
+        let mut stopped_hashes: std::collections::HashSet<[u8; 20]> =
+            std::collections::HashSet::new();
+        let mut hot_active_seeds: Vec<([u8; 20], u64, i64)> = Vec::new();
+
+        // 1. Evaluate downloading swarms in O(downloading).
+        let dl_hashes: Vec<[u8; 20]> = self.downloading_torrents.iter().map(|r| *r).collect();
+        for hash in dl_hashes {
+            let Some(handle) = self.torrents.get(&hash).map(|r| r.value().clone()) else {
+                self.downloading_torrents.remove(&hash);
+                continue;
+            };
+            let (
+                is_dl,
+                peers_connected,
+                download_rate,
+                dl_bytes,
+                total_size,
+                last_tx,
+                added_at,
+                old_stalled,
+            ) = {
+                let stats = handle.stats.read();
+                (
+                    stats.state == SwarmState::Downloading,
                     stats.peers_connected,
                     stats.download_rate,
                     stats.downloaded_bytes,
                     stats.total_size,
-                    Duration::from_secs(elapsed_secs),
-                );
-                // A freshly started torrent has no throughput yet; without a grace period it would
-                // count as "slow", not use up a slot, and every queued torrent would be started.
-                let started = *first_seen.entry(stats.info_hash).or_insert(now);
-                let in_startup_grace = now.duration_since(started) < AUTO_MANAGE_STARTUP;
-                let is_slow = !in_startup_grace && qm.is_slow_downloader(stats.download_rate);
-                stats.is_stalled = stalled;
-                if !stalled && !is_slow {
-                    active_non_stalled += 1;
+                    stats.last_transfer_at,
+                    stats.added_at,
+                    stats.is_stalled,
+                )
+            };
+            if !is_dl {
+                self.downloading_torrents.remove(&hash);
+                continue;
+            }
+            let last_activity = if last_tx > 0 {
+                last_tx as u64
+            } else {
+                added_at as u64
+            };
+            let elapsed_secs = now_secs.saturating_sub(last_activity);
+            let stalled = qm.is_stalled(
+                peers_connected,
+                download_rate,
+                dl_bytes,
+                total_size,
+                Duration::from_secs(elapsed_secs),
+            );
+            if old_stalled != stalled {
+                handle.stats.write().is_stalled = stalled;
+            }
+            // A freshly started torrent has no throughput yet; without a grace period it would
+            // count as "slow", not use up a slot, and every queued torrent would be started.
+            let started = *first_seen.entry(hash).or_insert(now);
+            let in_startup_grace = now.duration_since(started) < AUTO_MANAGE_STARTUP;
+            let is_slow = !in_startup_grace && qm.is_slow_downloader(download_rate);
+            if !stalled && !is_slow {
+                active_non_stalled += 1;
+            }
+        }
+
+        // 2. Enforce seed ratio and idle seed time limits.
+        let global_seed_limits =
+            qm.config().seed_ratio_limited || qm.config().idle_seeding_limit_enabled;
+        let check_seed_limit =
+            |hash: [u8; 20],
+             handle: &Arc<TorrentHandle>,
+             stop_handles: &mut Vec<Arc<TorrentHandle>>,
+             stopped_hashes: &mut std::collections::HashSet<[u8; 20]>| {
+                let (is_seeding, ratio, last_tx, added_at) = {
+                    let s = handle.stats.read();
+                    (
+                        s.state == SwarmState::Seeding,
+                        s.ratio,
+                        s.last_transfer_at,
+                        s.added_at,
+                    )
+                };
+                if !is_seeding {
+                    return false;
                 }
-            } else if stats.state == SwarmState::Seeding {
-                // "Idle seeding": time since anything last moved, not time since the torrent was
-                // added (a torrent that took hours to download must not be stopped the moment it
-                // finishes because it is "older" than the seed-time limit).
-                let last_activity = if stats.last_transfer_at > 0 {
-                    stats.last_transfer_at as u64
+                let last_activity = if last_tx > 0 {
+                    last_tx as u64
                 } else {
-                    stats.added_at as u64
+                    added_at as u64
                 };
                 let elapsed_secs = now_secs.saturating_sub(last_activity);
-                let meta = handle.metadata.read().clone();
+                let meta = handle.metadata.read();
                 let per_torrent_ratio_hit = meta
                     .seed_ratio_limit
-                    .is_some_and(|limit| limit > 0.0 && (stats.ratio as f64) >= limit);
+                    .is_some_and(|limit| limit > 0.0 && (ratio as f64) >= limit);
                 let per_torrent_time_hit = meta
                     .seed_time_limit_secs
                     .is_some_and(|limit| elapsed_secs >= limit);
-                let action =
-                    qm.evaluate_seeder(1, self.torrents.len(), stats.ratio as f64, elapsed_secs);
+                drop(meta);
+                let action = qm.evaluate_seeder(0, 0, ratio as f64, elapsed_secs);
                 if per_torrent_ratio_hit
                     || per_torrent_time_hit
                     || matches!(
@@ -1733,38 +2162,137 @@ impl SwarmEngine {
                         QueueAction::AutoStopRatioReached | QueueAction::AutoStopSeedTimeReached
                     )
                 {
-                    stats.state = SwarmState::Stopped;
-                    stats.tier = SwarmTier::Cold;
-                    self.metrics
-                        .record_state_transition(&SwarmState::Seeding, &SwarmState::Stopped);
-                    drop(stats);
-                    handle.stop_actor();
+                    let mut stats = handle.stats.write();
+                    if stats.state == SwarmState::Seeding {
+                        stats.state = SwarmState::Stopped;
+                        stats.tier = SwarmTier::Cold;
+                        self.metrics
+                            .record_state_transition(&SwarmState::Seeding, &SwarmState::Stopped);
+                        drop(stats);
+                        stopped_hashes.insert(hash);
+                        stop_handles.push(handle.clone());
+                    }
+                    true
+                } else {
+                    false
                 }
-            } else if stats.state == SwarmState::Queued {
-                queued_hashes.push(stats.info_hash);
+            };
+
+        if global_seed_limits {
+            for entry in self.torrents.iter() {
+                let _ = check_seed_limit(
+                    *entry.key(),
+                    entry.value(),
+                    &mut stop_handles,
+                    &mut stopped_hashes,
+                );
+            }
+        } else {
+            let limit_hashes: Vec<[u8; 20]> = self.limited_seeds.iter().map(|r| *r).collect();
+            for hash in limit_hashes {
+                if let Some(handle) = self.torrents.get(&hash).map(|r| r.value().clone()) {
+                    let _ = check_seed_limit(hash, &handle, &mut stop_handles, &mut stopped_hashes);
+                } else {
+                    self.limited_seeds.remove(&hash);
+                }
             }
         }
 
-        // Start queued torrents in queue order, not in whatever order the map yields them.
+        // 3. Count active seeds and enforce seed queue cap in O(active).
+        let active_hashes: Vec<[u8; 20]> = self.active_torrents.iter().map(|r| *r).collect();
+        for hash in active_hashes {
+            if stopped_hashes.contains(&hash) {
+                continue;
+            }
+            if let Some(handle) = self.torrents.get(&hash).map(|r| r.value().clone()) {
+                let s = handle.stats.read();
+                if s.state == SwarmState::Seeding && !qm.is_slow_seeder(s.upload_rate) {
+                    active_seeds += 1;
+                    if s.tier == SwarmTier::Hot {
+                        hot_active_seeds.push((hash, s.upload_rate, s.last_transfer_at));
+                    }
+                }
+            } else {
+                self.active_torrents.remove(&hash);
+            }
+        }
+        if !qm.config().dont_count_slow_torrents {
+            active_seeds = self.metrics.seeding_count.load(Ordering::Relaxed);
+        }
+
+        for h in stop_handles {
+            let hash = h.info.hash;
+            self.active_torrents.remove(&hash);
+            self.limited_seeds.remove(&hash);
+            h.mark_dirty();
+            h.stop_actor();
+            self.announce_scheduler.unregister(&hash);
+            self.lsd_manager.lock().unregister_torrent(&hash);
+            self.zeroconf_manager.lock().unregister_torrent(&hash);
+        }
+
+        if qm.config().seed_queue_enabled && hot_active_seeds.len() > qm.config().max_active_seeds {
+            hot_active_seeds.sort_by_key(|&(_, ul, ts)| (ul, ts));
+            let excess = hot_active_seeds.len() - qm.config().max_active_seeds;
+            for &(hash, _, _) in hot_active_seeds.iter().take(excess) {
+                if let Some(handle) = self.torrents.get(&hash).map(|r| r.value().clone()) {
+                    {
+                        let mut s = handle.stats.write();
+                        if s.state == SwarmState::Seeding && s.tier == SwarmTier::Hot {
+                            s.tier = SwarmTier::Warm;
+                        }
+                    }
+                    self.active_torrents.remove(&hash);
+                    handle.stop_actor();
+                }
+            }
+        }
+
+        // 4. Start queued torrents in queue order (only rebuilding queue_positions when queued exist).
+        for r in self.queued_torrents.iter() {
+            let hash = *r;
+            if self
+                .torrents
+                .get(&hash)
+                .is_some_and(|h| h.value().stats.read().state == SwarmState::Queued)
+            {
+                queued_hashes.push(hash);
+            }
+        }
+        if queued_hashes.is_empty() {
+            return;
+        }
+        let mut active_total = active_non_stalled + active_seeds;
         let positions = self.queue_positions();
         queued_hashes.sort_by_key(|h| positions.get(h).copied().unwrap_or(u32::MAX));
         for hash in queued_hashes {
-            if qm.evaluate_downloader(active_non_stalled, self.torrents.len()) == QueueAction::Allow
-            {
-                if let Some(handle) = self.torrents.get(&hash) {
-                    let mut s = handle.stats.write();
-                    s.state = SwarmState::Downloading;
-                    s.tier = SwarmTier::Hot;
-                    self.metrics
-                        .record_state_transition(&SwarmState::Queued, &SwarmState::Downloading);
-                    drop(s);
+            if qm.evaluate_downloader(active_non_stalled, active_total) == QueueAction::Allow {
+                if let Some(handle) = self.torrents.get(&hash).map(|r| r.value().clone()) {
+                    {
+                        let mut s = handle.stats.write();
+                        if s.state != SwarmState::Queued {
+                            continue;
+                        }
+                        s.state = SwarmState::Downloading;
+                        s.tier = SwarmTier::Hot;
+                        s.is_stalled = false;
+                        s.last_transfer_at = now_secs as i64;
+                        self.metrics
+                            .record_state_transition(&SwarmState::Queued, &SwarmState::Downloading);
+                    }
+                    self.queued_torrents.remove(&hash);
+                    self.downloading_torrents.insert(hash);
+                    handle.mark_dirty();
                     first_seen.insert(hash, now);
                     let _ = self.wake_torrent_internal(&handle);
+                    self.lsd_manager
+                        .lock()
+                        .register_torrent(hash, handle.info.private);
+                    self.zeroconf_manager
+                        .lock()
+                        .register_torrent(hash, handle.info.private);
                     let peer_tx = handle.peer_event_tx().unwrap_or_else(|| mpsc::channel(1).0);
-                    let initial_dl = {
-                        let s = handle.stats.read();
-                        s.downloaded_bytes
-                    };
+                    let initial_dl = handle.stats.read().downloaded_bytes;
                     self.announce_scheduler.register_with_details(
                         hash,
                         handle.info.clone(),
@@ -1775,9 +2303,11 @@ impl SwarmEngine {
                             file_priorities: handle.file_priorities.clone(),
                             compressed_bitfield: handle.compressed_bitfield.clone(),
                             initial_downloaded: initial_dl,
+                            missing_wanted_bytes: handle.missing_wanted_bytes.clone(),
                         },
                     );
                     active_non_stalled += 1;
+                    active_total += 1;
                 }
             }
         }
@@ -1795,11 +2325,29 @@ impl SwarmEngine {
         self.torrents.len()
     }
 
+    pub fn roster_version(&self) -> u64 {
+        self.roster_version.load(Ordering::Acquire)
+    }
+
+    pub fn queue_version(&self) -> u64 {
+        self.queue_version.load(Ordering::Acquire)
+    }
+
+    pub fn for_each_torrent_handle(&self, mut f: impl FnMut(&[u8; 20], &TorrentHandle)) {
+        for entry in self.torrents.iter() {
+            f(entry.key(), entry.value());
+        }
+    }
+
     /// Returns the number of currently active swarm actors running background tick loops.
     pub fn active_swarm_count(&self) -> usize {
-        self.torrents
+        self.active_torrents
             .iter()
-            .filter(|t| t.value().is_active())
+            .filter(|h| {
+                self.torrents
+                    .get(h.key())
+                    .is_some_and(|t| t.value().is_active())
+            })
             .count()
     }
 
@@ -1830,34 +2378,50 @@ impl SwarmEngine {
             .collect()
     }
 
-    /// High-performance engine-level pagination that avoids cloning the entire swarm collection.
+    /// High-performance engine-level pagination that slices insertion order in O(limit) when
+    /// unfiltered and preserves deterministic order across pages.
     pub fn list_torrents_paged(
         &self,
         offset: usize,
         limit: usize,
         filter: Option<SwarmStateFilter>,
     ) -> (Vec<SwarmStats>, usize) {
+        let order = self.torrent_order.read();
         if let Some(f) = filter {
-            let mut matching_count = 0;
+            let mut matching_count = 0usize;
             let mut items = Vec::with_capacity(limit.min(100));
-            for entry in self.torrents.iter() {
-                let stats = entry.value().stats.read();
-                if f.matches(&stats.state, stats.tier) {
-                    if matching_count >= offset && items.len() < limit {
-                        items.push(stats.clone());
+            for hash in order.iter() {
+                match f {
+                    SwarmStateFilter::Downloading if !self.downloading_torrents.contains(hash) => {
+                        continue;
                     }
-                    matching_count += 1;
+                    SwarmStateFilter::Queued if !self.queued_torrents.contains(hash) => {
+                        continue;
+                    }
+                    _ => {}
+                }
+                if let Some(entry) = self.torrents.get(hash) {
+                    let stats = entry.value().stats.read();
+                    if f.matches(&stats.state, stats.tier) {
+                        if matching_count >= offset && items.len() < limit {
+                            items.push(stats.clone());
+                        }
+                        matching_count += 1;
+                    }
                 }
             }
             (items, matching_count)
         } else {
-            let total = self.torrents.len();
-            let items: Vec<SwarmStats> = self
-                .torrents
+            let total = order.len();
+            let start = offset.min(total);
+            let end = start.saturating_add(limit).min(total);
+            let items: Vec<SwarmStats> = order[start..end]
                 .iter()
-                .skip(offset)
-                .take(limit)
-                .map(|r| r.value().stats.read().clone())
+                .filter_map(|hash| {
+                    self.torrents
+                        .get(hash)
+                        .map(|r| r.value().stats.read().clone())
+                })
                 .collect();
             (items, total)
         }
@@ -1869,7 +2433,11 @@ impl SwarmEngine {
         download_dir: std::path::PathBuf,
     ) -> Result<Arc<TorrentHandle>, synapse_meta::MetaError> {
         let info = Arc::new(synapse_meta::Info::from_magnet(magnet_uri)?);
-        Ok(self.add_torrent(info, download_dir, None))
+        let opts = SwarmResumeOptions {
+            magnet_uri: Some(magnet_uri.to_string()),
+            ..Default::default()
+        };
+        Ok(self.add_torrent_with_resume(info, download_dir, None, Some(opts)))
     }
 
     pub fn add_torrent(
@@ -1884,21 +2452,115 @@ impl SwarmEngine {
     /// BEP 9: called once a magnet-added torrent's metadata-only actor finishes
     /// assembling and verifying its real `Info` over the wire (see `TorrentConfig::
     /// on_metadata_resolved`). Drops the placeholder registration and re-adds the
-    /// torrent under the same info_hash with the real metadata, which spawns a normal
-    /// downloading actor in its place via the usual `add_torrent_with_resume` path.
+    /// torrent under the same info_hash with the real metadata, preserving user
+    /// flags/metadata/overrides and updating `metrics` cleanly.
     fn resolve_magnet_metadata(&self, download_dir: std::path::PathBuf, info: Info) {
         let info_hash = info.hash;
         tracing::info!(name = %info.name, hash = %hex::encode(info_hash), "Magnet metadata resolved; starting real download");
         self.announce_scheduler.unregister(&info_hash);
         self.lsd_manager.lock().unregister_torrent(&info_hash);
         self.zeroconf_manager.lock().unregister_torrent(&info_hash);
-        self.torrents.remove(&info_hash);
         self.mse_req2_index
             .remove(&synapse_wire::mse_req2(&info_hash));
         if let Some(v2) = info.info_hash_v2 {
             self.v2_torrents.remove(&v2);
         }
-        self.add_torrent(Arc::new(info), download_dir, None);
+
+        self.remove_from_tracking_sets(&info_hash);
+        let (prev_resume, old_final_dir) = if let Some((_, old)) = self.torrents.remove(&info_hash)
+        {
+            self.torrent_order.write().retain(|h| h != &info_hash);
+            self.roster_version.fetch_add(1, Ordering::Release);
+            self.queue_version.fetch_add(1, Ordering::Release);
+            let (snap, was_paused) = {
+                let mut s = old.stats.write();
+                let snap = s.clone();
+                let was_paused = s.state == SwarmState::Stopped;
+                s.download_rate = 0;
+                s.upload_rate = 0;
+                s.peers_connected = 0;
+                s.peers_sending = 0;
+                (snap, was_paused)
+            };
+            self.metrics.record_remove(&snap);
+            let final_dir = old.final_download_dir.read().clone();
+            old.stop_actor();
+            let meta = old.metadata.read().clone();
+            (
+                Some(SwarmResumeOptions {
+                    uploaded_bytes: snap.uploaded_bytes,
+                    downloaded_bytes: snap.downloaded_bytes,
+                    ratio: Some(snap.ratio),
+                    added_at: Some(snap.added_at),
+                    is_paused: was_paused,
+                    file_priorities: old.file_priorities.read().clone(),
+                    sequential: old.sequential.load(Ordering::Relaxed),
+                    tracker_override: old.tracker_override.read().clone(),
+                    category: meta.category,
+                    tags: meta.tags,
+                    seed_ratio_limit: meta.seed_ratio_limit,
+                    seed_time_limit_secs: meta.seed_time_limit_secs,
+                    super_seeding: old.super_seeding.load(Ordering::Relaxed),
+                    first_last_piece_priority: old
+                        .first_last_piece_priority
+                        .load(Ordering::Relaxed),
+                    magnet_uri: None,
+                    queue_position: None,
+                    download_limit_bytes: old.download_limit_bytes.load(Ordering::Relaxed),
+                    upload_limit_bytes: old.upload_limit_bytes.load(Ordering::Relaxed),
+                }),
+                final_dir,
+            )
+        } else {
+            (None, None)
+        };
+
+        let target_dir = old_final_dir.unwrap_or(download_dir);
+        let info_arc = Arc::new(info);
+        let resolved_handle = self.add_torrent_with_resume_internal(
+            info_arc.clone(),
+            target_dir,
+            None,
+            prev_resume,
+            true,
+        );
+
+        if let Some(ref store) = self.session_store {
+            if info_arc.has_piece_hashes() {
+                let store = store.clone();
+                let hex_hash = hex::encode(info_hash);
+                let raw_bytes = info_arc.to_torrent_bytes();
+                let name = info_arc.name.clone();
+                let total_size = info_arc.total_len;
+                let total_pieces = info_arc.pieces() as usize;
+                let file_count = info_arc.files.len();
+                let select_only = info_arc.select_only.clone();
+                let dl_dir_str = resolved_handle.stats.read().download_dir.clone();
+                tokio::task::spawn_blocking(move || {
+                    let _ = store.save_metadata(&info_hash, &raw_bytes);
+                    if let Ok(Some(mut state)) = store.load_torrent(&hex_hash) {
+                        state.name = name;
+                        state.total_size = total_size;
+                        state.total_pieces = total_pieces;
+                        state.download_dir = dl_dir_str;
+                        state.magnet_uri = None;
+                        state.raw_bencode_hex = None;
+                        if state.file_priorities.len() != file_count {
+                            let mut prios = vec![4u8; file_count];
+                            if let Some(ref sel) = select_only {
+                                for (i, p) in prios.iter_mut().enumerate() {
+                                    if !sel.contains(&i) {
+                                        *p = 0;
+                                    }
+                                }
+                            }
+                            state.file_priorities = prios;
+                        }
+                        let _ = store.save_states_batch(&[state]);
+                    }
+                });
+            }
+        }
     }
 
     pub fn add_torrent_with_resume(
@@ -1907,6 +2569,17 @@ impl SwarmEngine {
         download_dir: std::path::PathBuf,
         have: Option<&Bitfield>,
         resume: Option<SwarmResumeOptions>,
+    ) -> Arc<TorrentHandle> {
+        self.add_torrent_with_resume_internal(info, download_dir, have, resume, false)
+    }
+
+    fn add_torrent_with_resume_internal(
+        &self,
+        info: Arc<Info>,
+        download_dir: std::path::PathBuf,
+        have: Option<&Bitfield>,
+        resume: Option<SwarmResumeOptions>,
+        treat_as_new_add: bool,
     ) -> Arc<TorrentHandle> {
         let info_hash = info.hash;
 
@@ -1925,12 +2598,11 @@ impl SwarmEngine {
 
         let total_size = info.total_len;
         let name = info.name.clone();
-        let added_at = resume.as_ref().and_then(|r| r.added_at).unwrap_or_else(|| {
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs() as i64
-        });
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let added_at = resume.as_ref().and_then(|r| r.added_at).unwrap_or(now_secs);
 
         let initial_progress = if let Some(h) = have {
             if h.is_complete() {
@@ -1966,20 +2638,78 @@ impl SwarmEngine {
             (SwarmState::Seeding, SwarmTier::Warm)
         } else {
             let qm = self.queue_manager.read();
-            let active_dl = self
-                .torrents
-                .iter()
-                .filter(|t| {
+            let mut active_dl = 0usize;
+            for r in self.downloading_torrents.iter() {
+                if let Some(t) = self.torrents.get(r.key()) {
                     let s = t.value().stats.read();
-                    s.state == SwarmState::Downloading && !s.is_stalled
-                })
-                .count();
-            if qm.evaluate_downloader(active_dl, self.torrents.len()) == QueueAction::Allow {
+                    if s.state == SwarmState::Downloading && !s.is_stalled {
+                        active_dl += 1;
+                    }
+                }
+            }
+            let active_seeds = if qm.config().dont_count_slow_torrents {
+                let mut count = 0usize;
+                for r in self.active_torrents.iter() {
+                    if let Some(t) = self.torrents.get(r.key()) {
+                        let s = t.value().stats.read();
+                        if s.state == SwarmState::Seeding && !qm.is_slow_seeder(s.upload_rate) {
+                            count += 1;
+                        }
+                    }
+                }
+                count
+            } else {
+                self.metrics.seeding_count.load(Ordering::Relaxed)
+            };
+            let active_total = active_dl + active_seeds;
+            if qm.evaluate_downloader(active_dl, active_total) == QueueAction::Allow {
                 (SwarmState::Downloading, SwarmTier::Hot)
             } else {
                 (SwarmState::Queued, SwarmTier::Warm)
             }
         };
+
+        let is_new_add = treat_as_new_add
+            || resume.is_none()
+            || resume
+                .as_ref()
+                .and_then(|r| r.magnet_uri.as_ref())
+                .is_some();
+        let (inc_enabled, inc_dir_opt, default_dl_dir) = {
+            let s = self.settings.read();
+            (
+                s.incomplete_dir_enabled,
+                s.incomplete_dir.clone(),
+                s.download_dir.clone(),
+            )
+        };
+        let (active_dir, final_dir) = if initial_progress < 1.0 && inc_enabled {
+            if let Some(ref inc_dir) = inc_dir_opt {
+                if Self::is_safe_storage_dir(inc_dir) {
+                    if is_new_add
+                        && download_dir != *inc_dir
+                        && Self::is_safe_storage_dir(&download_dir)
+                    {
+                        (inc_dir.clone(), Some(download_dir))
+                    } else if !is_new_add
+                        && download_dir == *inc_dir
+                        && default_dl_dir != *inc_dir
+                        && Self::is_safe_storage_dir(&default_dl_dir)
+                    {
+                        (inc_dir.clone(), Some(default_dl_dir))
+                    } else {
+                        (download_dir, None)
+                    }
+                } else {
+                    (download_dir, None)
+                }
+            } else {
+                (download_dir, None)
+            }
+        } else {
+            (download_dir, None)
+        };
+        let active_dir_str = active_dir.to_string_lossy().to_string();
 
         let initial_stats = SwarmStats {
             info_hash,
@@ -1996,11 +2726,11 @@ impl SwarmEngine {
             peers_sending: 0,
             eta_seconds: 0,
             ratio,
-            download_dir: download_dir.to_string_lossy().to_string(),
+            download_dir: active_dir_str.clone(),
             added_at,
             is_private: info.private,
             is_stalled: false,
-            last_transfer_at: added_at,
+            last_transfer_at: now_secs,
             piece_count: info.pieces(),
             piece_size: info.piece_len,
         };
@@ -2012,48 +2742,11 @@ impl SwarmEngine {
             uploaded_bytes,
         );
 
+        let magnet_uri_val = resume.as_ref().and_then(|r| r.magnet_uri.clone());
         let stats = Arc::new(RwLock::new(initial_stats));
         let compressed_bitfield = Arc::new(RwLock::new(
             have.map(synapse_picker::RoaringBitfield::from_bitfield),
         ));
-
-        if resume.is_none() {
-            if let Some(ref store) = self.session_store {
-                let bitfield_hex = have.map(|h| hex::encode(h.as_bytes())).unwrap_or_default();
-                let state = TorrentSessionState {
-                    info_hash_hex: hex::encode(info_hash),
-                    name: name.clone(),
-                    download_dir: download_dir.to_string_lossy().to_string(),
-                    bitfield_hex,
-                    total_pieces: info.pieces() as usize,
-                    total_size,
-                    uploaded_bytes,
-                    downloaded_bytes,
-                    added_at,
-                    is_paused,
-                    ratio: Some(ratio),
-                    magnet_uri: None,
-                    raw_bencode_hex: Some(hex::encode(info.to_torrent_bytes())),
-                    file_priorities: Vec::new(),
-                    sequential: false,
-                    tracker_override: None,
-                    category: None,
-                    tags: Vec::new(),
-                    seed_ratio_limit: None,
-                    seed_time_limit_secs: None,
-                    super_seeding: false,
-                    first_last_piece_priority: false,
-                };
-                let _ = store.save_torrent(&state);
-            }
-        }
-
-        let initial_availability = if initial_state == SwarmState::Seeding {
-            vec![1u32; info.pieces() as usize]
-        } else {
-            vec![0u32; info.pieces() as usize]
-        };
-        let piece_availability = Arc::new(RwLock::new(initial_availability));
         let saved_priorities = resume
             .as_ref()
             .map(|r| r.file_priorities.clone())
@@ -2069,6 +2762,70 @@ impl SwarmEngine {
                 }
                 prios
             });
+        let initial_missing_wanted = if initial_progress >= 1.0 {
+            0
+        } else {
+            let bf_guard = compressed_bitfield.read();
+            crate::announcer::compute_missing_wanted_bytes(
+                &info,
+                &saved_priorities,
+                bf_guard.as_ref(),
+            )
+        };
+        let missing_wanted_bytes = Arc::new(AtomicU64::new(initial_missing_wanted));
+
+        if resume.is_none() || magnet_uri_val.is_some() {
+            if let Some(ref store) = self.session_store {
+                if info.has_piece_hashes() {
+                    let _ = store.save_metadata(&info_hash, &info.to_torrent_bytes());
+                }
+                let bitfield_hex = have.map(|h| hex::encode(h.as_bytes())).unwrap_or_default();
+                let state = TorrentSessionState {
+                    info_hash_hex: hex::encode(info_hash),
+                    name: name.clone(),
+                    download_dir: active_dir_str,
+                    bitfield_hex,
+                    total_pieces: info.pieces() as usize,
+                    total_size,
+                    uploaded_bytes,
+                    downloaded_bytes,
+                    added_at,
+                    is_paused,
+                    ratio: Some(ratio),
+                    magnet_uri: magnet_uri_val.clone(),
+                    raw_bencode_hex: None,
+                    file_priorities: saved_priorities.clone(),
+                    sequential: resume.as_ref().is_some_and(|r| r.sequential),
+                    tracker_override: resume.as_ref().and_then(|r| r.tracker_override.clone()),
+                    category: resume.as_ref().and_then(|r| r.category.clone()),
+                    tags: resume.as_ref().map(|r| r.tags.clone()).unwrap_or_default(),
+                    seed_ratio_limit: resume.as_ref().and_then(|r| r.seed_ratio_limit),
+                    seed_time_limit_secs: resume.as_ref().and_then(|r| r.seed_time_limit_secs),
+                    super_seeding: resume.as_ref().is_some_and(|r| r.super_seeding),
+                    first_last_piece_priority: resume
+                        .as_ref()
+                        .is_some_and(|r| r.first_last_piece_priority),
+                    queue_position: resume.as_ref().and_then(|r| r.queue_position),
+                    download_limit_bytes: resume
+                        .as_ref()
+                        .map(|r| r.download_limit_bytes)
+                        .unwrap_or(0),
+                    upload_limit_bytes: resume.as_ref().map(|r| r.upload_limit_bytes).unwrap_or(0),
+                };
+                let _ = store.save_states_batch(&[state]);
+            }
+        }
+
+        let initial_availability = if initial_tier == SwarmTier::Hot {
+            if initial_state == SwarmState::Seeding {
+                vec![1u32; info.pieces() as usize]
+            } else {
+                vec![0u32; info.pieces() as usize]
+            }
+        } else {
+            Vec::new()
+        };
+        let piece_availability = Arc::new(RwLock::new(initial_availability));
         let file_priorities = Arc::new(RwLock::new(saved_priorities));
 
         let handle = Arc::new(TorrentHandle {
@@ -2088,6 +2845,7 @@ impl SwarmEngine {
             super_seeding: Arc::new(std::sync::atomic::AtomicBool::new(
                 resume.as_ref().is_some_and(|r| r.super_seeding),
             )),
+            magnet_uri: Arc::new(RwLock::new(magnet_uri_val)),
             metadata: Arc::new(RwLock::new(
                 resume
                     .as_ref()
@@ -2102,6 +2860,17 @@ impl SwarmEngine {
             tracker_override: Arc::new(RwLock::new(
                 resume.as_ref().and_then(|r| r.tracker_override.clone()),
             )),
+            download_limit_bytes: Arc::new(std::sync::atomic::AtomicU64::new(
+                resume.as_ref().map(|r| r.download_limit_bytes).unwrap_or(0),
+            )),
+            upload_limit_bytes: Arc::new(std::sync::atomic::AtomicU64::new(
+                resume.as_ref().map(|r| r.upload_limit_bytes).unwrap_or(0),
+            )),
+            dirty: Arc::new(AtomicBool::new(false)),
+            last_flushed_downloaded: Arc::new(AtomicU64::new(downloaded_bytes)),
+            last_flushed_uploaded: Arc::new(AtomicU64::new(uploaded_bytes)),
+            missing_wanted_bytes,
+            final_download_dir: Arc::new(RwLock::new(final_dir)),
         });
         // Always set (or clear): a re-added torrent must not inherit an override left over
         // from an earlier life under the same info hash.
@@ -2119,18 +2888,24 @@ impl SwarmEngine {
         }
 
         self.torrents.insert(info_hash, handle.clone());
+        self.torrent_order.write().push(info_hash);
+        self.sync_tracking_sets(&info_hash, &initial_state, initial_tier, Some(&handle));
         self.queue_order.lock().push(info_hash);
+        self.roster_version.fetch_add(1, Ordering::Release);
+        self.queue_version.fetch_add(1, Ordering::Release);
         self.mse_req2_index
             .insert(synapse_wire::mse_req2(&info_hash), info_hash);
         if let Some(v2) = info.info_hash_v2 {
             self.v2_torrents.insert(v2, handle.clone());
         }
-        self.lsd_manager
-            .lock()
-            .register_torrent(info_hash, info.private);
-        self.zeroconf_manager
-            .lock()
-            .register_torrent(info_hash, info.private);
+        if !is_paused && initial_state != SwarmState::Queued {
+            self.lsd_manager
+                .lock()
+                .register_torrent(info_hash, info.private);
+            self.zeroconf_manager
+                .lock()
+                .register_torrent(info_hash, info.private);
+        }
         self.post_alert(crate::alert::Alert::TorrentAdded { info_hash });
 
         // Awaken actor immediately if Hot
@@ -2146,7 +2921,7 @@ impl SwarmEngine {
             tx
         };
 
-        if !is_paused {
+        if !is_paused && initial_state != SwarmState::Queued {
             let is_dl = initial_state == SwarmState::Downloading;
             // Trackers get only what this session downloads; bytes already on disk (cross-seed,
             // resume) are the baseline.
@@ -2161,6 +2936,7 @@ impl SwarmEngine {
                     file_priorities: handle.file_priorities.clone(),
                     compressed_bitfield: handle.compressed_bitfield.clone(),
                     initial_downloaded: initial_dl,
+                    missing_wanted_bytes: handle.missing_wanted_bytes.clone(),
                 },
             );
         }
@@ -2168,80 +2944,358 @@ impl SwarmEngine {
         handle
     }
 
-    /// Flushes all active swarm session states to disk synchronously or during shutdown.
+    /// Flushes dirty swarm session states to disk synchronously or during shutdown.
     pub async fn flush_session(&self) {
-        if let Some(ref store) = self.session_store {
-            let snapshots: Vec<TorrentSessionState> = self
-                .torrents
-                .iter()
-                .map(|r| {
-                    let h = r.value();
-                    let s = h.stats.read().clone();
-                    let bf = h.compressed_bitfield.read().clone();
-                    let bitfield_hex = bf
-                        .map(|b| hex::encode(b.to_bitfield().as_bytes()))
-                        .unwrap_or_default();
-                    TorrentSessionState {
-                        info_hash_hex: hex::encode(s.info_hash),
-                        name: s.name,
-                        download_dir: s.download_dir,
-                        bitfield_hex,
-                        total_pieces: h.info.pieces() as usize,
-                        total_size: s.total_size,
-                        uploaded_bytes: s.uploaded_bytes,
-                        downloaded_bytes: s.downloaded_bytes,
-                        added_at: s.added_at,
-                        // Only persist explicit user-paused/stopped state; Cold-tier dormant seeds
-                        // should resume normally on restart rather than staying stopped.
-                        is_paused: s.state == SwarmState::Stopped,
-                        ratio: Some(s.ratio),
-                        magnet_uri: None,
-                        raw_bencode_hex: if h.info.has_piece_hashes() {
-                            Some(hex::encode(h.info.to_torrent_bytes()))
-                        } else {
-                            None
-                        },
-                        file_priorities: h.file_priorities.read().clone(),
-                        sequential: h.sequential.load(Ordering::Relaxed),
-                        tracker_override: h.tracker_override.read().clone(),
-                        category: h.metadata.read().category.clone(),
-                        tags: h.metadata.read().tags.clone(),
-                        seed_ratio_limit: h.metadata.read().seed_ratio_limit,
-                        seed_time_limit_secs: h.metadata.read().seed_time_limit_secs,
-                        super_seeding: h.super_seeding.load(Ordering::Relaxed),
-                        first_last_piece_priority: h
-                            .first_last_piece_priority
-                            .load(Ordering::Relaxed),
-                    }
-                })
-                .collect();
-
-            let store = store.clone();
-            let _ = tokio::task::spawn_blocking(move || {
-                let _ = store.save_torrents_batch(&snapshots);
+        let Some(ref store) = self.session_store else {
+            return;
+        };
+        // Scanning/snapshotting dirty handles below only reads in-memory per-torrent state
+        // (no disk I/O) and doesn't touch the session store, so it doesn't need `persist_lock`;
+        // taking the lock only around the actual batched write lets `persist_torrent_option`/
+        // `persist_file_priorities`'s quick single-record updates interleave with this scan
+        // instead of queuing behind it.
+        let dirty_handles: Vec<Arc<TorrentHandle>> = self
+            .torrents
+            .iter()
+            .filter_map(|r| {
+                let h = r.value();
+                let is_dirty = h.dirty.load(Ordering::Acquire) || {
+                    let s = h.stats.read();
+                    s.downloaded_bytes != h.last_flushed_downloaded.load(Ordering::Relaxed)
+                        || s.uploaded_bytes != h.last_flushed_uploaded.load(Ordering::Relaxed)
+                };
+                if is_dirty {
+                    Some(h.clone())
+                } else {
+                    None
+                }
             })
-            .await;
+            .collect();
+        if dirty_handles.is_empty() {
+            return;
+        }
+
+        let positions = self.queue_positions();
+        let mut snapshots = Vec::with_capacity(dirty_handles.len());
+        let mut flushed_meta = Vec::with_capacity(dirty_handles.len());
+        for h in dirty_handles {
+            h.dirty.store(false, Ordering::Release);
+            let state = Self::snapshot_handle_state(&h, positions.get(&h.info.hash).copied());
+            let dl = state.downloaded_bytes;
+            let ul = state.uploaded_bytes;
+            snapshots.push(state);
+            flushed_meta.push((h, dl, ul));
+        }
+
+        let flush_start = Instant::now();
+        let store = store.clone();
+        let persist_lock = self.persist_lock.clone();
+        let res = tokio::task::spawn_blocking(move || {
+            let _guard = persist_lock.blocking_lock();
+            store.save_states_batch(&snapshots)
+        })
+        .await;
+        self.metrics
+            .last_flush_duration_ms
+            .store(flush_start.elapsed().as_millis() as u64, Ordering::Relaxed);
+        match res {
+            Ok(Ok(())) => {
+                for (h, dl, ul) in flushed_meta {
+                    h.last_flushed_downloaded.store(dl, Ordering::Relaxed);
+                    h.last_flushed_uploaded.store(ul, Ordering::Relaxed);
+                }
+            }
+            _ => {
+                for (h, _, _) in flushed_meta {
+                    h.dirty.store(true, Ordering::Release);
+                }
+            }
         }
     }
 
     /// Rechecks torrent files on disk and verifies integrity — dispatched to the torrent's own
-    /// task via `TorrentCommand::Recheck` (see `Torrent::handle_recheck`), which owns the
-    /// picker/bitfield state a real recheck needs to rebuild. Previously this just flipped the
-    /// reported state to `Checking` for cosmetic effect and never touched the files on disk.
+    /// task via `TorrentCommand::Recheck` for active torrents, or executed asynchronously in a
+    /// standalone task for `Cold`/`Stopped` torrents so paused torrents never wake or resume
+    /// network activity on recheck.
     pub fn recheck_torrent(&self, info_hash: &[u8; 20]) -> bool {
-        if let Some(handle) = self.torrents.get(info_hash) {
-            // If hashes were evicted for memory savings during seeding, recover them on-demand
-            if !handle.info.has_piece_hashes() {
-                if let Some(hashes) = self.try_recover_piece_hashes(info_hash) {
-                    handle.info.restore_piece_hashes(hashes);
-                }
+        let Some(handle) = self.torrents.get(info_hash).map(|r| r.value().clone()) else {
+            return false;
+        };
+
+        // If hashes were evicted for memory savings during seeding, recover them on-demand
+        if !handle.info.has_piece_hashes() {
+            if let Some(hashes) = self.try_recover_piece_hashes(info_hash) {
+                handle.info.restore_piece_hashes(hashes);
             }
         }
 
-        if let Some(tx) = self.get_or_wake_command_tx(info_hash) {
-            if let Some(handle) = self.torrents.get(info_hash) {
-                handle.stats.write().state = SwarmState::Checking;
+        let has_actor = handle.command_tx().is_some();
+        let (old_state, tier, download_dir_str) = {
+            let s = handle.stats.read();
+            (s.state.clone(), s.tier, s.download_dir.clone())
+        };
+
+        if !has_actor
+            && (tier == SwarmTier::Cold
+                || matches!(old_state, SwarmState::Stopped | SwarmState::Checking))
+        {
+            if old_state == SwarmState::Checking {
+                return true;
             }
+            handle.stats.write().state = SwarmState::Checking;
+            self.metrics
+                .record_state_transition(&old_state, &SwarmState::Checking);
+            self.downloading_torrents.remove(info_hash);
+            self.queued_torrents.remove(info_hash);
+            self.limited_seeds.remove(info_hash);
+            handle.mark_dirty();
+            self.post_alert(crate::alert::Alert::StateChanged {
+                info_hash: *info_hash,
+                old_state,
+                new_state: SwarmState::Checking,
+            });
+
+            let engine = self.clone();
+            let info_hash_copy = *info_hash;
+            let info = handle.info.clone();
+            let disk = self.disk.clone();
+            let download_dir = PathBuf::from(download_dir_str);
+            let file_priorities = handle.file_priorities.read().clone();
+
+            tokio::spawn(async move {
+                let part_file =
+                    crate::part_file::PartFileManager::new(download_dir.clone(), info.hash);
+                let total = info.pieces();
+                let mut new_bitfield = Bitfield::new(total as usize);
+                let previous_bitfield = handle.compressed_bitfield.read().clone();
+                let concurrency = 8usize.min(total as usize).max(1);
+                let mut join_set: tokio::task::JoinSet<(u32, bool, Option<[u8; 20]>, bool)> =
+                    tokio::task::JoinSet::new();
+                let mut results: Vec<(u32, bool, Option<[u8; 20]>, bool)> =
+                    Vec::with_capacity(total as usize);
+
+                for idx in 0..total {
+                    while join_set.len() >= concurrency {
+                        if let Some(Ok(r)) = join_set.join_next().await {
+                            results.push(r);
+                        }
+                    }
+
+                    let piece_len = info.piece_len(idx);
+                    let locations = info.block_locations(idx, 0, piece_len);
+                    let mut read_slices = Vec::with_capacity(locations.len());
+                    let mut symlink_blocked = false;
+                    for loc in locations {
+                        if synapse_meta::is_padding_file(&info.files[loc.file].path, None) {
+                            read_slices.push((None, loc.piece_range));
+                        } else if crate::fs::verify_no_symlinks_under(
+                            &download_dir,
+                            &info.files[loc.file].path,
+                        )
+                        .is_err()
+                        {
+                            symlink_blocked = true;
+                            break;
+                        } else {
+                            let normal_path = download_dir.join(&info.files[loc.file].path);
+                            let mut piece_cursor = loc.piece_range.start;
+                            for (target_path, target_offset, sub_len) in part_file
+                                .resolve_read_ranges(
+                                    loc.file,
+                                    loc.file_offset,
+                                    loc.piece_range.len(),
+                                    &normal_path,
+                                )
+                            {
+                                read_slices.push((
+                                    Some(ReadJob {
+                                        path: Arc::new(target_path),
+                                        offset: target_offset,
+                                        len: sub_len,
+                                    }),
+                                    piece_cursor..piece_cursor + sub_len,
+                                ));
+                                piece_cursor += sub_len;
+                            }
+                        }
+                    }
+                    if symlink_blocked {
+                        // Treat as if a hash were available so the "no statically-known hash"
+                        // fallback below never trusts a previous have-bit for a path a symlink
+                        // may now be redirecting outside download_dir.
+                        results.push((idx, false, None, true));
+                        continue;
+                    }
+
+                    let info_c = info.clone();
+                    let disk_c = disk.clone();
+                    let expected_v1 = info.piece_hash(idx);
+                    let is_merkle = info.is_merkle_v1();
+                    let expected_v2 = info.piece_hash_v2(idx);
+                    let has_expected_hash = expected_v1.is_some() || expected_v2.is_some();
+
+                    join_set.spawn(async move {
+                        let mut buf = vec![0u8; piece_len as usize];
+                        let mut read_ok = true;
+                        for (job_opt, range) in read_slices {
+                            if let Some(job) = job_opt {
+                                match disk_c.read(job).await {
+                                    Ok(data) if data.len() == range.len() => {
+                                        buf[range].copy_from_slice(&data);
+                                    }
+                                    Ok(_) | Err(_) => {
+                                        read_ok = false;
+                                        break;
+                                    }
+                                }
+                            } else {
+                                buf[range].fill(0);
+                            }
+                        }
+
+                        let (verified, sha1) = tokio::task::spawn_blocking(move || {
+                            let sha1: Option<[u8; 20]> =
+                                (read_ok && is_merkle).then(|| Sha1::digest(&buf).into());
+                            let verified = read_ok && {
+                                if let Some(expected) = expected_v1 {
+                                    let computed: [u8; 20] = Sha1::digest(&buf).into();
+                                    computed == expected
+                                } else if let Some(expected_v2) = expected_v2 {
+                                    let computed: [u8; 32] =
+                                        info_c.compute_piece_hash_v2(idx, &buf);
+                                    computed == expected_v2
+                                } else {
+                                    false
+                                }
+                            };
+                            (verified, sha1)
+                        })
+                        .await
+                        .unwrap_or((false, None));
+
+                        (idx, verified, sha1, has_expected_hash)
+                    });
+                }
+
+                while let Some(res) = join_set.join_next().await {
+                    if let Ok(r) = res {
+                        results.push(r);
+                    }
+                }
+
+                if info.is_merkle_v1() && results.iter().all(|(_, _, h, _)| h.is_some()) {
+                    results.sort_by_key(|r| r.0);
+                    let hashes: Vec<[u8; 20]> = results.iter().filter_map(|r| r.2).collect();
+                    let expected_root = info.root_hash_v1;
+                    let valid_merkle = tokio::task::spawn_blocking(move || {
+                        synapse_meta::merkle_v1::MerkleTreeV1::from_piece_hashes(&hashes)
+                            .is_some_and(|t| Some(t.root()) == expected_root)
+                    })
+                    .await
+                    .unwrap_or(false);
+                    if valid_merkle {
+                        for r in &mut results {
+                            r.1 = true;
+                        }
+                    }
+                }
+
+                let mut verified_count = 0usize;
+                for (idx, verified, _, has_expected_hash) in results {
+                    // A piece with no statically-known hash can't be re-verified cold (e.g. a
+                    // BEP52 hash only ever recovered dynamically from a peer in a now-stopped
+                    // live actor session); trust its previous have-bit rather than silently
+                    // marking a paused/complete torrent incomplete. `Torrent::handle_recheck`
+                    // (the live-actor path) can attempt this with in-memory dynamic hashes;
+                    // this cold path cannot.
+                    let keep = verified
+                        || (!has_expected_hash
+                            && previous_bitfield.as_ref().is_some_and(|b| b.has(idx as usize)));
+                    if keep {
+                        new_bitfield.set(idx as usize);
+                        verified_count += 1;
+                    }
+                }
+
+                // Ensure the handle wasn't removed, replaced, or woken into a live actor while checking.
+                let Some(current) = engine
+                    .torrents
+                    .get(&info_hash_copy)
+                    .map(|r| r.value().clone())
+                else {
+                    return;
+                };
+                if !Arc::ptr_eq(&current, &handle) || handle.command_tx().is_some() {
+                    return;
+                }
+
+                let is_magnet_unresolved = handle.magnet_uri.read().is_some();
+                let progress = if total > 0 {
+                    verified_count as f32 / total as f32
+                } else if is_magnet_unresolved {
+                    0.0
+                } else {
+                    1.0
+                };
+
+                *handle.compressed_bitfield.write() = Some(
+                    synapse_picker::RoaringBitfield::from_bitfield(&new_bitfield),
+                );
+                let new_missing = if total > 0 && verified_count == total as usize {
+                    0
+                } else {
+                    crate::announcer::compute_missing_wanted_bytes(
+                        &info,
+                        &file_priorities,
+                        handle.compressed_bitfield.read().as_ref(),
+                    )
+                };
+                handle
+                    .missing_wanted_bytes
+                    .store(new_missing, Ordering::Release);
+
+                {
+                    let mut s = handle.stats.write();
+                    s.progress = progress;
+                    s.downloaded_bytes = ((progress as f64) * (info.total_len as f64)) as u64;
+                    if s.state == SwarmState::Checking {
+                        s.state = SwarmState::Stopped;
+                        engine
+                            .metrics
+                            .record_state_transition(&SwarmState::Checking, &SwarmState::Stopped);
+                    }
+                }
+                handle.mark_dirty();
+
+                if let Some(ref store) = engine.session_store {
+                    let queue_pos = engine.queue_positions().get(&info_hash_copy).copied();
+                    let state = Self::snapshot_handle_state(&handle, queue_pos);
+                    let store = store.clone();
+                    let _ = tokio::task::spawn_blocking(move || store.save_states_batch(&[state]))
+                        .await;
+                }
+
+                engine.post_alert(crate::alert::Alert::StateChanged {
+                    info_hash: info_hash_copy,
+                    old_state: SwarmState::Checking,
+                    new_state: SwarmState::Stopped,
+                });
+            });
+
+            return true;
+        }
+
+        if let Some(tx) = self.get_or_wake_command_tx(info_hash) {
+            {
+                let mut s = handle.stats.write();
+                let prev_state = std::mem::replace(&mut s.state, SwarmState::Checking);
+                self.metrics
+                    .record_state_transition(&prev_state, &SwarmState::Checking);
+            }
+            self.downloading_torrents.remove(info_hash);
+            self.queued_torrents.remove(info_hash);
+            self.limited_seeds.remove(info_hash);
+            handle.mark_dirty();
             let _ = tx.try_send(TorrentCommand::Recheck);
             true
         } else {
@@ -2256,10 +3310,11 @@ impl SwarmEngine {
     /// Switches a torrent between rarest-first and sequential (in-order) piece picking.
     /// Returns false if the torrent doesn't exist.
     pub fn set_sequential_download(&self, info_hash: &[u8; 20], enabled: bool) -> bool {
-        let Some(handle) = self.torrents.get(info_hash) else {
+        let Some(handle) = self.torrents.get(info_hash).map(|r| r.value().clone()) else {
             return false;
         };
         handle.sequential.store(enabled, Ordering::Relaxed);
+        handle.mark_dirty();
         self.persist_torrent_option(info_hash, move |state| state.sequential = enabled);
         // A running actor changes mode now; a dormant one picks it up when it next starts.
         if let Some(tx) = handle.command_tx() {
@@ -2276,12 +3331,13 @@ impl SwarmEngine {
 
     /// Enables or disables first/last piece priority for a torrent.
     pub fn set_first_last_piece_priority(&self, info_hash: &[u8; 20], enabled: bool) -> bool {
-        let Some(handle) = self.torrents.get(info_hash) else {
+        let Some(handle) = self.torrents.get(info_hash).map(|r| r.value().clone()) else {
             return false;
         };
         handle
             .first_last_piece_priority
             .store(enabled, Ordering::Relaxed);
+        handle.mark_dirty();
         self.persist_torrent_option(info_hash, move |state| {
             state.first_last_piece_priority = enabled;
         });
@@ -2293,10 +3349,11 @@ impl SwarmEngine {
 
     /// Enables or disables super-seeding mode for a torrent.
     pub fn set_super_seeding(&self, info_hash: &[u8; 20], enabled: bool) -> bool {
-        let Some(handle) = self.torrents.get(info_hash) else {
+        let Some(handle) = self.torrents.get(info_hash).map(|r| r.value().clone()) else {
             return false;
         };
         handle.super_seeding.store(enabled, Ordering::Relaxed);
+        handle.mark_dirty();
         self.persist_torrent_option(info_hash, move |state| {
             state.super_seeding = enabled;
         });
@@ -2312,7 +3369,7 @@ impl SwarmEngine {
         info_hash: &[u8; 20],
         patch: TorrentMetadataPatch,
     ) -> Option<TorrentMetadata> {
-        let handle = self.torrents.get(info_hash)?;
+        let handle = self.torrents.get(info_hash).map(|r| r.value().clone())?;
         let updated = {
             let mut meta = handle.metadata.write();
             if let Some(cat) = patch.category {
@@ -2343,7 +3400,15 @@ impl SwarmEngine {
             }
             meta.clone()
         };
+        if handle.stats.read().state != SwarmState::Stopped {
+            if updated.seed_ratio_limit.is_some() || updated.seed_time_limit_secs.is_some() {
+                self.limited_seeds.insert(*info_hash);
+            } else {
+                self.limited_seeds.remove(info_hash);
+            }
+        }
         let persisted = updated.clone();
+        handle.mark_dirty();
         self.persist_torrent_option(info_hash, move |state| {
             state.category = persisted.category;
             state.tags = persisted.tags;
@@ -2355,18 +3420,14 @@ impl SwarmEngine {
 
     /// Exports the `.torrent` bencode bytes and torrent name for a loaded torrent.
     pub fn export_torrent_bytes(&self, info_hash: &[u8; 20]) -> Option<(String, Vec<u8>)> {
-        let handle = self.torrents.get(info_hash)?;
+        let handle = self.torrents.get(info_hash).map(|r| r.value().clone())?;
         let name = handle.stats.read().name.clone();
         if handle.info.has_piece_hashes() {
             return Some((name, handle.info.to_torrent_bytes()));
         }
         if let Some(ref store) = self.session_store {
-            if let Ok(Some(state)) = store.load_torrent(&hex::encode(info_hash)) {
-                if let Some(hex_str) = state.raw_bencode_hex {
-                    if let Ok(bytes) = hex::decode(&hex_str) {
-                        return Some((name, bytes));
-                    }
-                }
+            if let Ok(Some(bytes)) = store.load_metadata(info_hash) {
+                return Some((name, bytes));
             }
         }
         None
@@ -2377,7 +3438,7 @@ impl SwarmEngine {
     /// dropped; returns how many usable trackers were set, or `None` if the torrent
     /// doesn't exist.
     pub fn replace_trackers(&self, info_hash: &[u8; 20], trackers: &[String]) -> Option<usize> {
-        let handle = self.torrents.get(info_hash)?;
+        let handle = self.torrents.get(info_hash).map(|r| r.value().clone())?;
         let urls = parse_tracker_urls(trackers);
         let announcer = self.announce_scheduler.announcer();
         let (stored, count) = if trackers.is_empty() {
@@ -2390,6 +3451,7 @@ impl SwarmEngine {
             (Some(strings), count)
         };
         *handle.tracker_override.write() = stored.clone();
+        handle.mark_dirty();
         self.persist_torrent_option(info_hash, move |state| state.tracker_override = stored);
         self.announce_scheduler
             .drop_stale_tracker_reports(info_hash, &announcer.trackers_for(&handle.info));
@@ -2440,8 +3502,17 @@ impl SwarmEngine {
             .collect();
         let mut order = self.queue_order.lock();
         self.sync_queue_order(&mut order);
+        let old_order = order.clone();
         if apply_queue_move(&mut order, &selected, direction) {
+            for (idx, hash) in order.iter().enumerate() {
+                if old_order.get(idx) != Some(hash) {
+                    if let Some(h) = self.torrents.get(hash) {
+                        h.mark_dirty();
+                    }
+                }
+            }
             drop(order);
+            self.queue_version.fetch_add(1, Ordering::Release);
             self.reconcile_queue();
         }
         selected.len()
@@ -2456,31 +3527,46 @@ impl SwarmEngine {
         let Some(store) = self.session_store.clone() else {
             return;
         };
+        let persist_lock = self.persist_lock.clone();
         let hex = hex::encode(info_hash);
         tokio::task::spawn_blocking(move || {
+            let _guard = persist_lock.blocking_lock();
             if let Ok(Some(mut state)) = store.load_torrent(&hex) {
                 apply(&mut state);
-                let _ = store.save_torrent(&state);
+                state.raw_bencode_hex = None;
+                let _ = store.save_states_batch(&[state]);
             }
         });
     }
 
     pub fn set_file_priority(&self, info_hash: &[u8; 20], file_index: u32, priority: u8) -> bool {
-        if let Some(handle) = self.torrents.get(info_hash) {
-            {
-                let mut prios = handle.file_priorities.write();
-                if let Some(p) = prios.get_mut(file_index as usize) {
-                    *p = priority;
-                }
+        let Some(handle) = self.torrents.get(info_hash).map(|r| r.value().clone()) else {
+            return false;
+        };
+        let priorities_snapshot = {
+            let mut prios = handle.file_priorities.write();
+            if let Some(p) = prios.get_mut(file_index as usize) {
+                *p = priority;
             }
-            self.persist_file_priorities(info_hash, handle.file_priorities.read().clone());
-            if let Some(tx) = self.get_or_wake_command_tx(info_hash) {
-                let _ = tx.try_send(TorrentCommand::SetFilePriority(file_index, priority));
-            }
-            true
-        } else {
-            false
+            prios.clone()
+        };
+        {
+            let bf = handle.compressed_bitfield.read();
+            let missing = crate::announcer::compute_missing_wanted_bytes(
+                &handle.info,
+                &priorities_snapshot,
+                bf.as_ref(),
+            );
+            handle
+                .missing_wanted_bytes
+                .store(missing, Ordering::Release);
         }
+        handle.mark_dirty();
+        self.persist_file_priorities(info_hash, priorities_snapshot);
+        if let Some(tx) = self.get_or_wake_command_tx(info_hash) {
+            let _ = tx.try_send(TorrentCommand::SetFilePriority(file_index, priority));
+        }
+        true
     }
 
     /// Saves the current per-file priorities into the torrent's session record so they survive a
@@ -2489,11 +3575,14 @@ impl SwarmEngine {
         let Some(store) = self.session_store.clone() else {
             return;
         };
+        let persist_lock = self.persist_lock.clone();
         let hex = hex::encode(info_hash);
         tokio::task::spawn_blocking(move || {
+            let _guard = persist_lock.blocking_lock();
             if let Ok(Some(mut state)) = store.load_torrent(&hex) {
                 state.file_priorities = priorities;
-                let _ = store.save_torrent(&state);
+                state.raw_bencode_hex = None;
+                let _ = store.save_states_batch(&[state]);
             }
         });
     }
@@ -2505,31 +3594,251 @@ impl SwarmEngine {
             .map(|h| h.file_priorities.read().clone())
     }
 
-    /// Moves an active swarm's downloaded files to a new directory — dispatched to
-    /// `Torrent::handle_set_location` via `TorrentCommand::SetLocation`, which does the actual
-    /// file move. Previously this only relabeled `stats.download_dir` without moving anything
-    /// on disk, silently diverging from where the files actually were.
+    /// Moves or updates a torrent's download directory. For active swarms this dispatches to
+    /// `Torrent::handle_set_location`; for paused (`Cold`/`Stopped`) swarms this updates
+    /// location (and optionally moves existing verified files) without waking the actor.
     pub fn set_location(&self, info_hash: &[u8; 20], new_download_dir: &str) -> bool {
-        if let Some(tx) = self.get_or_wake_command_tx(info_hash) {
-            let _ = tx.try_send(TorrentCommand::SetLocation(std::path::PathBuf::from(
-                new_download_dir,
-            )));
-            true
-        } else {
-            false
+        self.set_location_with_options(info_hash, new_download_dir, true)
+    }
+
+    pub fn set_location_with_options(
+        &self,
+        info_hash: &[u8; 20],
+        new_download_dir: &str,
+        move_existing_files: bool,
+    ) -> bool {
+        let Some(handle) = self.torrents.get(info_hash).map(|r| r.value().clone()) else {
+            return false;
+        };
+        let new_dir = PathBuf::from(new_download_dir);
+        if new_dir.as_os_str().is_empty()
+            || !new_dir.is_absolute()
+            || new_dir
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return false;
+        }
+        let (is_cold_or_stopped, old_dir_str, progress) = {
+            let s = handle.stats.read();
+            (
+                s.tier == SwarmTier::Cold || s.state == SwarmState::Stopped,
+                s.download_dir.clone(),
+                s.progress,
+            )
+        };
+        if !is_cold_or_stopped {
+            if let Some(tx) = self.get_or_wake_command_tx(info_hash) {
+                if tx
+                    .try_send(TorrentCommand::SetLocation {
+                        new_dir,
+                        move_existing_files,
+                    })
+                    .is_ok()
+                {
+                    *handle.final_download_dir.write() = None;
+                    return true;
+                }
+                return false;
+            }
+            return false;
+        }
+
+        let old_dir = PathBuf::from(&old_dir_str);
+        if new_dir == old_dir {
+            *handle.final_download_dir.write() = None;
+            return true;
+        }
+        if std::fs::symlink_metadata(&new_dir).is_ok_and(|m| m.file_type().is_symlink()) {
+            return false;
+        }
+        if move_existing_files
+            && std::fs::symlink_metadata(&old_dir).is_ok_and(|m| m.file_type().is_symlink())
+        {
+            return false;
+        }
+        if std::fs::create_dir_all(&new_dir).is_err() {
+            return false;
+        }
+
+        let has_verified_data = progress > 0.0
+            || handle
+                .compressed_bitfield
+                .read()
+                .as_ref()
+                .is_some_and(|b| b.count_ones() > 0);
+
+        let mut moved: Vec<(PathBuf, PathBuf)> = Vec::new();
+        if move_existing_files {
+            if has_verified_data {
+                for file in &handle.info.files {
+                    if crate::fs::verify_no_symlinks_under(&old_dir, &file.path).is_err()
+                        || crate::fs::verify_no_symlinks_under(&new_dir, &file.path).is_err()
+                    {
+                        Self::rollback_moves_sync(&self.disk, &moved);
+                        return false;
+                    }
+                    let src = old_dir.join(&file.path);
+                    let dst = new_dir.join(&file.path);
+                    match std::fs::symlink_metadata(&src) {
+                        Ok(meta) if meta.file_type().is_file() => {}
+                        Ok(_) => {
+                            Self::rollback_moves_sync(&self.disk, &moved);
+                            return false;
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(_) => {
+                            Self::rollback_moves_sync(&self.disk, &moved);
+                            return false;
+                        }
+                    }
+                    if !Self::move_file_with_fallback(&self.disk, &src, &dst, &mut moved) {
+                        Self::rollback_moves_sync(&self.disk, &moved);
+                        return false;
+                    }
+                }
+            }
+
+            let hex_hash = hex::encode(info_hash);
+            for fname in [
+                format!(".synapse_part_{hex_hash}"),
+                format!(".synapse_part_{hex_hash}.map"),
+            ] {
+                let src = old_dir.join(&fname);
+                match std::fs::symlink_metadata(&src) {
+                    Ok(meta) if meta.file_type().is_file() => {}
+                    Ok(_) => {
+                        Self::rollback_moves_sync(&self.disk, &moved);
+                        return false;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(_) => {
+                        Self::rollback_moves_sync(&self.disk, &moved);
+                        return false;
+                    }
+                }
+                let dst = new_dir.join(&fname);
+                if !Self::move_file_with_fallback(&self.disk, &src, &dst, &mut moved) {
+                    Self::rollback_moves_sync(&self.disk, &moved);
+                    return false;
+                }
+            }
+        }
+
+        *handle.final_download_dir.write() = None;
+        handle.stats.write().download_dir = new_dir.to_string_lossy().to_string();
+        if let Some(ref store) = self.session_store {
+            let hex_hash = hex::encode(info_hash);
+            let new_dir_str = new_dir.to_string_lossy().to_string();
+            if let Ok(Some(mut state)) = store.load_torrent(&hex_hash) {
+                state.download_dir = new_dir_str;
+                state.raw_bencode_hex = None;
+                let _ = store.save_states_batch(&[state]);
+            }
+        }
+        true
+    }
+
+    fn move_file_with_fallback(
+        disk: &diskio::DiskEngine,
+        src: &std::path::Path,
+        dst: &std::path::Path,
+        moved: &mut Vec<(PathBuf, PathBuf)>,
+    ) -> bool {
+        if let Ok(dst_meta) = std::fs::symlink_metadata(dst) {
+            if dst_meta.file_type().is_symlink() || dst_meta.file_type().is_dir() {
+                return false;
+            }
+        }
+        if let Some(parent) = dst.parent() {
+            if std::fs::create_dir_all(parent).is_err() {
+                return false;
+            }
+        }
+        disk.evict(src);
+        disk.evict(dst);
+        if std::fs::rename(src, dst).is_err() {
+            if std::fs::copy(src, dst).is_err() {
+                let _ = std::fs::remove_file(dst);
+                return false;
+            }
+            let _ = std::fs::remove_file(src);
+        }
+        moved.push((src.to_path_buf(), dst.to_path_buf()));
+        true
+    }
+
+    fn rollback_moves_sync(disk: &diskio::DiskEngine, moved: &[(PathBuf, PathBuf)]) {
+        for (src, dst) in moved.iter().rev() {
+            disk.evict(dst);
+            disk.evict(src);
+            if std::fs::rename(dst, src).is_err() && std::fs::copy(dst, src).is_ok() {
+                let _ = std::fs::remove_file(dst);
+            }
         }
     }
 
     /// Configures global download and upload rate limits in bytes per second (0 = unlimited).
     pub fn set_rate_limits(&self, download_limit_bytes: u64, upload_limit_bytes: u64) {
+        self.update_global_rate_limits(Some(download_limit_bytes), Some(upload_limit_bytes));
+    }
+
+    /// Partially updates global download and/or upload rate limits without wiping the omitted direction.
+    pub fn update_global_rate_limits(
+        &self,
+        download_limit_bytes: Option<u64>,
+        upload_limit_bytes: Option<u64>,
+    ) {
+        if download_limit_bytes.is_none() && upload_limit_bytes.is_none() {
+            return;
+        }
         {
             let mut s = self.settings.write();
-            s.download_limit_bytes = download_limit_bytes;
-            s.download_limit_enabled = download_limit_bytes > 0;
-            s.upload_limit_bytes = upload_limit_bytes;
-            s.upload_limit_enabled = upload_limit_bytes > 0;
+            if let Some(dl) = download_limit_bytes {
+                s.download_limit_bytes = dl;
+                s.download_limit_enabled = dl > 0;
+            }
+            if let Some(ul) = upload_limit_bytes {
+                s.upload_limit_bytes = ul;
+                s.upload_limit_enabled = ul > 0;
+            }
         }
         self.recalculate_effective_rate_limits();
+    }
+
+    /// Partially updates per-torrent download and/or upload rate limits (0 = unlimited), preserving
+    /// any omitted direction across active and future woken actors.
+    pub fn set_torrent_rate_limits(
+        &self,
+        info_hash: &[u8; 20],
+        download_limit_bytes: Option<u64>,
+        upload_limit_bytes: Option<u64>,
+    ) -> bool {
+        let Some(handle) = self.torrents.get(info_hash).map(|r| r.value().clone()) else {
+            return false;
+        };
+        let effective_dl = match download_limit_bytes {
+            Some(dl) => {
+                handle.download_limit_bytes.store(dl, Ordering::Relaxed);
+                dl
+            }
+            None => handle.download_limit_bytes.load(Ordering::Relaxed),
+        };
+        let effective_ul = match upload_limit_bytes {
+            Some(ul) => {
+                handle.upload_limit_bytes.store(ul, Ordering::Relaxed);
+                ul
+            }
+            None => handle.upload_limit_bytes.load(Ordering::Relaxed),
+        };
+        if let Some(tx) = handle.command_tx() {
+            let _ = tx.try_send(TorrentCommand::SetRateLimits {
+                download_limit_bytes: effective_dl,
+                upload_limit_bytes: effective_ul,
+            });
+        }
+        handle.mark_dirty();
+        true
     }
 
     pub fn settings(&self) -> Arc<RwLock<DynamicSessionSettings>> {
@@ -2544,10 +3853,68 @@ impl SwarmEngine {
         self.settings.read().clone()
     }
 
-    /// Returns the available disk space in bytes on the filesystem backing the configured `download_dir`.
+    fn trigger_free_disk_refresh(&self, download_dir: PathBuf) {
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        if self.free_disk_refreshing.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        struct ResetFlag(Arc<AtomicBool>);
+        impl Drop for ResetFlag {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        let cache = self.free_disk_cache.clone();
+        let flag = ResetFlag(self.free_disk_refreshing.clone());
+        handle.spawn_blocking(move || {
+            let _guard = flag;
+            let bytes = crate::fs::get_available_disk_space(&download_dir);
+            *cache.lock() = Some((download_dir, Instant::now(), bytes));
+        });
+    }
+
+    /// Returns the available disk space in bytes on the filesystem backing the configured `download_dir`,
+    /// using a short-lived cache and background refresh when called inside a Tokio runtime.
     pub fn free_disk_space_bytes(&self) -> u64 {
+        const FREE_DISK_CACHE_TTL: Duration = Duration::from_secs(5);
         let download_dir = self.settings.read().download_dir.clone();
-        crate::fs::get_available_disk_space(&download_dir)
+        if let Some((ref cached_dir, cached_at, cached_bytes)) = *self.free_disk_cache.lock() {
+            if cached_dir == &download_dir {
+                if cached_at.elapsed() < FREE_DISK_CACHE_TTL {
+                    return cached_bytes;
+                }
+                if tokio::runtime::Handle::try_current().is_ok() {
+                    self.trigger_free_disk_refresh(download_dir);
+                    return cached_bytes;
+                }
+            }
+        }
+        let bytes = crate::fs::get_available_disk_space(&download_dir);
+        *self.free_disk_cache.lock() = Some((download_dir, Instant::now(), bytes));
+        bytes
+    }
+
+    /// Non-blocking async variant of `free_disk_space_bytes` that offloads cache misses to `spawn_blocking`.
+    pub async fn free_disk_space_bytes_async(&self) -> u64 {
+        const FREE_DISK_CACHE_TTL: Duration = Duration::from_secs(5);
+        let download_dir = self.settings.read().download_dir.clone();
+        if let Some((ref cached_dir, cached_at, cached_bytes)) = *self.free_disk_cache.lock() {
+            if cached_dir == &download_dir {
+                if cached_at.elapsed() >= FREE_DISK_CACHE_TTL {
+                    self.trigger_free_disk_refresh(download_dir);
+                }
+                return cached_bytes;
+            }
+        }
+        let dir_for_stat = download_dir.clone();
+        let bytes =
+            tokio::task::spawn_blocking(move || crate::fs::get_available_disk_space(&dir_for_stat))
+                .await
+                .unwrap_or(0);
+        *self.free_disk_cache.lock() = Some((download_dir, Instant::now(), bytes));
+        bytes
     }
 
     /// Returns the available disk space in bytes for a specific target path.
@@ -2771,6 +4138,7 @@ impl SwarmEngine {
             self.queue_manager.write().set_config(s.queue.clone());
         }
 
+        self.dht_concurrency_notify.notify_waiters();
         self.recalculate_effective_rate_limits();
         self.rechoke_session();
         warnings
@@ -2779,9 +4147,12 @@ impl SwarmEngine {
     /// Evaluates all active swarms and distributes unchoke slots session-wide based on
     /// torrent priority, seeding state, and interested peer demand.
     pub fn rechoke_session(&self) {
+        let is_alt = self.is_alt_speed_active();
         let (global_slots, slot_bw, upload_limit, seed_algo_str) = {
             let s = self.settings.read();
-            let upload_lim = if s.upload_limit_enabled {
+            let upload_lim = if is_alt {
+                s.alt_speed_up_bytes
+            } else if s.upload_limit_enabled {
                 s.upload_limit_bytes
             } else {
                 0
@@ -2805,17 +4176,24 @@ impl SwarmEngine {
         choker.slot_bandwidth = slot_bw.max(1);
 
         let mut demands = Vec::new();
-        for item in self.torrents.iter() {
-            let info_hash = *item.key();
-            let handle = item.value();
+        let active_hashes: Vec<[u8; 20]> = self.active_torrents.iter().map(|r| *r).collect();
+        for info_hash in active_hashes {
+            let Some(handle) = self.torrents.get(&info_hash).map(|r| r.value().clone()) else {
+                self.active_torrents.remove(&info_hash);
+                continue;
+            };
             if !handle.is_active() {
+                self.active_torrents.remove(&info_hash);
                 continue;
             }
-            let is_seeding = handle.stats.read().state == SwarmState::Seeding;
-            let priority = match handle.stats.read().tier {
-                SwarmTier::Hot => 5,
-                SwarmTier::Warm => 4,
-                SwarmTier::Cold => 2,
+            let (is_seeding, priority) = {
+                let s = handle.stats.read();
+                let prio = match s.tier {
+                    SwarmTier::Hot => 5,
+                    SwarmTier::Warm => 4,
+                    SwarmTier::Cold => 2,
+                };
+                (s.state == SwarmState::Seeding, prio)
             };
             let interested_peers = handle
                 .live_peers
@@ -2834,7 +4212,7 @@ impl SwarmEngine {
         let allocation = choker.allocate_slots(&demands, upload_limit);
 
         for (info_hash, slots) in allocation {
-            if let Some(handle) = self.torrents.get(&info_hash) {
+            if let Some(handle) = self.torrents.get(&info_hash).map(|r| r.value().clone()) {
                 if let Some(tx) = handle.command_tx() {
                     let _ = tx.try_send(TorrentCommand::SetUnchokeSlots(slots));
                     let _ = tx.try_send(TorrentCommand::SetSeedChokingAlgorithm(seed_algo));
@@ -2849,6 +4227,7 @@ impl SwarmEngine {
             let mut interval = tokio::time::interval(Duration::from_secs(5));
             loop {
                 interval.tick().await;
+                self.recalculate_effective_rate_limits();
                 self.rechoke_session();
             }
         })
@@ -2856,10 +4235,13 @@ impl SwarmEngine {
 
     /// Transitions an active torrent to the Warm tier (idle seeding with compressed Roaring Bitfield).
     pub fn transition_to_warm(&self, info_hash: &[u8; 20]) -> bool {
-        if let Some(handle) = self.torrents.get(info_hash) {
-            let mut stats = handle.stats.write();
-            stats.tier = SwarmTier::Warm;
-            drop(stats);
+        if let Some(handle) = self.torrents.get(info_hash).map(|r| r.value().clone()) {
+            let cur_state = {
+                let mut stats = handle.stats.write();
+                stats.tier = SwarmTier::Warm;
+                stats.state.clone()
+            };
+            self.sync_tracking_sets(info_hash, &cur_state, SwarmTier::Warm, Some(&handle));
             handle.stop_actor();
             true
         } else {
@@ -2869,7 +4251,7 @@ impl SwarmEngine {
 
     /// Transitions an active torrent to the Cold tier (paused / stopped).
     pub fn transition_to_cold(&self, info_hash: &[u8; 20]) -> bool {
-        if let Some(handle) = self.torrents.get(info_hash) {
+        if let Some(handle) = self.torrents.get(info_hash).map(|r| r.value().clone()) {
             let mut stats = handle.stats.write();
             let old_state = stats.state.clone();
             let old_dl = stats.download_rate;
@@ -2891,6 +4273,7 @@ impl SwarmEngine {
                 new_state: SwarmState::Stopped,
             });
             drop(stats);
+            self.remove_from_tracking_sets(info_hash);
             handle.stop_actor();
             self.announce_scheduler.unregister(info_hash);
             self.lsd_manager.lock().unregister_torrent(info_hash);
@@ -2900,8 +4283,13 @@ impl SwarmEngine {
                 let hex_hash = hex::encode(info_hash);
                 if let Ok(Some(mut state)) = store.load_torrent(&hex_hash) {
                     state.is_paused = true;
-                    let _ = store.save_torrent(&state);
+                    state.raw_bencode_hex = None;
+                    let _ = store.save_states_batch(&[state]);
+                } else {
+                    handle.mark_dirty();
                 }
+            } else {
+                handle.mark_dirty();
             }
             true
         } else {
@@ -2911,7 +4299,7 @@ impl SwarmEngine {
 
     /// Transitions a torrent back to the Hot tier for active transfers.
     pub fn transition_to_hot(&self, info_hash: &[u8; 20]) -> bool {
-        if let Some(handle) = self.torrents.get(info_hash) {
+        if let Some(handle) = self.torrents.get(info_hash).map(|r| r.value().clone()) {
             let mut stats = handle.stats.write();
             let old_state = stats.state.clone();
             let target_state = if stats.progress >= 1.0 {
@@ -2921,6 +4309,11 @@ impl SwarmEngine {
             };
             stats.tier = SwarmTier::Hot;
             stats.state = target_state.clone();
+            stats.is_stalled = false;
+            stats.last_transfer_at = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64;
             self.metrics
                 .record_state_transition(&old_state, &target_state);
             self.post_alert(crate::alert::Alert::StateChanged {
@@ -2931,6 +4324,7 @@ impl SwarmEngine {
             drop(stats);
 
             let is_dl = target_state == SwarmState::Downloading;
+            self.sync_tracking_sets(info_hash, &target_state, SwarmTier::Hot, Some(&handle));
             let _ = self.wake_torrent_internal(&handle);
             let peer_tx = handle.peer_event_tx().unwrap_or_else(|| mpsc::channel(1).0);
             let initial_dl = {
@@ -2947,6 +4341,7 @@ impl SwarmEngine {
                     file_priorities: handle.file_priorities.clone(),
                     compressed_bitfield: handle.compressed_bitfield.clone(),
                     initial_downloaded: initial_dl,
+                    missing_wanted_bytes: handle.missing_wanted_bytes.clone(),
                 },
             );
             self.announce_scheduler.notify_resumed(info_hash);
@@ -2961,8 +4356,13 @@ impl SwarmEngine {
                 let hex_hash = hex::encode(info_hash);
                 if let Ok(Some(mut state)) = store.load_torrent(&hex_hash) {
                     state.is_paused = false;
-                    let _ = store.save_torrent(&state);
+                    state.raw_bencode_hex = None;
+                    let _ = store.save_states_batch(&[state]);
+                } else {
+                    handle.mark_dirty();
                 }
+            } else {
+                handle.mark_dirty();
             }
             true
         } else {
@@ -2974,23 +4374,37 @@ impl SwarmEngine {
         self.announce_scheduler.unregister(info_hash);
         self.lsd_manager.lock().unregister_torrent(info_hash);
         self.zeroconf_manager.lock().unregister_torrent(info_hash);
+        self.remove_from_tracking_sets(info_hash);
         if let Some(ref store) = self.session_store {
             let _ = store.remove_torrent(info_hash);
         }
         if let Some((_, handle)) = self.torrents.remove(info_hash) {
+            self.torrent_order.write().retain(|h| h != info_hash);
+            self.roster_version.fetch_add(1, Ordering::Release);
+            self.queue_version.fetch_add(1, Ordering::Release);
             self.mse_req2_index
                 .remove(&synapse_wire::mse_req2(info_hash));
             if let Some(v2) = handle.info.info_hash_v2 {
                 self.v2_torrents.remove(&v2);
             }
+            let dl_dir = {
+                let mut s = handle.stats.write();
+                self.metrics.record_remove(&s);
+                s.download_rate = 0;
+                s.upload_rate = 0;
+                s.peers_connected = 0;
+                s.peers_sending = 0;
+                PathBuf::from(&s.download_dir)
+            };
             handle.stop_actor();
-            let s = handle.stats.read();
-            self.metrics.record_remove(&s);
+            for file in &handle.info.files {
+                self.disk.evict(&dl_dir.join(&file.path));
+            }
+            let hex_hash = hex::encode(info_hash);
+            self.disk
+                .evict(&dl_dir.join(format!(".synapse_part_{hex_hash}")));
             // The part file and its slice map are private scratch; nothing else can use them.
-            crate::part_file::PartFileManager::remove_files(
-                std::path::Path::new(&s.download_dir),
-                info_hash,
-            );
+            crate::part_file::PartFileManager::remove_files(&dl_dir, info_hash);
             true
         } else {
             false
@@ -3002,66 +4416,129 @@ impl SwarmEngine {
         self.v2_torrents.get(hash).map(|r| r.value().clone())
     }
 
+    fn build_watch_dir_index(watch_dir: &std::path::Path) -> WatchDirIndex {
+        let mut index = std::collections::HashMap::new();
+        let candidates = [
+            watch_dir.to_path_buf(),
+            watch_dir.join(".imported"),
+            watch_dir.join(".failed"),
+        ];
+        for dir in &candidates {
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_file() {
+                        if let Ok(bytes) = std::fs::read(&path) {
+                            if let Ok(reloaded) = Info::from_persisted_bencode(&bytes) {
+                                if reloaded.has_piece_hashes() {
+                                    index.entry(reloaded.hash).or_insert((reloaded, bytes));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        index
+    }
+
     pub fn restore_session(&self) -> std::io::Result<usize> {
         let Some(ref store) = self.session_store else {
             return Ok(0);
         };
-        let states = store.load_all()?;
+        let mut entries = store.load_all_entries()?;
+        entries.sort_by(|a, b| {
+            (
+                a.0.queue_position.unwrap_or(u32::MAX),
+                a.0.added_at,
+                &a.0.info_hash_hex,
+            )
+                .cmp(&(
+                    b.0.queue_position.unwrap_or(u32::MAX),
+                    b.0.added_at,
+                    &b.0.info_hash_hex,
+                ))
+        });
+
+        enum ParsedMeta {
+            Complete(Info),
+            Incomplete(Info),
+            Mismatch([u8; 20]),
+            Missing,
+        }
+
+        let mut watch_dir_index: Option<WatchDirIndex> = None;
         let mut restored = 0;
-        for state in states {
+        for (state, raw_meta) in entries {
             if let Some(info_hash) = state.info_hash() {
                 if self.torrents.contains_key(&info_hash) {
                     continue;
                 }
-                // First try recovering pristine Info (from session store if valid, or watch_dir auto-heal)
-                let info_result = if let Some(recovered) = self.try_recover_info(&info_hash) {
-                    Some(recovered)
-                } else if let Some(ref hex_str) = state.raw_bencode_hex {
-                    if let Ok(bytes) = hex::decode(hex_str) {
-                        if let Ok(bencode) = synapse_bencode::decode_buf(&bytes) {
-                            if let Ok(mut info) = Info::from_persisted_bencode(bencode) {
-                                if info.hash != info_hash {
-                                    // If piece hashes were evicted prior to session persistence,
-                                    // info.pieces will be 0 while state.total_pieces is > 0.
-                                    if info.pieces == 0 && state.total_pieces > 0 {
-                                        tracing::info!(
-                                            "Restoring seeding swarm '{}' ({}) whose piece hashes were previously evicted",
-                                            state.name,
-                                            state.info_hash_hex
-                                        );
-                                        info.hash = info_hash;
-                                        info.pieces = state.total_pieces as u32;
-                                    } else {
-                                        tracing::warn!(
-                                            "Session file hash mismatch for '{}' (header hash: {}, payload hash: {}). Skipping without purging.",
-                                            state.name,
-                                            state.info_hash_hex,
-                                            hex::encode(info.hash)
-                                        );
-                                        continue;
-                                    }
+                let parsed = match raw_meta {
+                    Some(bytes) => match Info::from_persisted_bencode(&bytes).ok() {
+                        Some(mut info) => {
+                            if info.hash != info_hash {
+                                // If piece hashes were evicted prior to session persistence,
+                                // info.pieces will be 0 while state.total_pieces is > 0.
+                                if info.pieces == 0 && state.total_pieces > 0 {
+                                    tracing::info!(
+                                        "Restoring seeding swarm '{}' ({}) whose piece hashes were previously evicted",
+                                        state.name,
+                                        state.info_hash_hex
+                                    );
+                                    info.hash = info_hash;
+                                    info.pieces = state.total_pieces as u32;
+                                    ParsedMeta::Incomplete(info)
+                                } else {
+                                    ParsedMeta::Mismatch(info.hash)
                                 }
-                                if !info.has_piece_hashes() {
-                                    if let Some(hashes) = self.try_recover_piece_hashes(&info_hash)
-                                    {
-                                        if info.pieces == 0 {
-                                            info.pieces = hashes.len() as u32;
-                                        }
-                                        info.restore_piece_hashes(hashes);
-                                    }
-                                }
-                                Some(info)
+                            } else if info.has_piece_hashes() {
+                                ParsedMeta::Complete(info)
                             } else {
-                                None
+                                ParsedMeta::Incomplete(info)
                             }
+                        }
+                        None => ParsedMeta::Missing,
+                    },
+                    None => ParsedMeta::Missing,
+                };
+
+                let info_result = match parsed {
+                    ParsedMeta::Complete(info) => Some(info),
+                    other => {
+                        let healed = if let Some(ref watch_dir) = self.watch_dir {
+                            let idx = watch_dir_index
+                                .get_or_insert_with(|| Self::build_watch_dir_index(watch_dir));
+                            idx.get(&info_hash).map(|(reloaded, raw_bytes)| {
+                                tracing::info!(
+                                    "Auto-healed corrupted session metadata for '{}' ({}) from watch directory",
+                                    reloaded.name,
+                                    state.info_hash_hex,
+                                );
+                                let _ = store.save_metadata(&info_hash, raw_bytes);
+                                reloaded.clone()
+                            })
                         } else {
                             None
+                        };
+                        match (healed, other) {
+                            (Some(info), _) => Some(info),
+                            (None, ParsedMeta::Incomplete(info)) => Some(info),
+                            (None, ParsedMeta::Mismatch(payload_hash)) => {
+                                tracing::warn!(
+                                    "Session file hash mismatch for '{}' (header hash: {}, payload hash: {}). Skipping without purging.",
+                                    state.name,
+                                    state.info_hash_hex,
+                                    hex::encode(payload_hash)
+                                );
+                                continue;
+                            }
+                            (None, ParsedMeta::Missing | ParsedMeta::Complete(_)) => state
+                                .magnet_uri
+                                .as_deref()
+                                .and_then(|uri| Info::from_magnet(uri).ok()),
                         }
-                    } else {
-                        None
                     }
-                } else {
-                    None
                 };
 
                 if let Some(info) = info_result {
@@ -3100,6 +4577,14 @@ impl SwarmEngine {
                         seed_time_limit_secs: state.seed_time_limit_secs,
                         super_seeding: state.super_seeding,
                         first_last_piece_priority: state.first_last_piece_priority,
+                        magnet_uri: if info.files.is_empty() {
+                            state.magnet_uri.clone()
+                        } else {
+                            None
+                        },
+                        queue_position: state.queue_position,
+                        download_limit_bytes: state.download_limit_bytes,
+                        upload_limit_bytes: state.upload_limit_bytes,
                     };
                     self.add_torrent_with_resume(
                         Arc::new(info),
@@ -3111,11 +4596,12 @@ impl SwarmEngine {
                 }
             }
         }
-        // The store yields torrents in arbitrary order; start the queue oldest-first.
+        // Preserve restored queue_position order; sync_queue_order only deduplicates/appends.
         if restored > 0 {
             let mut order = self.queue_order.lock();
-            order.clear();
             self.sync_queue_order(&mut order);
+            self.roster_version.fetch_add(1, Ordering::Release);
+            self.queue_version.fetch_add(1, Ordering::Release);
         }
         Ok(restored)
     }
@@ -3295,13 +4781,18 @@ impl SwarmEngine {
         Ok(handle)
     }
 
+    /// Returns the live DHT routing table size in O(1) without messaging the DHT actor.
+    pub fn dht_node_count_fast(&self) -> usize {
+        self.dht
+            .read()
+            .as_ref()
+            .map(|h| h.node_count())
+            .unwrap_or(0)
+    }
+
     /// Returns the live DHT routing table size (0 if DHT isn't running), for metrics.
     pub async fn dht_node_count(&self) -> usize {
-        let handle = self.dht.read().clone();
-        match handle {
-            Some(h) => h.routing_snapshot().await.map(|v| v.len()).unwrap_or(0),
-            None => 0,
-        }
+        self.dht_node_count_fast()
     }
 
     /// Returns the number of candidate peers queued to be dialed for this swarm.
@@ -3388,11 +4879,13 @@ impl SwarmEngine {
         ];
 
         // Resume from the saved state if there is one: same node id, and the nodes we knew.
-        let saved = self
-            .dht_state_path
-            .as_ref()
-            .and_then(|p| std::fs::read(p).ok())
-            .and_then(|b| synapse_dht::DhtState::decode(&b));
+        let saved = match self.dht_state_path.as_ref() {
+            Some(p) => tokio::fs::read(p)
+                .await
+                .ok()
+                .and_then(|b| synapse_dht::DhtState::decode(&b)),
+            None => None,
+        };
         let our_id: [u8; 20] = saved
             .as_ref()
             .map(|s| s.node_id)
@@ -3502,8 +4995,23 @@ impl SwarmEngine {
 
         let engine = self;
         tokio::spawn(async move {
-            let dht_concurrency = engine.settings.read().max_concurrent_dht_announces.max(1);
-            let semaphore = Arc::new(tokio::sync::Semaphore::new(dht_concurrency));
+            let mut sem_cap = engine.settings.read().max_concurrent_dht_announces.max(1);
+            let semaphore = Arc::new(tokio::sync::Semaphore::new(sem_cap));
+            let active_dht = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let done_notify = engine.dht_concurrency_notify.clone();
+
+            struct DhtCrawlGuard {
+                _permit: tokio::sync::OwnedSemaphorePermit,
+                active: Arc<std::sync::atomic::AtomicUsize>,
+                notify: Arc<tokio::sync::Notify>,
+            }
+            impl Drop for DhtCrawlGuard {
+                fn drop(&mut self) {
+                    self.active.fetch_sub(1, Ordering::AcqRel);
+                    self.notify.notify_waiters();
+                }
+            }
+
             let mut ticker = tokio::time::interval(DHT_CRAWL_INTERVAL);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
@@ -3529,13 +5037,33 @@ impl SwarmEngine {
                     .collect();
 
                 for (info_hash, _) in swarms {
-                    let permit = semaphore.clone().acquire_owned().await;
-                    let Ok(permit) = permit else { continue };
+                    let permit = loop {
+                        let notified = done_notify.notified();
+                        tokio::pin!(notified);
+                        notified.as_mut().enable();
+                        let limit = engine.settings.read().max_concurrent_dht_announces.max(1);
+                        if limit > sem_cap {
+                            semaphore.add_permits(limit - sem_cap);
+                            sem_cap = limit;
+                        }
+                        if active_dht.load(Ordering::Acquire) < limit {
+                            if let Ok(permit) = semaphore.clone().try_acquire_owned() {
+                                break permit;
+                            }
+                        }
+                        notified.await;
+                    };
+                    active_dht.fetch_add(1, Ordering::AcqRel);
+                    let guard = DhtCrawlGuard {
+                        _permit: permit,
+                        active: active_dht.clone(),
+                        notify: done_notify.clone(),
+                    };
                     let handle = handle.clone();
                     let engine = engine.clone();
                     let bootstrap_nodes = bootstrap_nodes.clone();
                     tokio::spawn(async move {
-                        let _permit = permit;
+                        let _guard = guard;
                         match handle
                             .iterative_get_peers(info_hash, &bootstrap_nodes)
                             .await
@@ -3600,12 +5128,12 @@ impl SwarmEngine {
 
         // IPv4 group (BEP 14) is required; the IPv6 group (BEP 14/22) is best effort, as many
         // hosts and containers have no IPv6.
-        let socket_v4 = bind_lsd_socket(lsd_v4)?;
+        let socket_v4 = Arc::new(bind_lsd_socket(lsd_v4)?);
         info!("LSD (Local Peer Discovery) active on {}", lsd_v4);
         let socket_v6 = match bind_lsd_socket(lsd_v6) {
             Ok(s) => {
                 info!("LSD (Local Peer Discovery) active on {}", lsd_v6);
-                Some(s)
+                Some(Arc::new(s))
             }
             Err(e) => {
                 debug!("LSD IPv6 group unavailable: {e}");
@@ -3633,22 +5161,37 @@ impl SwarmEngine {
                         if !self.settings.read().lsd_enabled {
                             continue;
                         }
-                        let packet = self.lsd_manager.lock().build_announce_packet();
-                        if let Some(packet) = packet {
-                            if let Err(e) = socket_v4.send_to(packet.as_bytes(), lsd_v4).await {
-                                debug!("LSD IPv4 announce send failed: {e}");
-                            }
-                            if let Some(ref s6) = socket_v6 {
-                                // The `Host:` header names the group the packet is sent to.
-                                let v6_packet = packet.replace(
-                                    synapse_wire::LSD_MULTICAST_IPV4,
-                                    synapse_wire::LSD_MULTICAST_IPV6,
-                                );
-                                if let Err(e) = s6.send_to(v6_packet.as_bytes(), lsd_v6).await {
-                                    debug!("LSD IPv6 announce send failed: {e}");
-                                }
+                        let mut sends: Vec<(Arc<tokio::net::UdpSocket>, SocketAddr, String)> =
+                            Vec::new();
+                        for packet in self
+                            .lsd_manager
+                            .lock()
+                            .build_announce_packets_for_host(synapse_wire::LSD_MULTICAST_IPV4)
+                        {
+                            sends.push((socket_v4.clone(), lsd_v4, packet));
+                        }
+                        if let Some(ref s6) = socket_v6 {
+                            for v6_packet in self
+                                .lsd_manager
+                                .lock()
+                                .build_announce_packets_for_host(synapse_wire::LSD_MULTICAST_IPV6)
+                            {
+                                sends.push((s6.clone(), lsd_v6, v6_packet));
                             }
                         }
+                        let limit = self.settings.read().max_concurrent_lsd_announces.max(1);
+                        let mut in_flight = tokio::task::JoinSet::new();
+                        for (sock, dest, pkt) in sends {
+                            while in_flight.len() >= limit {
+                                let _ = in_flight.join_next().await;
+                            }
+                            in_flight.spawn(async move {
+                                if let Err(e) = sock.send_to(pkt.as_bytes(), dest).await {
+                                    debug!("LSD announce send failed to {dest}: {e}");
+                                }
+                            });
+                        }
+                        while in_flight.join_next().await.is_some() {}
                     }
                     recv = from_v4 => {
                         match recv {
@@ -3698,15 +5241,15 @@ impl SwarmEngine {
                             continue;
                         }
                         let addrs = self.zeroconf_addresses();
-                        let (queries, announcement) = {
+                        let (queries, announcements) = {
                             let mut m = self.zeroconf_manager.lock();
                             m.set_listen_port(*self.listen_port.read());
-                            (m.queries(), m.announcement(&addrs))
+                            (m.queries(), m.announcements(&addrs))
                         };
                         for q in queries {
                             let _ = socket.send_to(&q, self.zeroconf_target(group)).await;
                         }
-                        if let Some(a) = announcement {
+                        for a in announcements {
                             let _ = socket.send_to(&a, self.zeroconf_target(group)).await;
                         }
                     }
@@ -3807,7 +5350,13 @@ impl SwarmEngine {
         }
         let bytes = synapse_dht::DhtState { node_id, nodes }.encode();
         let tmp = path.with_extension("tmp");
-        let result = std::fs::write(&tmp, &bytes).and_then(|_| std::fs::rename(&tmp, &path));
+        let write_path = path.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            std::fs::write(&tmp, &bytes).and_then(|_| std::fs::rename(&tmp, &write_path))
+        })
+        .await
+        .map_err(std::io::Error::other)
+        .and_then(|r| r);
         if let Err(e) = result {
             debug!("DHT: could not save state to {}: {e}", path.display());
         }
@@ -4044,5 +5593,913 @@ mod queue_order_tests {
             assert!(!apply_queue_move(&mut o, &sel(&[]), d));
         }
         assert_eq!(o, order(&[1, 2, 3]));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_set_file_priority_and_swarm_mutations_do_not_deadlock() {
+        use std::collections::BTreeMap;
+        use synapse_bencode::BEncode;
+
+        let make_info = |name: Vec<u8>, len: i64| -> Arc<Info> {
+            let mut fdict = BTreeMap::new();
+            fdict.insert(b"length".to_vec(), BEncode::Int(len));
+            fdict.insert(
+                b"path".to_vec(),
+                BEncode::List(vec![BEncode::String(b"file.bin".to_vec())]),
+            );
+            let mut id = BTreeMap::new();
+            id.insert(b"name".to_vec(), BEncode::String(name));
+            id.insert(b"piece length".to_vec(), BEncode::Int(16384));
+            id.insert(
+                b"pieces".to_vec(),
+                BEncode::String(vec![0u8; 20 * ((len as usize) / 16384)]),
+            );
+            id.insert(b"files".to_vec(), BEncode::List(vec![BEncode::Dict(fdict)]));
+            let mut top = BTreeMap::new();
+            top.insert(b"info".to_vec(), BEncode::Dict(id));
+            Arc::new(Info::from_bencode(BEncode::Dict(top)).unwrap())
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let disk = Arc::new(diskio::DiskEngine::new_blocking(64 * 1024 * 1024));
+        let engine = Arc::new(SwarmEngine::new(disk, [0x42; 20]));
+        let info = make_info(b"primary".to_vec(), 32768);
+        let hash = info.hash;
+        engine.add_torrent_with_resume(info, dir.path().to_path_buf(), None, None);
+
+        let e1 = engine.clone();
+        let h1 = tokio::spawn(async move {
+            for i in 0..200u32 {
+                e1.set_file_priority(&hash, 0, if i % 2 == 0 { 0 } else { 4 });
+            }
+        });
+
+        let e2 = engine.clone();
+        let dir2 = dir.path().to_path_buf();
+        let h2 = tokio::spawn(async move {
+            for idx in 0..50u8 {
+                let inf = make_info(format!("t_{idx}").into_bytes(), 16384);
+                let h = inf.hash;
+                e2.add_torrent_with_resume(inf, dir2.clone(), None, None);
+                e2.remove_torrent(&h);
+            }
+        });
+
+        tokio::time::timeout(Duration::from_secs(10), async move {
+            h1.await.unwrap();
+            h2.await.unwrap();
+        })
+        .await
+        .expect("concurrent set_file_priority + shard mutations deadlocked");
+    }
+
+    #[tokio::test]
+    async fn queued_torrent_isolated_and_magnet_plus_queue_position_survive_restore() {
+        use std::collections::BTreeMap;
+        use synapse_bencode::BEncode;
+
+        let make_info = |name: &str, len: i64| -> Arc<Info> {
+            let mut fdict = BTreeMap::new();
+            fdict.insert(b"length".to_vec(), BEncode::Int(len));
+            fdict.insert(
+                b"path".to_vec(),
+                BEncode::List(vec![BEncode::String(b"file.bin".to_vec())]),
+            );
+            let mut id = BTreeMap::new();
+            id.insert(b"name".to_vec(), BEncode::String(name.as_bytes().to_vec()));
+            id.insert(b"piece length".to_vec(), BEncode::Int(16384));
+            id.insert(
+                b"pieces".to_vec(),
+                BEncode::String(vec![0u8; 20 * ((len as usize) / 16384)]),
+            );
+            id.insert(b"files".to_vec(), BEncode::List(vec![BEncode::Dict(fdict)]));
+            let mut top = BTreeMap::new();
+            top.insert(b"info".to_vec(), BEncode::Dict(id));
+            Arc::new(Info::from_bencode(BEncode::Dict(top)).unwrap())
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let sess_dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(crate::session::SessionStore::new(sess_dir.path()).unwrap());
+        let disk = Arc::new(diskio::DiskEngine::new_blocking(64 * 1024 * 1024));
+        let engine =
+            Arc::new(SwarmEngine::new(disk.clone(), [0x44; 20]).with_session_store(store.clone()));
+        {
+            let mut qm = engine.queue_manager.write();
+            let mut cfg = qm.config().clone();
+            cfg.max_active_downloads = 1;
+            qm.set_config(cfg);
+        }
+
+        let i1 = make_info("dl1", 16384);
+        let h1 = i1.hash;
+        engine.add_torrent(i1, dir.path().to_path_buf(), None);
+
+        let i2 = make_info("dl2", 16384);
+        let h2 = i2.hash;
+        let handle2 = engine.add_torrent(i2, dir.path().to_path_buf(), None);
+        assert_eq!(handle2.stats.read().state, SwarmState::Queued);
+        assert!(engine.get_or_wake_torrent(&h2).is_none());
+
+        let mag = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=unresolved";
+        let m_handle = engine.add_magnet(mag, dir.path().to_path_buf()).unwrap();
+        let mh = m_handle.info.hash;
+
+        engine.move_in_queue(&[h2], QueueMove::Top);
+        engine.flush_session().await;
+
+        let engine2 = Arc::new(SwarmEngine::new(disk, [0x45; 20]).with_session_store(store));
+        let restored = engine2.restore_session().unwrap();
+        assert_eq!(restored, 3);
+        assert!(engine2.get_torrent(&mh).is_some());
+        let pos = engine2.queue_positions();
+        assert!(pos[&h2] < pos[&h1]);
+    }
+
+    #[tokio::test]
+    async fn completing_download_triggers_tracker_event_completed() {
+        use sha1::{Digest, Sha1};
+        use std::collections::BTreeMap;
+        use synapse_bencode::BEncode;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let events_seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let events_bg = events_seen.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tracker_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let events_inner = events_bg.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 2048];
+                    if let Ok(n) = sock.read(&mut buf).await {
+                        let req = String::from_utf8_lossy(&buf[..n]);
+                        if let Some(line) = req.lines().next() {
+                            events_inner.lock().push(line.to_string());
+                        }
+                        let body = b"d8:intervali600e5:peers0:e";
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        let _ = sock.write_all(resp.as_bytes()).await;
+                        let _ = sock.write_all(body).await;
+                    }
+                });
+            }
+        });
+
+        let payload = vec![0xABu8; 16_384];
+        let hash = Sha1::digest(&payload).to_vec();
+        let announce_url = format!("http://{tracker_addr}/announce");
+        let mut info_dict = BTreeMap::new();
+        info_dict.insert(b"name".to_vec(), BEncode::String(b"done-evt.bin".to_vec()));
+        info_dict.insert(b"piece length".to_vec(), BEncode::Int(16_384));
+        info_dict.insert(b"pieces".to_vec(), BEncode::String(hash));
+        info_dict.insert(b"length".to_vec(), BEncode::Int(16_384));
+        info_dict.insert(b"private".to_vec(), BEncode::Int(1));
+        let mut top = BTreeMap::new();
+        top.insert(
+            b"announce".to_vec(),
+            BEncode::String(announce_url.into_bytes()),
+        );
+        top.insert(b"info".to_vec(), BEncode::Dict(info_dict));
+        let info = Arc::new(Info::from_bencode(BEncode::Dict(top)).unwrap());
+
+        let dir = tempfile::tempdir().unwrap();
+        let disk = Arc::new(diskio::DiskEngine::new_blocking(1024 * 1024));
+        let engine = SwarmEngine::new(disk, [0x46; 20]);
+        let handle = engine.add_torrent(info.clone(), dir.path().to_path_buf(), None);
+        let peer_tx = handle.peer_event_tx().unwrap();
+
+        let (out_tx, mut out_rx) = mpsc::channel(16);
+        let peer_handle =
+            crate::peer::PeerHandle::new_for_test(1, "127.0.0.1:6891".parse().unwrap(), out_tx);
+        let pinfo = crate::peer::PeerInfo {
+            info_hash: info.hash,
+            peer_id: [0x77; 20],
+            addr: "127.0.0.1:6891".parse().unwrap(),
+            local_addr: None,
+            is_outbound: true,
+            is_encrypted: false,
+            reserved: [0, 0, 0, 0, 0, 0x10, 0, 0x04],
+            is_utp: false,
+        };
+        peer_tx
+            .send(PeerEvent::Connected(peer_handle, pinfo))
+            .await
+            .unwrap();
+        peer_tx
+            .send(PeerEvent::Message(1, synapse_wire::Message::HaveAll))
+            .await
+            .unwrap();
+        peer_tx
+            .send(PeerEvent::Message(1, synapse_wire::Message::Unchoke))
+            .await
+            .unwrap();
+
+        // Wait until the actor requests block 0, then deliver it.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while let Some(msg) = out_rx.recv().await {
+                if matches!(
+                    msg,
+                    synapse_wire::Message::Request {
+                        index: 0,
+                        begin: 0,
+                        ..
+                    }
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("torrent actor requested block 0");
+
+        peer_tx
+            .send(PeerEvent::Message(
+                1,
+                synapse_wire::Message::Piece {
+                    index: 0,
+                    begin: 0,
+                    data: bytes::Bytes::from(payload),
+                },
+            ))
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if events_seen
+                    .lock()
+                    .iter()
+                    .any(|line| line.contains("event=completed"))
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("expected event=completed tracker announce on download completion");
+    }
+
+    #[tokio::test]
+    async fn partial_global_and_per_torrent_rate_limits_preserve_omitted_direction() {
+        let disk = Arc::new(diskio::DiskEngine::new_blocking(1024 * 1024));
+        let engine = SwarmEngine::new(disk, [0x47; 20]);
+
+        engine.set_rate_limits(200_000, 100_000);
+        engine.update_global_rate_limits(Some(50_000), None);
+        {
+            let settings = engine.settings();
+            let s = settings.read();
+            assert_eq!(s.download_limit_bytes, 50_000);
+            assert!(s.download_limit_enabled);
+            assert_eq!(s.upload_limit_bytes, 100_000);
+            assert!(s.upload_limit_enabled);
+        }
+
+        let mut info_dict = std::collections::BTreeMap::new();
+        info_dict.insert(
+            b"name".to_vec(),
+            synapse_bencode::BEncode::String(b"rate-limit-test.bin".to_vec()),
+        );
+        info_dict.insert(
+            b"piece length".to_vec(),
+            synapse_bencode::BEncode::Int(16_384),
+        );
+        info_dict.insert(
+            b"pieces".to_vec(),
+            synapse_bencode::BEncode::String(vec![0x11; 20]),
+        );
+        info_dict.insert(b"length".to_vec(), synapse_bencode::BEncode::Int(16_384));
+        let mut top = std::collections::BTreeMap::new();
+        top.insert(b"info".to_vec(), synapse_bencode::BEncode::Dict(info_dict));
+        let info = Arc::new(Info::from_bencode(synapse_bencode::BEncode::Dict(top)).unwrap());
+        let dir = tempfile::tempdir().unwrap();
+        let handle = engine.add_torrent(info.clone(), dir.path().to_path_buf(), None);
+
+        assert!(engine.set_torrent_rate_limits(&info.hash, Some(75_000), Some(25_000)));
+        assert!(engine.set_torrent_rate_limits(&info.hash, Some(125_000), None));
+        assert_eq!(handle.download_limit_bytes.load(Ordering::Relaxed), 125_000);
+        assert_eq!(handle.upload_limit_bytes.load(Ordering::Relaxed), 25_000);
+    }
+
+    #[tokio::test]
+    async fn per_torrent_rate_limits_survive_a_session_restart() {
+        let mut info_dict = std::collections::BTreeMap::new();
+        info_dict.insert(
+            b"name".to_vec(),
+            synapse_bencode::BEncode::String(b"rate-limit-resume-test.bin".to_vec()),
+        );
+        info_dict.insert(
+            b"piece length".to_vec(),
+            synapse_bencode::BEncode::Int(16_384),
+        );
+        info_dict.insert(
+            b"pieces".to_vec(),
+            synapse_bencode::BEncode::String(vec![0x22; 20]),
+        );
+        info_dict.insert(b"length".to_vec(), synapse_bencode::BEncode::Int(16_384));
+        let mut top = std::collections::BTreeMap::new();
+        top.insert(b"info".to_vec(), synapse_bencode::BEncode::Dict(info_dict));
+        let info = Arc::new(Info::from_bencode(synapse_bencode::BEncode::Dict(top)).unwrap());
+
+        let dir = tempfile::tempdir().unwrap();
+        let sess_dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(crate::session::SessionStore::new(sess_dir.path()).unwrap());
+        let disk = Arc::new(diskio::DiskEngine::new_blocking(1024 * 1024));
+        let engine = SwarmEngine::new(disk.clone(), [0x49; 20]).with_session_store(store.clone());
+
+        engine.add_torrent(info.clone(), dir.path().to_path_buf(), None);
+        assert!(engine.set_torrent_rate_limits(&info.hash, Some(75_000), Some(25_000)));
+        engine.flush_session().await;
+
+        let engine2 = SwarmEngine::new(disk, [0x4a; 20]).with_session_store(store);
+        assert_eq!(engine2.restore_session().unwrap(), 1);
+        let restored_handle = engine2.get_torrent(&info.hash).unwrap();
+        assert_eq!(
+            restored_handle.download_limit_bytes.load(Ordering::Relaxed),
+            75_000,
+            "a per-torrent download limit must survive a daemon restart"
+        );
+        assert_eq!(
+            restored_handle.upload_limit_bytes.load(Ordering::Relaxed),
+            25_000,
+            "a per-torrent upload limit must survive a daemon restart"
+        );
+    }
+
+    #[tokio::test]
+    async fn paused_torrent_set_location_with_options_respects_move_flag_and_stays_cold() {
+        use sha1::Digest;
+
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let dir_c = tempfile::tempdir().unwrap();
+        let disk = Arc::new(diskio::DiskEngine::new_blocking(1024 * 1024));
+        let store = Arc::new(crate::session::SessionStore::new(dir_a.path()).unwrap());
+        let engine = SwarmEngine::new(disk, [0x48; 20]).with_session_store(store.clone());
+
+        let payload = vec![0x5Au8; 16_384];
+        std::fs::write(dir_a.path().join("paused-move.bin"), &payload).unwrap();
+
+        let hash: [u8; 20] = sha1::Sha1::digest(&payload).into();
+        let mut info_dict = std::collections::BTreeMap::new();
+        info_dict.insert(
+            b"name".to_vec(),
+            synapse_bencode::BEncode::String(b"paused-move.bin".to_vec()),
+        );
+        info_dict.insert(
+            b"piece length".to_vec(),
+            synapse_bencode::BEncode::Int(16_384),
+        );
+        info_dict.insert(
+            b"pieces".to_vec(),
+            synapse_bencode::BEncode::String(hash.to_vec()),
+        );
+        info_dict.insert(b"length".to_vec(), synapse_bencode::BEncode::Int(16_384));
+        let mut top = std::collections::BTreeMap::new();
+        top.insert(b"info".to_vec(), synapse_bencode::BEncode::Dict(info_dict));
+        let info = Arc::new(Info::from_bencode(synapse_bencode::BEncode::Dict(top)).unwrap());
+
+        let mut bf = synapse_picker::Bitfield::new(1);
+        bf.set(0);
+        let resume = SwarmResumeOptions {
+            is_paused: true,
+            ..Default::default()
+        };
+        let handle = engine.add_torrent_with_resume(
+            info.clone(),
+            dir_a.path().to_path_buf(),
+            Some(&bf),
+            Some(resume),
+        );
+        engine.transition_to_cold(&info.hash);
+        engine.flush_session().await;
+
+        assert_eq!(handle.stats.read().tier, SwarmTier::Cold);
+        assert!(engine.set_location_with_options(
+            &info.hash,
+            &dir_b.path().to_string_lossy(),
+            true
+        ));
+        assert_eq!(handle.stats.read().tier, SwarmTier::Cold);
+        assert_eq!(
+            handle.stats.read().download_dir,
+            dir_b.path().to_string_lossy()
+        );
+        assert!(dir_b.path().join("paused-move.bin").exists());
+        assert!(!dir_a.path().join("paused-move.bin").exists());
+        assert_eq!(
+            store
+                .load_torrent(&hex::encode(info.hash))
+                .unwrap()
+                .unwrap()
+                .download_dir,
+            dir_b.path().to_string_lossy()
+        );
+
+        // move_existing_files = false updates metadata without touching files on disk.
+        assert!(engine.set_location_with_options(
+            &info.hash,
+            &dir_c.path().to_string_lossy(),
+            false
+        ));
+        assert_eq!(handle.stats.read().tier, SwarmTier::Cold);
+        assert_eq!(
+            handle.stats.read().download_dir,
+            dir_c.path().to_string_lossy()
+        );
+        assert!(dir_b.path().join("paused-move.bin").exists());
+        assert!(!dir_c.path().join("paused-move.bin").exists());
+    }
+}
+
+#[cfg(test)]
+mod batch1_scale_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use synapse_bencode::BEncode;
+
+    fn make_multi_piece_info(name: &str, pieces: usize) -> Arc<Info> {
+        let len = (pieces as i64) * 16_384;
+        let mut fdict = BTreeMap::new();
+        fdict.insert(b"length".to_vec(), BEncode::Int(len));
+        fdict.insert(
+            b"path".to_vec(),
+            BEncode::List(vec![BEncode::String(format!("{name}.bin").into_bytes())]),
+        );
+        let mut id = BTreeMap::new();
+        id.insert(b"name".to_vec(), BEncode::String(name.as_bytes().to_vec()));
+        id.insert(b"piece length".to_vec(), BEncode::Int(16_384));
+        id.insert(b"pieces".to_vec(), BEncode::String(vec![0xAB; 20 * pieces]));
+        id.insert(b"files".to_vec(), BEncode::List(vec![BEncode::Dict(fdict)]));
+        let mut top = BTreeMap::new();
+        top.insert(b"info".to_vec(), BEncode::Dict(id));
+        Arc::new(Info::from_bencode(BEncode::Dict(top)).unwrap())
+    }
+
+    #[tokio::test]
+    async fn dormant_torrent_elides_piece_availability_and_synthesizes_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let sess_dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(crate::session::SessionStore::new(sess_dir.path()).unwrap());
+        let disk = Arc::new(diskio::DiskEngine::new_blocking(16 * 1024 * 1024));
+        let engine = Arc::new(SwarmEngine::new(disk, [0x51; 20]).with_session_store(store));
+
+        let seed_info = make_multi_piece_info("seed-dormant", 4);
+        let seed_hash = seed_info.hash;
+        let mut bf = synapse_picker::Bitfield::new(4);
+        for i in 0..4 {
+            bf.set(i);
+        }
+        let seed_handle = engine.add_torrent(seed_info, dir.path().to_path_buf(), Some(&bf));
+        assert_eq!(seed_handle.stats.read().state, SwarmState::Seeding);
+        assert_eq!(seed_handle.stats.read().tier, SwarmTier::Warm);
+        assert_eq!(seed_handle.piece_availability.read().capacity(), 0);
+        assert_eq!(seed_handle.piece_availability_snapshot(), vec![1; 4]);
+        assert!(!seed_handle.info.has_piece_hashes());
+        let (exp_name, exp_bytes) = engine
+            .export_torrent_bytes(&seed_hash)
+            .expect("metadata should be recovered from session store");
+        assert_eq!(exp_name, "seed-dormant");
+        assert!(!exp_bytes.is_empty());
+
+        let cold_info = make_multi_piece_info("paused-dormant", 4);
+        let cold_handle = engine.add_torrent_with_resume(
+            cold_info,
+            dir.path().to_path_buf(),
+            None,
+            Some(SwarmResumeOptions {
+                is_paused: true,
+                ..Default::default()
+            }),
+        );
+        assert_eq!(cold_handle.stats.read().state, SwarmState::Stopped);
+        assert_eq!(cold_handle.stats.read().tier, SwarmTier::Cold);
+        assert_eq!(cold_handle.piece_availability.read().capacity(), 0);
+        assert_eq!(cold_handle.piece_availability_snapshot(), vec![0; 4]);
+    }
+
+    #[tokio::test]
+    async fn idle_flush_session_skips_clean_torrents() {
+        let dir = tempfile::tempdir().unwrap();
+        let sess_dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(crate::session::SessionStore::new(sess_dir.path()).unwrap());
+        let disk = Arc::new(diskio::DiskEngine::new_blocking(16 * 1024 * 1024));
+        let engine = Arc::new(SwarmEngine::new(disk, [0x52; 20]).with_session_store(store.clone()));
+
+        let info1 = make_multi_piece_info("clean-one", 2);
+        let h1 = info1.hash;
+        let handle1 = engine.add_torrent(info1, dir.path().to_path_buf(), None);
+        assert!(engine.transition_to_cold(&h1));
+        let info2 = make_multi_piece_info("clean-two", 2);
+        let h2 = info2.hash;
+        let handle2 = engine.add_torrent(info2, dir.path().to_path_buf(), None);
+        assert!(engine.transition_to_cold(&h2));
+
+        assert!(!handle1.dirty.load(Ordering::Acquire));
+        assert!(!handle2.dirty.load(Ordering::Acquire));
+
+        // Inject a sentinel name into SessionStore without dirtying `handle1`; an idle
+        // `flush_session()` must skip writing clean handles so the sentinel remains untouched.
+        let mut persisted = store.load_torrent(&hex::encode(h1)).unwrap().unwrap();
+        persisted.name = "sentinel-unflushed".to_string();
+        persisted.raw_bencode_hex = None;
+        store
+            .save_states_batch(std::slice::from_ref(&persisted))
+            .unwrap();
+
+        engine.flush_session().await;
+        let after_idle = store.load_torrent(&hex::encode(h1)).unwrap().unwrap();
+        assert_eq!(after_idle.name, "sentinel-unflushed");
+
+        // Reordering queue marks changed handles dirty, so flush persists and clears dirty.
+        assert_eq!(engine.move_in_queue(&[h2], QueueMove::Top), 1);
+        assert!(handle1.dirty.load(Ordering::Acquire));
+        assert!(handle2.dirty.load(Ordering::Acquire));
+
+        engine.flush_session().await;
+        assert!(!handle1.dirty.load(Ordering::Acquire));
+        assert!(!handle2.dirty.load(Ordering::Acquire));
+        let after_dirty_flush = store.load_torrent(&hex::encode(h1)).unwrap().unwrap();
+        assert_eq!(after_dirty_flush.name, "clean-one");
+        let after_h2 = store.load_torrent(&hex::encode(h2)).unwrap().unwrap();
+        assert_eq!(after_h2.queue_position, Some(0));
+        assert_eq!(after_dirty_flush.queue_position, Some(1));
+    }
+
+    #[tokio::test]
+    async fn list_torrents_paged_is_deterministic_across_pages_and_respects_remove() {
+        let dir = tempfile::tempdir().unwrap();
+        let disk = Arc::new(diskio::DiskEngine::new_blocking(16 * 1024 * 1024));
+        let engine = Arc::new(SwarmEngine::new(disk, [0x53; 20]));
+
+        let mut expected_hashes = Vec::new();
+        for idx in 0..5 {
+            let info = make_multi_piece_info(&format!("paged-{idx}"), 1);
+            expected_hashes.push(info.hash);
+            engine.add_torrent_with_resume(
+                info,
+                dir.path().to_path_buf(),
+                None,
+                Some(SwarmResumeOptions {
+                    is_paused: true,
+                    ..Default::default()
+                }),
+            );
+        }
+
+        let (p0, t0) = engine.list_torrents_paged(0, 2, None);
+        let (p1, t1) = engine.list_torrents_paged(2, 2, None);
+        let (p2, t2) = engine.list_torrents_paged(4, 2, None);
+        assert_eq!((t0, t1, t2), (5, 5, 5));
+        assert_eq!((p0.len(), p1.len(), p2.len()), (2, 2, 1));
+        let combined: Vec<[u8; 20]> = p0
+            .into_iter()
+            .chain(p1)
+            .chain(p2)
+            .map(|s| s.info_hash)
+            .collect();
+        assert_eq!(combined, expected_hashes);
+
+        assert!(engine.remove_torrent(&expected_hashes[2]));
+        let (all_after, total_after) = engine.list_torrents_paged(0, 10, None);
+        assert_eq!(total_after, 4);
+        let after_hashes: Vec<[u8; 20]> = all_after.into_iter().map(|s| s.info_hash).collect();
+        assert_eq!(
+            after_hashes,
+            vec![
+                expected_hashes[0],
+                expected_hashes[1],
+                expected_hashes[3],
+                expected_hashes[4],
+            ]
+        );
+        let (mid_page, mid_total) = engine.list_torrents_paged(1, 2, None);
+        assert_eq!(mid_total, 4);
+        assert_eq!(
+            mid_page.iter().map(|s| s.info_hash).collect::<Vec<_>>(),
+            vec![expected_hashes[1], expected_hashes[3]]
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_queue_and_rechoke_use_tracking_sets() {
+        let dir = tempfile::tempdir().unwrap();
+        let disk = Arc::new(diskio::DiskEngine::new_blocking(16 * 1024 * 1024));
+        let engine = Arc::new(SwarmEngine::new(disk, [0x54; 20]));
+        {
+            let mut qm = engine.queue_manager.write();
+            let mut cfg = qm.config().clone();
+            cfg.max_active_downloads = 1;
+            cfg.max_active_torrents = 10;
+            qm.set_config(cfg);
+        }
+
+        let d1 = make_multi_piece_info("track-dl-1", 2);
+        let h1 = d1.hash;
+        let handle1 = engine.add_torrent(d1, dir.path().to_path_buf(), None);
+        let d2 = make_multi_piece_info("track-dl-2", 2);
+        let h2 = d2.hash;
+        let handle2 = engine.add_torrent(d2, dir.path().to_path_buf(), None);
+
+        assert_eq!(handle1.stats.read().state, SwarmState::Downloading);
+        assert_eq!(handle2.stats.read().state, SwarmState::Queued);
+        assert!(engine.downloading_torrents.contains(&h1));
+        assert!(!engine.downloading_torrents.contains(&h2));
+        assert!(engine.queued_torrents.contains(&h2));
+        assert!(engine.active_torrents.contains(&h1));
+        assert!(!engine.active_torrents.contains(&h2));
+
+        engine.rechoke_session();
+        assert!(engine.active_torrents.contains(&h1));
+
+        assert!(engine.transition_to_cold(&h1));
+        assert!(!engine.downloading_torrents.contains(&h1));
+        assert!(!engine.active_torrents.contains(&h1));
+
+        engine.reconcile_queue();
+        assert_eq!(handle2.stats.read().state, SwarmState::Downloading);
+        assert!(!engine.queued_torrents.contains(&h2));
+        assert!(engine.downloading_torrents.contains(&h2));
+        assert!(engine.active_torrents.contains(&h2));
+
+        engine.rechoke_session();
+        assert!(engine.active_torrents.contains(&h2));
+    }
+
+    #[tokio::test]
+    async fn incomplete_dir_downloads_into_incomplete_and_moves_before_lifecycle() {
+        use sha1::{Digest, Sha1};
+
+        struct CapturePlugin {
+            tx: parking_lot::Mutex<Option<oneshot::Sender<(String, bool, bool)>>>,
+            inc_file: PathBuf,
+            final_file: PathBuf,
+        }
+
+        #[async_trait::async_trait]
+        impl crate::lifecycle::LifecyclePlugin for CapturePlugin {
+            fn name(&self) -> &str {
+                "capture"
+            }
+
+            async fn on_torrent_completed(
+                &self,
+                event: &crate::lifecycle::TorrentCompletedEvent,
+            ) -> Result<(), crate::lifecycle::LifecycleError> {
+                if let Some(tx) = self.tx.lock().take() {
+                    let _ = tx.send((
+                        event.download_dir.clone(),
+                        self.final_file.exists(),
+                        !self.inc_file.exists(),
+                    ));
+                }
+                Ok(())
+            }
+        }
+
+        let inc_dir = tempfile::tempdir().unwrap();
+        let final_dir = tempfile::tempdir().unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let data = vec![0x5Au8; 16_384];
+        let hash: [u8; 20] = Sha1::digest(&data).into();
+
+        let mut fdict = BTreeMap::new();
+        fdict.insert(b"length".to_vec(), BEncode::Int(data.len() as i64));
+        fdict.insert(
+            b"path".to_vec(),
+            BEncode::List(vec![BEncode::String(b"payload.bin".to_vec())]),
+        );
+        let mut id = BTreeMap::new();
+        id.insert(b"name".to_vec(), BEncode::String(b"inc_dir_test".to_vec()));
+        id.insert(b"piece length".to_vec(), BEncode::Int(data.len() as i64));
+        id.insert(b"pieces".to_vec(), BEncode::String(hash.to_vec()));
+        id.insert(b"files".to_vec(), BEncode::List(vec![BEncode::Dict(fdict)]));
+        let mut top = BTreeMap::new();
+        top.insert(b"info".to_vec(), BEncode::Dict(id));
+        let info = Arc::new(Info::from_bencode(BEncode::Dict(top)).unwrap());
+
+        let cached_file = cache_dir.path().join(&info.files[0].path);
+        std::fs::create_dir_all(cached_file.parent().unwrap()).unwrap();
+        std::fs::write(&cached_file, &data).unwrap();
+
+        let inc_file = inc_dir.path().join(&info.files[0].path);
+        let final_file = final_dir.path().join(&info.files[0].path);
+        let (cap_tx, cap_rx) = oneshot::channel();
+        let lifecycle = Arc::new(
+            crate::lifecycle::LifecycleDispatcher::new(crate::lifecycle::LifecycleConfig {
+                staging_dir: None,
+                auto_hardlink: false,
+                wal_path: None,
+                post_script: None,
+                copy_script: None,
+                script_timeout: None,
+                instructions: None,
+            })
+            .with_plugin(Arc::new(CapturePlugin {
+                tx: parking_lot::Mutex::new(Some(cap_tx)),
+                inc_file: inc_file.clone(),
+                final_file: final_file.clone(),
+            })),
+        );
+
+        let disk = Arc::new(diskio::DiskEngine::new_blocking(4 * 1024 * 1024));
+        let engine = Arc::new(SwarmEngine::new(disk, [0x54; 20]).with_lifecycle(lifecycle));
+        let settings = DynamicSessionSettings {
+            incomplete_dir_enabled: true,
+            incomplete_dir: Some(inc_dir.path().to_path_buf()),
+            ..Default::default()
+        };
+        engine.update_settings(settings);
+
+        let handle = engine.add_torrent(info.clone(), final_dir.path().to_path_buf(), None);
+        assert!(engine.transition_to_cold(&info.hash));
+
+        let inc_str = inc_dir.path().to_string_lossy().to_string();
+        let final_str = final_dir.path().to_string_lossy().to_string();
+        assert_eq!(handle.stats.read().download_dir, inc_str);
+        assert_eq!(
+            handle.final_download_dir.read().as_ref(),
+            Some(&final_dir.path().to_path_buf())
+        );
+
+        engine.set_local_webseed_dirs(vec![cache_dir.path().to_path_buf()]);
+        assert!(engine.transition_to_hot(&info.hash));
+
+        let (cb_dir, final_exists_at_cb, gone_from_inc_at_cb) =
+            tokio::time::timeout(Duration::from_secs(5), cap_rx)
+                .await
+                .expect("lifecycle callback timed out")
+                .expect("capture channel dropped");
+
+        assert_eq!(cb_dir, final_str);
+        assert!(
+            final_exists_at_cb,
+            "file must already be moved to final_dir before lifecycle callback runs"
+        );
+        assert!(
+            gone_from_inc_at_cb,
+            "file must no longer remain in incomplete_dir after completion move"
+        );
+        assert_eq!(handle.stats.read().download_dir, final_str);
+        assert!(handle.final_download_dir.read().is_none());
+        assert_eq!(std::fs::read(&final_file).unwrap(), data);
+    }
+
+    #[tokio::test]
+    async fn rechoke_session_honors_turtle_mode_upload_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let disk = Arc::new(diskio::DiskEngine::new_blocking(4 * 1024 * 1024));
+        let engine = Arc::new(SwarmEngine::new(disk, [0x54; 20]));
+
+        {
+            let mut s = engine.settings.write();
+            s.upload_limit_enabled = false;
+            s.unchoke_slots_global = 10;
+            s.unchoke_slot_bandwidth = 16_384;
+            s.alt_speed_enabled = true;
+            s.alt_speed_up_bytes = 32_768;
+            s.alt_speed_time_enabled = false;
+        }
+
+        let info = make_multi_piece_info("turtle-rechoke", 1);
+        let handle = engine.add_torrent(info, dir.path().to_path_buf(), None);
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
+        let (ev_tx, _ev_rx) = mpsc::channel(8);
+        let (stop_tx, _stop_rx) = tokio::sync::watch::channel(false);
+        *handle.active_actor.write() = Some(ActiveActor {
+            peer_event_tx: ev_tx,
+            command_tx: cmd_tx,
+            stop_tx,
+        });
+        {
+            let mut peers = handle.live_peers.write();
+            for i in 0..6u16 {
+                peers.push(crate::torrent::PeerSnapshot {
+                    addr: SocketAddr::from(([127, 0, 0, 1], 7000 + i)),
+                    client_name: "Synapse/2.0".to_string(),
+                    flags: "I".to_string(),
+                    rate_to_client: 0,
+                    rate_to_peer: 0,
+                    progress: 0.5,
+                    is_encrypted: false,
+                    is_utp: false,
+                    supports_pex: false,
+                    peer_interested: true,
+                });
+            }
+        }
+
+        engine.rechoke_session();
+        let mut alt_slots = None;
+        while let Ok(cmd) = cmd_rx.try_recv() {
+            if let TorrentCommand::SetUnchokeSlots(slots) = cmd {
+                alt_slots = Some(slots);
+            }
+        }
+        let alt_slots = alt_slots.expect("expected SetUnchokeSlots under turtle mode");
+        assert_eq!(
+            alt_slots, 4,
+            "turtle mode upload limit (32 KiB/s) at 16 KiB/slot must cap slots at SessionChoker min 4, got {alt_slots}"
+        );
+
+        engine.settings.write().alt_speed_enabled = false;
+        engine.rechoke_session();
+        let mut normal_slots = None;
+        while let Ok(cmd) = cmd_rx.try_recv() {
+            if let TorrentCommand::SetUnchokeSlots(slots) = cmd {
+                normal_slots = Some(slots);
+            }
+        }
+        let normal_slots =
+            normal_slots.expect("expected SetUnchokeSlots after disabling turtle mode");
+        assert!(
+            normal_slots > 4,
+            "disabling turtle mode must restore > 4 slots, got {normal_slots}"
+        );
+    }
+
+    #[tokio::test]
+    async fn paused_torrent_recheck_verifies_disk_and_stays_cold_stopped() {
+        use sha1::Digest;
+        use std::collections::BTreeMap;
+        use synapse_bencode::BEncode;
+
+        let dir = tempfile::tempdir().unwrap();
+        let disk = Arc::new(diskio::DiskEngine::new_blocking(4 * 1024 * 1024));
+        let engine = Arc::new(SwarmEngine::new(disk, [0x55; 20]));
+
+        let payload = b"hello cold recheck world! 1234567890".to_vec();
+        let hash: [u8; 20] = sha1::Sha1::digest(&payload).into();
+        let mut id = BTreeMap::new();
+        id.insert(
+            b"name".to_vec(),
+            BEncode::String(b"cold_recheck.bin".to_vec()),
+        );
+        id.insert(b"length".to_vec(), BEncode::Int(payload.len() as i64));
+        id.insert(b"piece length".to_vec(), BEncode::Int(payload.len() as i64));
+        id.insert(b"pieces".to_vec(), BEncode::String(hash.to_vec()));
+        let mut top = BTreeMap::new();
+        top.insert(b"info".to_vec(), BEncode::Dict(id));
+        let info = Arc::new(Info::from_bencode(BEncode::Dict(top)).unwrap());
+        let info_hash = info.hash;
+
+        let handle = engine.add_torrent_with_resume(
+            info,
+            dir.path().to_path_buf(),
+            None,
+            Some(SwarmResumeOptions {
+                is_paused: true,
+                ..Default::default()
+            }),
+        );
+        assert_eq!(handle.stats.read().state, SwarmState::Stopped);
+        assert_eq!(handle.stats.read().tier, SwarmTier::Cold);
+        assert!(handle.command_tx().is_none());
+        assert_eq!(handle.stats.read().progress, 0.0);
+
+        // Write valid data on disk and recheck without waking the actor.
+        std::fs::write(dir.path().join("cold_recheck.bin"), &payload).unwrap();
+        assert!(engine.recheck_torrent(&info_hash));
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while handle.stats.read().state == SwarmState::Checking {
+            assert!(Instant::now() < deadline, "cold recheck timed out");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        {
+            let s = handle.stats.read();
+            assert_eq!(s.state, SwarmState::Stopped);
+            assert_eq!(s.tier, SwarmTier::Cold);
+            assert!((s.progress - 1.0).abs() < f32::EPSILON);
+        }
+        assert!(handle.command_tx().is_none());
+
+        // Corrupt the payload on disk and recheck again while staying Cold/Stopped.
+        std::fs::write(
+            dir.path().join("cold_recheck.bin"),
+            vec![0u8; payload.len()],
+        )
+        .unwrap();
+        assert!(engine.recheck_torrent(&info_hash));
+
+        let deadline2 = Instant::now() + Duration::from_secs(5);
+        while handle.stats.read().state == SwarmState::Checking {
+            assert!(Instant::now() < deadline2, "second cold recheck timed out");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        {
+            let s = handle.stats.read();
+            assert_eq!(s.state, SwarmState::Stopped);
+            assert_eq!(s.tier, SwarmTier::Cold);
+            assert!((s.progress - 0.0).abs() < f32::EPSILON);
+        }
+        assert!(handle.command_tx().is_none());
     }
 }

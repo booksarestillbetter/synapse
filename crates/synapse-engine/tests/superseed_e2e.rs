@@ -148,7 +148,8 @@ async fn test_superseeding_selective_piece_advertisement() {
     let mut peer_a = Framed::new(stream_a, PeerCodec::new());
 
     let mut reserved = [0u8; 8];
-    reserved[7] |= 0x01; // Fast extension support
+    reserved[5] |= 0x10; // BEP 10 Extension protocol
+    reserved[7] |= 0x04; // BEP 6 Fast extension support
 
     peer_a
         .send(Message::Handshake {

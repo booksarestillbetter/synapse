@@ -7,7 +7,7 @@ use crate::atomic_compat::FetchUpdateCompat;
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -50,6 +50,7 @@ pub struct PeerSnapshot {
 /// Conventional BitTorrent block size. Requests are always made in blocks of this size
 /// (the last block of a piece may be shorter).
 const BLOCK_LEN: u32 = 16 * 1024;
+const MAX_PEER_HINT_PIECES: usize = 64;
 
 /// Largest block we will serve for a single `Request`. Anything bigger is a protocol
 /// violation (or an allocation-amplification probe) and is rejected.
@@ -187,17 +188,62 @@ fn request_in_bounds(piece_len: Option<u32>, begin: u32, length: u32) -> bool {
         && u64::from(begin) + u64::from(length) <= u64::from(piece_len)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct ServeKey {
+    peer_id: PeerId,
+    index: u32,
+    begin: u32,
+    length: u32,
+}
+
+struct ServeCancelToken {
+    cancelled: AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl ServeCancelToken {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            cancelled: AtomicBool::new(false),
+            notify: tokio::sync::Notify::new(),
+        })
+    }
+
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        self.notify.notify_waiters();
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+}
+
+type InFlightServes = Arc<parking_lot::Mutex<HashMap<ServeKey, Vec<Arc<ServeCancelToken>>>>>;
+
 /// Releases a peer's and the torrent's pending-serve slots when the serving task ends,
 /// including on early return or cancellation.
 struct ServeSlot {
     peer: Arc<AtomicUsize>,
     total: Arc<AtomicUsize>,
+    serves: InFlightServes,
+    key: ServeKey,
+    cancel: Arc<ServeCancelToken>,
 }
 
 impl Drop for ServeSlot {
     fn drop(&mut self) {
         self.peer.fetch_sub(1, Ordering::Relaxed);
         self.total.fetch_sub(1, Ordering::Relaxed);
+        let mut guard = self.serves.lock();
+        if let Some(tokens) = guard.get_mut(&self.key) {
+            if let Some(pos) = tokens.iter().position(|t| Arc::ptr_eq(t, &self.cancel)) {
+                tokens.remove(pos);
+            }
+            if tokens.is_empty() {
+                guard.remove(&self.key);
+            }
+        }
     }
 }
 
@@ -230,8 +276,11 @@ pub enum TorrentCommand {
     /// Re-verifies every piece already on disk against the torrent's real hashes and
     /// rebuilds picker/bitfield state to match, rather than just flipping a state label.
     Recheck,
-    /// Moves every downloaded file from the current download directory to a new one.
-    SetLocation(PathBuf),
+    /// Moves (or updates) a torrent's download directory.
+    SetLocation {
+        new_dir: PathBuf,
+        move_existing_files: bool,
+    },
     /// Switches the piece picker between rarest-first and sequential.
     SetSequential(bool),
     /// Enables or disables first/last piece priority in the picker.
@@ -323,12 +372,15 @@ struct PeerState {
     consecutive_timeouts: u32,
     is_snubbed: bool,
     downloaded_from: u64,
-    uploaded_to: u64,
+    uploaded_to: Arc<AtomicU64>,
     /// `downloaded_from`/`uploaded_to` are cumulative totals; these are the values they held
     /// as of the previous tick, so `tick()` can compute a per-second rate from the delta
     /// instead of reporting the cumulative total as if it were instantaneous throughput.
     prev_downloaded_from: u64,
     prev_uploaded_to: u64,
+    /// Exponentially weighted moving average throughput (bytes/sec) used by the choker.
+    ewma_download_rate: u64,
+    ewma_upload_rate: u64,
     /// BEP 6: AllowedFast pieces we permit this peer to request while choked
     allowed_fast: HashSet<u32>,
     /// BEP 6: AllowedFast pieces this peer permits us to request while choked
@@ -352,6 +404,8 @@ struct PeerState {
     invalid_requests: u32,
     /// Whether this peer is a pure or partial seed that does not download blocks (BEP 21).
     is_upload_only: bool,
+    /// Whether this peer is counted once in `Picker::seed_count` instead of per-piece buckets.
+    counted_as_seed: bool,
     /// BEP 6 Fast Extension suggested pieces from this peer.
     suggested_pieces: HashSet<u32>,
     /// Last piece index requested from this peer (drives extent affinity).
@@ -361,11 +415,88 @@ struct PeerState {
 const MAX_IN_PROGRESS_PIECES: usize = 256;
 const MAX_IN_PROGRESS_BYTES: usize = 256 * 1024 * 1024;
 
+enum BlockSlot {
+    Idle,
+    One(PeerId, std::time::Instant),
+    Many(Vec<(PeerId, std::time::Instant)>),
+}
+
+impl BlockSlot {
+    fn record(&mut self, peer_id: PeerId, now: std::time::Instant) -> bool {
+        match self {
+            BlockSlot::Idle => {
+                *self = BlockSlot::One(peer_id, now);
+                true
+            }
+            BlockSlot::One(existing_id, existing_ts) => {
+                if *existing_id == peer_id {
+                    *existing_ts = now;
+                    false
+                } else {
+                    let first = (*existing_id, *existing_ts);
+                    *self = BlockSlot::Many(vec![first, (peer_id, now)]);
+                    true
+                }
+            }
+            BlockSlot::Many(vec) => {
+                if let Some((_, ts)) = vec.iter_mut().find(|(id, _)| *id == peer_id) {
+                    *ts = now;
+                    false
+                } else {
+                    vec.push((peer_id, now));
+                    true
+                }
+            }
+        }
+    }
+
+    fn remove(&mut self, peer_id: PeerId) -> bool {
+        match self {
+            BlockSlot::Idle => false,
+            BlockSlot::One(existing_id, _) => {
+                if *existing_id == peer_id {
+                    *self = BlockSlot::Idle;
+                    true
+                } else {
+                    false
+                }
+            }
+            BlockSlot::Many(vec) => {
+                if let Some(pos) = vec.iter().position(|(id, _)| *id == peer_id) {
+                    vec.swap_remove(pos);
+                    if vec.len() == 1 {
+                        let lone = vec[0];
+                        *self = BlockSlot::One(lone.0, lone.1);
+                    } else if vec.is_empty() {
+                        *self = BlockSlot::Idle;
+                    }
+                    true
+                } else {
+                    false
+                }
+            }
+        }
+    }
+
+    fn clear(&mut self) -> usize {
+        let removed = match self {
+            BlockSlot::Idle => 0,
+            BlockSlot::One(..) => 1,
+            BlockSlot::Many(v) => v.len(),
+        };
+        *self = BlockSlot::Idle;
+        removed
+    }
+}
+
 struct InProgressPiece {
     piece_len: u32,
     buf: Vec<u8>,
-    received_blocks: HashSet<u32>,
+    received: Vec<bool>,
+    received_count: usize,
     expected_blocks: usize,
+    block_slots: Vec<BlockSlot>,
+    in_flight_count: usize,
     /// Which address supplied each received block (keyed by block offset). If the piece
     /// then fails its hash check this is how smart-ban knows whom to blame.
     contributors: HashMap<u32, IpAddr>,
@@ -374,11 +505,29 @@ struct InProgressPiece {
 impl InProgressPiece {
     fn new(piece_len: u32) -> InProgressPiece {
         let expected_blocks = (piece_len as usize).div_ceil(BLOCK_LEN as usize);
+        let mut block_slots = Vec::with_capacity(expected_blocks);
+        block_slots.resize_with(expected_blocks, || BlockSlot::Idle);
         InProgressPiece {
             piece_len,
             buf: Vec::new(),
-            received_blocks: HashSet::new(),
+            received: vec![false; expected_blocks],
+            received_count: 0,
             expected_blocks,
+            block_slots,
+            in_flight_count: 0,
+            contributors: HashMap::new(),
+        }
+    }
+
+    fn from_complete_buf(buf: Vec<u8>) -> InProgressPiece {
+        InProgressPiece {
+            piece_len: buf.len() as u32,
+            buf,
+            received: Vec::new(),
+            received_count: 0,
+            expected_blocks: 0,
+            block_slots: Vec::new(),
+            in_flight_count: 0,
             contributors: HashMap::new(),
         }
     }
@@ -389,8 +538,74 @@ impl InProgressPiece {
         }
     }
 
+    #[inline]
+    fn block_index(offset: u32) -> Option<usize> {
+        if offset.is_multiple_of(BLOCK_LEN) {
+            Some((offset / BLOCK_LEN) as usize)
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn is_received(&self, offset: u32) -> bool {
+        Self::block_index(offset)
+            .and_then(|b| self.received.get(b).copied())
+            .unwrap_or(false)
+    }
+
+    fn mark_received(&mut self, offset: u32) {
+        if let Some(b) = Self::block_index(offset) {
+            if let Some(slot) = self.received.get_mut(b) {
+                if !*slot {
+                    *slot = true;
+                    self.received_count += 1;
+                }
+            }
+        }
+    }
+
+    fn record_request(&mut self, offset: u32, peer_id: PeerId, now: std::time::Instant) {
+        if let Some(b) = Self::block_index(offset) {
+            if let Some(slot) = self.block_slots.get_mut(b) {
+                if slot.record(peer_id, now) {
+                    self.in_flight_count += 1;
+                }
+            }
+        }
+    }
+
+    fn clear_request(&mut self, offset: u32, peer_id: PeerId) {
+        if let Some(b) = Self::block_index(offset) {
+            if let Some(slot) = self.block_slots.get_mut(b) {
+                if slot.remove(peer_id) {
+                    self.in_flight_count = self.in_flight_count.saturating_sub(1);
+                }
+            }
+        }
+    }
+
+    fn clear_all_requests_for_block(&mut self, offset: u32) {
+        if let Some(b) = Self::block_index(offset) {
+            if let Some(slot) = self.block_slots.get_mut(b) {
+                let cleared = slot.clear();
+                self.in_flight_count = self.in_flight_count.saturating_sub(cleared);
+            }
+        }
+    }
+
+    #[inline]
+    fn remaining_blocks(&self) -> usize {
+        self.expected_blocks.saturating_sub(self.received_count)
+    }
+
+    #[inline]
+    fn has_in_flight(&self) -> bool {
+        self.in_flight_count > 0
+    }
+
     fn is_complete(&self) -> bool {
-        self.received_blocks.len() == self.expected_blocks
+        self.received_count == self.expected_blocks
     }
 }
 
@@ -400,6 +615,11 @@ struct BlockReadSlice {
     len: usize,
     piece_range: std::ops::Range<usize>,
     is_padding: bool,
+}
+
+enum ServeReadPlan {
+    Single(ReadJob),
+    Multi(Vec<BlockReadSlice>),
 }
 
 pub struct Torrent {
@@ -427,7 +647,7 @@ pub struct Torrent {
     /// Running total, independent of any single peer's `uploaded_to` — a per-peer counter is
     /// lost when that peer disconnects (`on_disconnected` drops its `PeerState`), so this is
     /// tracked separately to survive peer churn across the torrent's lifetime.
-    total_uploaded: u64,
+    total_uploaded: Arc<AtomicU64>,
     /// Requests being served across all peers; bounded by `MAX_PENDING_SERVES_TOTAL`.
     pending_serves_total: Arc<AtomicUsize>,
     idle_timeout: Option<Duration>,
@@ -484,6 +704,7 @@ pub struct Torrent {
     local_webseed_resolver: Option<Arc<crate::local_webseed::LocalWebSeedResolver>>,
     pub part_file: crate::part_file::PartFileManager,
     alert_sender: Option<tokio::sync::broadcast::Sender<crate::alert::Alert>>,
+    alert_category_mask: Option<Arc<AtomicU32>>,
     /// Outstanding requests for block-level hashes to pinpoint a corrupt block, by
     /// `(peer asked, file root, first block)`. Only that peer's reply, and only if its proof
     /// checks out, is used.
@@ -494,6 +715,20 @@ pub struct Torrent {
     /// actor over a bounded channel it shares with every other peer.
     piece_write_tx: mpsc::Sender<(u32, diskio::Result<()>)>,
     piece_write_rx: Option<mpsc::Receiver<(u32, diskio::Result<()>)>>,
+    stop_rx: Option<tokio::sync::watch::Receiver<bool>>,
+    session_store: Option<Arc<crate::session::SessionStore>>,
+    active_torrents: Option<Arc<dashmap::DashSet<[u8; 20]>>>,
+    downloading_torrents: Option<Arc<dashmap::DashSet<[u8; 20]>>>,
+    dirty_flag: Option<Arc<AtomicBool>>,
+    missing_wanted_bytes: Option<Arc<AtomicU64>>,
+    /// Per-file verified real paths under `download_dir`, populated lazily by `serve_request`
+    /// and invalidated whenever `download_dir` changes (`handle_set_location`).
+    verified_serve_files: HashMap<usize, Arc<PathBuf>>,
+    /// If set (`incomplete_dir_enabled`), `finalize_completion` atomically relocates
+    /// completed files from the staging `download_dir` to this final destination.
+    final_download_dir: Option<PathBuf>,
+    /// Active upload `serve_request` cancellation tokens indexed by `(peer_id, index, begin, length)`.
+    in_flight_serves: InFlightServes,
 }
 
 impl Torrent {
@@ -503,6 +738,7 @@ impl Torrent {
         if let Some(have) = have {
             picker = picker.with_completed(have);
         }
+        let initial_complete = picker.is_complete();
         let mut on_complete = Vec::new();
         if let Some(tx) = config.on_torrent_completed {
             on_complete.push(tx);
@@ -562,13 +798,13 @@ impl Torrent {
             peer_download_buckets: HashMap::new(),
             peer_upload_buckets: HashMap::new(),
             global_metrics: config.global_metrics,
-            total_uploaded: starting_uploaded,
+            total_uploaded: Arc::new(AtomicU64::new(starting_uploaded)),
             pending_serves_total: Arc::new(AtomicUsize::new(0)),
             max_pipeline: config.max_pipeline,
             tick_interval: config.tick_interval,
             on_complete,
             on_piece_completed: config.on_piece_completed,
-            completed_fired: false,
+            completed_fired: initial_complete,
             idle_timeout: config.idle_timeout,
             last_activity: std::time::Instant::now(),
             live_peers: config.live_peers,
@@ -614,21 +850,80 @@ impl Torrent {
             local_webseed_resolver: config.local_webseed_resolver,
             part_file,
             alert_sender: config.alert_sender,
+            alert_category_mask: None,
             pending_block_audits: HashMap::new(),
             piece_write_tx,
             piece_write_rx: Some(piece_write_rx),
+            stop_rx: None,
+            session_store: None,
+            active_torrents: None,
+            downloading_torrents: None,
+            dirty_flag: None,
+            missing_wanted_bytes: None,
+            verified_serve_files: HashMap::new(),
+            final_download_dir: None,
+            in_flight_serves: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         }
     }
 
+    pub fn set_stop_signal(&mut self, rx: tokio::sync::watch::Receiver<bool>) {
+        self.stop_rx = Some(rx);
+    }
+
+    pub fn set_session_store(&mut self, store: Arc<crate::session::SessionStore>) {
+        self.session_store = Some(store);
+    }
+
+    pub fn set_active_torrents(&mut self, set: Arc<dashmap::DashSet<[u8; 20]>>) {
+        self.active_torrents = Some(set);
+    }
+
+    pub fn set_downloading_torrents(&mut self, set: Arc<dashmap::DashSet<[u8; 20]>>) {
+        self.downloading_torrents = Some(set);
+    }
+
+    pub fn set_dirty_flag(&mut self, flag: Arc<AtomicBool>) {
+        self.dirty_flag = Some(flag);
+    }
+
+    pub fn set_missing_wanted_bytes(&mut self, counter: Arc<AtomicU64>) {
+        self.missing_wanted_bytes = Some(counter);
+    }
+
+    pub fn set_final_download_dir(&mut self, dir: PathBuf) {
+        self.final_download_dir = Some(dir);
+    }
+
+    pub fn set_alert_category_mask(&mut self, mask: Arc<AtomicU32>) {
+        self.alert_category_mask = Some(mask);
+    }
+
     fn emit_alert(&self, alert: crate::alert::Alert) {
-        if let Some(ref tx) = self.alert_sender {
-            let _ = tx.send(alert);
+        let Some(ref tx) = self.alert_sender else {
+            return;
+        };
+        if tx.receiver_count() == 0 {
+            return;
         }
+        if let Some(ref mask) = self.alert_category_mask {
+            if (mask.load(Ordering::Relaxed) & alert.category().bits()) == 0 {
+                return;
+            }
+        }
+        let _ = tx.send(alert);
     }
 
     /// Dynamically configures first/last piece priority before starting the actor.
     pub fn set_first_last_piece_priority(&mut self, enabled: bool) {
         self.picker.set_first_last_piece_priority(enabled);
+    }
+
+    /// Dynamically configures per-torrent rate limits (0 = unlimited) before starting the actor.
+    pub fn set_torrent_rate_limits(&mut self, download_limit_bytes: u64, upload_limit_bytes: u64) {
+        self.torrent_download_bucket
+            .set_rate_auto_burst(download_limit_bytes);
+        self.torrent_upload_bucket
+            .set_rate_auto_burst(upload_limit_bytes);
     }
 
     /// Registers a channel that fires exactly once, the moment every piece is complete.
@@ -666,9 +961,19 @@ impl Torrent {
     fn handle_fatal_storage_error(&mut self, err: &diskio::DiskError) {
         let err_msg = format!("Fatal storage error: {err}");
         tracing::error!(name = %self.info.name, "{err_msg}");
-        {
+        let new_state = SwarmState::Error(err_msg.clone());
+        let old_state = {
             let mut s = self.stats.write();
-            s.state = SwarmState::Error(err_msg.clone());
+            std::mem::replace(&mut s.state, new_state.clone())
+        };
+        if let Some(ref m) = self.global_metrics {
+            m.record_state_transition(&old_state, &new_state);
+        }
+        if let Some(ref dl) = self.downloading_torrents {
+            dl.remove(&self.info.hash);
+        }
+        if let Some(ref dirty) = self.dirty_flag {
+            dirty.store(true, Ordering::Release);
         }
         self.emit_alert(crate::alert::Alert::TorrentError {
             info_hash: self.info.hash,
@@ -736,12 +1041,41 @@ impl Torrent {
             .piece_write_rx
             .take()
             .expect("run consumes the receiver once");
+        let mut stop_rx = self.stop_rx.take();
+        if !self.picker.is_complete() && self.local_webseed_resolver.is_some() {
+            self.check_local_webseed_cache().await;
+        }
         loop {
             if self.metadata_resolved {
                 tracing::debug!(name = %self.info.name, "Metadata-only actor exiting after successful resolution");
                 break;
             }
+            if stop_rx.as_ref().is_some_and(|rx| *rx.borrow()) {
+                tracing::debug!(name = %self.info.name, "Stop signal active; stopping torrent actor");
+                self.peers.clear();
+                let cancelled: Vec<Arc<ServeCancelToken>> = {
+                    let mut guard = self.in_flight_serves.lock();
+                    guard.drain().flat_map(|(_, v)| v).collect()
+                };
+                for tok in cancelled {
+                    tok.cancel();
+                }
+                break;
+            }
             tokio::select! {
+                _ = async {
+                    if let Some(ref mut rx) = stop_rx {
+                        let _ = rx.changed().await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                } => {
+                    if stop_rx.as_ref().is_some_and(|rx| *rx.borrow()) {
+                        tracing::debug!(name = %self.info.name, "Stop signal received; stopping torrent actor");
+                        self.peers.clear();
+                        break;
+                    }
+                }
                 ev = events.recv() => {
                     self.last_activity = std::time::Instant::now();
                     match ev {
@@ -792,7 +1126,14 @@ impl Torrent {
                             }
                         }
                         Some(TorrentCommand::Recheck) => self.handle_recheck().await,
-                        Some(TorrentCommand::SetLocation(new_dir)) => self.handle_set_location(new_dir).await,
+                        Some(TorrentCommand::SetLocation {
+                            new_dir,
+                            move_existing_files,
+                        }) => {
+                            self.final_download_dir = None;
+                            self.handle_set_location(new_dir, move_existing_files)
+                                .await;
+                        }
                         Some(TorrentCommand::SetUnchokeSlots(slots)) => self.choker.set_regular_unchokes(slots),
                         Some(TorrentCommand::SetSeedChokingAlgorithm(algo)) => self.choker.set_seed_algorithm(algo),
                         Some(TorrentCommand::SetRateLimits { download_limit_bytes, upload_limit_bytes }) => {
@@ -850,15 +1191,36 @@ impl Torrent {
             }
         }
 
-        self.publish_live_stats();
-        self.live_peers.write().clear();
+        {
+            let mut lp = self.live_peers.write();
+            lp.clear();
+            lp.shrink_to_fit();
+        }
+        {
+            let mut pa = self.piece_availability.write();
+            pa.clear();
+            pa.shrink_to_fit();
+        }
+        if let Some(ref active) = self.active_torrents {
+            active.remove(&self.info.hash);
+        }
 
-        // On actor loop exit (due to idle timeout, unregistration, or channel close):
-        // Ensure Warm tier is set if still seeding/not cold, and decrement active actor metric.
+        // Atomically zero live rate/peer counters under `stats` lock before updating
+        // `global_metrics`, so concurrent `remove_torrent` cannot double-subtract them.
         {
             let mut s = self.stats.write();
+            let prev_dl = s.download_rate;
+            let prev_ul = s.upload_rate;
+            let prev_peers = s.peers_connected;
+            s.download_rate = 0;
+            s.upload_rate = 0;
+            s.peers_connected = 0;
+            s.peers_sending = 0;
             if s.tier == SwarmTier::Hot {
                 s.tier = SwarmTier::Warm;
+            }
+            if let Some(ref m) = self.global_metrics {
+                m.record_rate_change(prev_dl, 0, prev_ul, 0, prev_peers, 0);
             }
         }
         if let Some(ref m) = self.global_metrics {
@@ -935,7 +1297,7 @@ impl Torrent {
                     existing_addr = %existing_info.addr,
                     "BEP 40: Replacing lower-priority duplicate connection in simultaneous dial race"
                 );
-                self.peers.remove(&existing_id);
+                self.on_disconnected(existing_id);
             } else {
                 tracing::debug!(name = %self.info.name, addr = %info.addr, "Rejecting peer connection: duplicate peer");
                 return;
@@ -971,7 +1333,9 @@ impl Torrent {
 
         let id = handle.id;
         let num_pieces = self.info.pieces() as usize;
-        let our_bitfield = if self.picker.is_complete() {
+        let is_seeding = self.picker.is_complete();
+        let is_full_seed = self.picker.has_all_pieces();
+        let our_bitfield = if is_full_seed {
             Bitfield::full(num_pieces)
         } else {
             let mut bf = Bitfield::new(num_pieces);
@@ -982,7 +1346,6 @@ impl Torrent {
             }
             bf
         };
-        let is_seeding = self.picker.is_complete();
         let allowed_fast_vec =
             compute_allowed_fast_set(info.addr.ip(), self.info.hash, self.info.pieces(), 10);
         let allowed_fast_set: HashSet<u32> = allowed_fast_vec.iter().copied().collect();
@@ -1002,9 +1365,11 @@ impl Torrent {
                 consecutive_timeouts: 0,
                 is_snubbed: false,
                 downloaded_from: 0,
-                uploaded_to: 0,
+                uploaded_to: Arc::new(AtomicU64::new(0)),
                 prev_downloaded_from: 0,
                 prev_uploaded_to: 0,
+                ewma_download_rate: 0,
+                ewma_upload_rate: 0,
                 allowed_fast: allowed_fast_set,
                 peer_allowed_fast: HashSet::new(),
                 last_received_at: std::time::Instant::now(),
@@ -1015,6 +1380,7 @@ impl Torrent {
                 pending_serves: Arc::new(AtomicUsize::new(0)),
                 invalid_requests: 0,
                 is_upload_only: false,
+                counted_as_seed: false,
                 suggested_pieces: HashSet::new(),
                 last_requested_piece: None,
             },
@@ -1025,50 +1391,53 @@ impl Torrent {
             addr,
         });
 
-        // BEP 10: Immediately send Extension Handshake message (ID 0). When we already
-        // have real metadata (i.e. we're not ourselves awaiting it), advertise its size
-        // so a magnet-downloading peer on the other end knows how many pieces to ask
-        // for -- see `maybe_request_metadata`, which reads this same field from peers.
-        let metadata_size = if self.metadata_fetcher.is_none() {
-            let info = &self.info;
-            Some(
-                self.info_dict_cache
-                    .get_or_insert_with(|| Bytes::from(info.to_info_dict_bytes()))
-                    .len() as u32,
-            )
-        } else {
-            None
-        };
-        let mut ext_hs_builder = ExtensionHandshake::for_torrent(self.info.private, metadata_size);
-        if is_seeding {
-            // BEP 21: Extension for Partial Seeds (upload_only)
-            ext_hs_builder = ext_hs_builder.with_upload_only(true);
+        // BEP 10: Immediately send Extension Handshake message (ID 0) only when the peer
+        // advertised BEP 10 extension protocol support in its handshake reserved bytes.
+        if info.supports_extensions() {
+            let metadata_size = if self.metadata_fetcher.is_none() {
+                let meta_info = &self.info;
+                Some(
+                    self.info_dict_cache
+                        .get_or_insert_with(|| Bytes::from(meta_info.to_info_dict_bytes()))
+                        .len() as u32,
+                )
+            } else {
+                None
+            };
+            let mut ext_hs_builder =
+                ExtensionHandshake::for_torrent(self.info.private, metadata_size);
+            if !self.settings.read().pex_enabled {
+                ext_hs_builder.m.remove("ut_pex");
+            }
+            if is_seeding {
+                // BEP 21: Extension for Partial Seeds (upload_only)
+                ext_hs_builder = ext_hs_builder.with_upload_only(true);
+            }
+            if self.info.is_merkle_v1() {
+                ext_hs_builder
+                    .m
+                    .insert(synapse_wire::TR_HASHPIECE.to_string(), EXT_ID_TR_HASHPIECE);
+            }
+            let ext_hs = ext_hs_builder.encode();
+            handle.try_send(Message::Extension {
+                id: 0,
+                payload: ext_hs,
+            });
         }
-        if self.info.is_merkle_v1() {
-            ext_hs_builder
-                .m
-                .insert(synapse_wire::TR_HASHPIECE.to_string(), EXT_ID_TR_HASHPIECE);
-        }
-        let ext_hs = ext_hs_builder.encode();
-        // `try_send`, not `send().await`: these all run inline in `on_connected`, inside this
-        // actor's event loop (see `finish_piece` for why a blocking send here is a hazard --
-        // same actor, same shared loop, same "one congested peer stalls everyone" risk). A new
-        // connection's outbound queue is empty, so these essentially always queue immediately;
-        // dropping one on the rare congested case just means the peer learns our interest or
-        // bitfield slightly later, from a subsequent message, not a permanent desync.
-        handle.try_send(Message::Extension {
-            id: 0,
-            payload: ext_hs,
-        });
 
-        // BEP 6 Fast Extension / Super-Seeding: If super-seeding, offer single piece; if seeding, send HaveAll, otherwise Bitfield
-        if is_seeding {
+        // BEP 6 Fast Extension / Super-Seeding: only full seeds may send HaveAll, and only to
+        // peers that advertised BEP 6 Fast Extension support; otherwise send our Bitfield.
+        if is_full_seed {
             if let Some(ref mut ss) = self.super_seeder {
-                if let Some(p) = ss.assign_piece_to_peer(id) {
+                if let Some(p) = ss.assign_piece_to_peer_filtered(id, |_| false) {
                     handle.try_send(Message::Have(p));
                 }
-            } else {
+            } else if info.supports_fast() {
                 handle.try_send(Message::HaveAll);
+            } else {
+                handle.try_send(Message::Bitfield(Bytes::copy_from_slice(
+                    our_bitfield.as_bytes(),
+                )));
             }
         } else {
             handle.try_send(Message::Bitfield(Bytes::copy_from_slice(
@@ -1076,9 +1445,11 @@ impl Torrent {
             )));
         }
 
-        // BEP 6 Fast Extension: Send AllowedFast piece indices
-        for piece_idx in allowed_fast_vec {
-            handle.try_send(Message::AllowedFast(piece_idx));
+        // BEP 6 Fast Extension: Send AllowedFast piece indices only if peer supports Fast Extension.
+        if info.supports_fast() {
+            for piece_idx in allowed_fast_vec {
+                handle.try_send(Message::AllowedFast(piece_idx));
+            }
         }
 
         // A pure-v2 magnet needs its piece layer from peers; ask as soon as one is here.
@@ -1089,6 +1460,21 @@ impl Torrent {
         let Some(mut peer) = self.peers.remove(&id) else {
             return;
         };
+        let cancelled_serves: Vec<Arc<ServeCancelToken>> = {
+            let mut guard = self.in_flight_serves.lock();
+            let matching_keys: Vec<ServeKey> =
+                guard.keys().copied().filter(|k| k.peer_id == id).collect();
+            let mut tokens = Vec::new();
+            for key in matching_keys {
+                if let Some(mut v) = guard.remove(&key) {
+                    tokens.append(&mut v);
+                }
+            }
+            tokens
+        };
+        for tok in cancelled_serves {
+            tok.cancel();
+        }
         for fetch in &mut self.layer_fetches {
             fetch.peer_disconnected(id);
         }
@@ -1106,13 +1492,22 @@ impl Torrent {
         if !self.peers.values().any(|p| p.peer_info.addr.ip() == ip) {
             self.exclusive_pieces.retain(|_, owner| *owner != ip);
         }
-        for i in 0..self.info.pieces() {
-            if peer.has.has(i as usize) {
-                self.picker.peer_lost(i);
+        if peer.counted_as_seed {
+            self.picker.peer_lost_all();
+        } else if peer.has.count_ones() > 0 {
+            for i in 0..self.info.pieces() {
+                if peer.has.has(i as usize) {
+                    self.picker.peer_lost(i);
+                }
             }
         }
-        let drained_pieces: Vec<u32> = peer.in_flight.drain().map(|((idx, _), _)| idx).collect();
-        for idx in drained_pieces {
+        let drained_blocks: Vec<(u32, u32)> = peer.in_flight.drain().map(|(k, _)| k).collect();
+        for &(idx, offset) in &drained_blocks {
+            if let Some(piece) = self.in_progress.get_mut(&idx) {
+                piece.clear_request(offset, id);
+            }
+        }
+        for (idx, _) in drained_blocks {
             self.cleanup_abandoned_piece(idx);
         }
         if !self.metadata_resolved {
@@ -1147,15 +1542,15 @@ impl Torrent {
             return;
         }
         let any_in_flight = self
-            .peers
-            .values()
-            .any(|p| p.in_flight.keys().any(|&(i, _)| i == idx));
+            .in_progress
+            .get(&idx)
+            .is_some_and(|p| p.has_in_flight());
         if !any_in_flight {
             self.picker.mark_missing(idx);
             if self
                 .in_progress
                 .get(&idx)
-                .is_some_and(|p| p.received_blocks.is_empty())
+                .is_some_and(|p| p.received_count == 0)
             {
                 self.in_progress.remove(&idx);
                 self.exclusive_pieces.remove(&idx);
@@ -1168,14 +1563,19 @@ impl Torrent {
         match msg {
             Message::Handshake { .. } | Message::KeepAlive => {}
             Message::Choke => {
-                let drained: Vec<u32> = if let Some(p) = self.peers.get_mut(&id) {
+                let drained: Vec<(u32, u32)> = if let Some(p) = self.peers.get_mut(&id) {
                     p.peer_choking = true;
-                    p.in_flight.drain().map(|((idx, _), _)| idx).collect()
+                    p.in_flight.drain().map(|(k, _)| k).collect()
                 } else {
                     Vec::new()
                 };
-                for idx in &drained {
-                    self.cleanup_abandoned_piece(*idx);
+                for &(idx, offset) in &drained {
+                    if let Some(piece) = self.in_progress.get_mut(&idx) {
+                        piece.clear_request(offset, id);
+                    }
+                }
+                for &(idx, _) in &drained {
+                    self.cleanup_abandoned_piece(idx);
                 }
                 if !drained.is_empty() {
                     let other_unchoked: Vec<PeerId> = self
@@ -1210,20 +1610,28 @@ impl Torrent {
             }
             Message::Have(index) => {
                 let idx_usize = index as usize;
-                let already_had = if let Some(p) = self.peers.get_mut(&id) {
-                    let had = p.has.has(idx_usize);
-                    p.has.set(idx_usize);
-                    had
+                let increment_picker = if let Some(p) = self.peers.get_mut(&id) {
+                    if p.counted_as_seed {
+                        false
+                    } else {
+                        let had = p.has.has(idx_usize);
+                        p.has.set(idx_usize);
+                        !had
+                    }
                 } else {
                     false
                 };
-                if !already_had {
+                if increment_picker {
                     self.picker.peer_has(index);
                 }
                 if let Some(ref mut ss) = self.super_seeder {
                     if let Some(freed_peer_id) = ss.on_peer_have(id, index) {
-                        if let Some(next_p) = ss.assign_piece_to_peer(freed_peer_id) {
-                            if let Some(freed_peer) = self.peers.get_mut(&freed_peer_id) {
+                        if let Some(freed_peer) = self.peers.get(&freed_peer_id) {
+                            if let Some(next_p) = ss
+                                .assign_piece_to_peer_filtered(freed_peer_id, |p| {
+                                    freed_peer.has.has(p as usize)
+                                })
+                            {
                                 let _ = freed_peer.handle.try_send(Message::Have(next_p));
                             }
                         }
@@ -1241,13 +1649,48 @@ impl Torrent {
             }
             Message::Bitfield(bits) => {
                 if let Some(bf) = Bitfield::from_bytes(&bits, self.info.pieces() as usize) {
-                    for i in 0..bf.len() {
-                        if bf.has(i) {
-                            self.picker.peer_has(i as u32);
-                        }
-                    }
+                    let num_pieces = bf.len();
+                    let is_full = num_pieces > 0 && bf.is_complete();
                     if let Some(p) = self.peers.get_mut(&id) {
-                        p.has = bf;
+                        if is_full {
+                            if !p.counted_as_seed {
+                                if p.has.count_ones() > 0 {
+                                    for i in 0..num_pieces {
+                                        if p.has.has(i) {
+                                            self.picker.peer_lost(i as u32);
+                                        }
+                                    }
+                                }
+                                self.picker.peer_has_all();
+                                p.counted_as_seed = true;
+                                p.has = bf;
+                            }
+                        } else if p.counted_as_seed {
+                            self.picker.peer_lost_all();
+                            p.counted_as_seed = false;
+                            p.has = bf;
+                            if p.has.count_ones() > 0 {
+                                for i in 0..num_pieces {
+                                    if p.has.has(i) {
+                                        self.picker.peer_has(i as u32);
+                                    }
+                                }
+                            }
+                        } else {
+                            let old = std::mem::replace(&mut p.has, bf);
+                            let new_ref = &p.has;
+                            if old.count_ones() > 0 || new_ref.count_ones() > 0 {
+                                for i in 0..num_pieces {
+                                    let had = old.has(i);
+                                    let has = new_ref.has(i);
+                                    if has && !had {
+                                        self.picker.peer_has(i as u32);
+                                    } else if had && !has {
+                                        self.picker.peer_lost(i as u32);
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 self.maybe_show_interest(id).await;
@@ -1283,13 +1726,19 @@ impl Torrent {
             }
             Message::HaveAll => {
                 let pieces = self.info.pieces() as usize;
-                let mut bf = Bitfield::new(pieces);
-                for i in 0..pieces {
-                    bf.set(i);
-                    self.picker.peer_has(i as u32);
-                }
                 if let Some(p) = self.peers.get_mut(&id) {
-                    p.has = bf;
+                    if !p.counted_as_seed {
+                        if p.has.count_ones() > 0 {
+                            for i in 0..pieces {
+                                if p.has.has(i) {
+                                    self.picker.peer_lost(i as u32);
+                                }
+                            }
+                        }
+                        p.has = Bitfield::full(pieces);
+                        self.picker.peer_has_all();
+                        p.counted_as_seed = true;
+                    }
                 }
                 self.maybe_show_interest(id).await;
                 let can_request = self
@@ -1302,23 +1751,48 @@ impl Torrent {
                 }
             }
             Message::HaveNone => {
+                let pieces = self.info.pieces() as usize;
                 if let Some(p) = self.peers.get_mut(&id) {
-                    p.has = Bitfield::new(self.info.pieces() as usize);
+                    if p.counted_as_seed {
+                        self.picker.peer_lost_all();
+                        p.counted_as_seed = false;
+                        p.has = Bitfield::new(pieces);
+                    } else {
+                        let old = std::mem::replace(&mut p.has, Bitfield::new(pieces));
+                        if old.count_ones() > 0 {
+                            for i in 0..pieces {
+                                if old.has(i) {
+                                    self.picker.peer_lost(i as u32);
+                                }
+                            }
+                        }
+                    }
                 }
+                self.maybe_show_interest(id).await;
             }
             Message::SuggestPiece(index) => {
-                if let Some(p) = self.peers.get_mut(&id) {
-                    p.suggested_pieces.insert(index);
+                let total_pieces = self.info.pieces();
+                if index < total_pieces {
+                    if let Some(p) = self.peers.get_mut(&id) {
+                        if p.suggested_pieces.len() < MAX_PEER_HINT_PIECES {
+                            p.suggested_pieces.insert(index);
+                        }
+                    }
+                    self.maybe_show_interest(id).await;
+                    self.try_request_more(id).await;
                 }
-                self.maybe_show_interest(id).await;
-                self.try_request_more(id).await;
             }
             Message::AllowedFast(index) => {
-                if let Some(p) = self.peers.get_mut(&id) {
-                    p.peer_allowed_fast.insert(index);
+                let total_pieces = self.info.pieces();
+                if index < total_pieces {
+                    if let Some(p) = self.peers.get_mut(&id) {
+                        if p.peer_allowed_fast.len() < MAX_PEER_HINT_PIECES {
+                            p.peer_allowed_fast.insert(index);
+                        }
+                    }
+                    self.maybe_show_interest(id).await;
+                    self.try_request_more(id).await;
                 }
-                self.maybe_show_interest(id).await;
-                self.try_request_more(id).await;
             }
             Message::RejectRequest { index, begin, .. } => {
                 if let Some(ref m) = self.global_metrics {
@@ -1327,9 +1801,40 @@ impl Torrent {
                 if let Some(peer) = self.peers.get_mut(&id) {
                     peer.in_flight.remove(&(index, begin));
                 }
+                if let Some(piece) = self.in_progress.get_mut(&index) {
+                    piece.clear_request(begin, id);
+                }
                 self.cleanup_abandoned_piece(index);
             }
-            Message::Cancel { .. } => {}
+            Message::Cancel {
+                index,
+                begin,
+                length,
+            } => {
+                let key = ServeKey {
+                    peer_id: id,
+                    index,
+                    begin,
+                    length,
+                };
+                let token = {
+                    let mut guard = self.in_flight_serves.lock();
+                    let popped = guard.get_mut(&key).and_then(|tokens| {
+                        if tokens.is_empty() {
+                            None
+                        } else {
+                            Some(tokens.remove(0))
+                        }
+                    });
+                    if guard.get(&key).is_some_and(Vec::is_empty) {
+                        guard.remove(&key);
+                    }
+                    popped
+                };
+                if let Some(tok) = token {
+                    tok.cancel();
+                }
+            }
             Message::Port(port) => {
                 // BEP 5 / BEP 27: DHT port messages must never trigger DHT queries for private torrents.
                 tracing::trace!(peer = %id, port, "Received DHT Port message; ignoring per privacy/config");
@@ -1377,8 +1882,8 @@ impl Torrent {
                                 }
                             }
                         }
-                        EXT_ID_UT_PEX if self.info.private => {
-                            tracing::trace!(peer = %id, "Ignoring ut_pex message on private swarm (BEP 27)");
+                        EXT_ID_UT_PEX if self.info.private || !self.settings.read().pex_enabled => {
+                            tracing::trace!(peer = %id, "Ignoring ut_pex message (private swarm or PEX disabled)");
                         }
                         EXT_ID_UT_PEX => match synapse_wire::UtPexMessage::decode(&payload) {
                             Ok(pex_msg) => {
@@ -1434,16 +1939,23 @@ impl Torrent {
                                     // Only a piece the peer really had counts against availability:
                                     // otherwise repeated revocations of pieces it never advertised
                                     // would drive the rarest-first counts to zero.
-                                    let had = self.peers.get_mut(&id).is_some_and(|peer| {
+                                    if let Some(peer) = self.peers.get_mut(&id) {
                                         let idx = dont_have.piece as usize;
-                                        let had = peer.has.has(idx);
-                                        if had {
-                                            peer.has.unset(idx);
+                                        if peer.has.has(idx) {
+                                            if peer.counted_as_seed {
+                                                peer.counted_as_seed = false;
+                                                self.picker.peer_lost_all();
+                                                peer.has.unset(idx);
+                                                for i in 0..self.info.pieces() {
+                                                    if peer.has.has(i as usize) {
+                                                        self.picker.peer_has(i);
+                                                    }
+                                                }
+                                            } else {
+                                                peer.has.unset(idx);
+                                                self.picker.peer_lost(dont_have.piece);
+                                            }
                                         }
-                                        had
-                                    });
-                                    if had {
-                                        self.picker.peer_lost(dont_have.piece);
                                     }
                                 }
                                 Err(e) => {
@@ -1495,7 +2007,7 @@ impl Torrent {
                     .iter_mut()
                     .find(|f| *f.root() == pieces_root)
                 {
-                    fetch.on_reject(index, std::time::Instant::now());
+                    fetch.on_reject(id, index, std::time::Instant::now());
                 }
             }
         }
@@ -1505,8 +2017,9 @@ impl Torrent {
         let Some(peer) = self.peers.get_mut(&id) else {
             return;
         };
-        let wants_something =
-            (0..self.info.pieces()).any(|i| peer.has.has(i as usize) && !self.picker.have(i));
+        let wants_something = (0..self.info.pieces()).any(|i| {
+            peer.has.has(i as usize) && !self.picker.have(i) && self.picker.piece_priority(i) > 0
+        });
         if wants_something && !peer.am_interested {
             peer.am_interested = true;
             peer.handle.try_send(Message::Interested);
@@ -1532,187 +2045,157 @@ impl Torrent {
             return;
         }
         loop {
-            let (is_choking, in_flight_count, is_snubbed, peer_has, peer_allowed_fast) = {
-                let Some(peer) = self.peers.get(&id) else {
-                    return;
-                };
-                (
-                    peer.peer_choking,
-                    peer.in_flight.len(),
-                    peer.is_snubbed,
-                    peer.has.clone(),
-                    peer.peer_allowed_fast.clone(),
-                )
-            };
-
-            if is_choking {
-                let has_missing_allowed_fast = peer_allowed_fast
-                    .iter()
-                    .any(|&idx| !self.picker.have(idx) && peer_has.has(idx as usize));
-                if !has_missing_allowed_fast || in_flight_count >= 2 {
-                    return;
-                }
-            } else {
-                let max_allowed = if is_snubbed { 1 } else { self.max_pipeline };
-                if in_flight_count >= max_allowed {
-                    return;
-                }
-            }
-
-            let is_endgame =
-                self.picker.pick(&peer_has, false).is_none() && !self.in_progress.is_empty();
             let now = std::time::Instant::now();
             const STEAL_THRESHOLD: Duration = Duration::from_secs(3);
 
-            let (my_ip, on_parole) = {
-                let Some(p) = self.peers.get(&id) else {
+            let next_target: Option<(u32, u32, bool)> = {
+                let Some(peer) = self.peers.get(&id) else {
                     return;
                 };
-                let ip = p.peer_info.addr.ip();
-                (ip, self.parole.contains(&ip))
-            };
+                let is_choking = peer.peer_choking;
+                let in_flight_count = peer.in_flight.len();
+                let is_snubbed = peer.is_snubbed;
+                let peer_has = &peer.has;
+                let peer_allowed_fast = &peer.peer_allowed_fast;
 
-            // 1. Scan in-progress pieces that this peer has for missing blocks,
-            // prioritizing pieces closest to completion (fewest remaining blocks).
-            let mut sorted_in_progress: Vec<(u32, usize)> = self
-                .in_progress
-                .iter()
-                .map(|(&idx, p)| {
-                    let total = (self.info.piece_len(idx) as usize).div_ceil(BLOCK_LEN as usize);
-                    let remaining = total.saturating_sub(p.received_blocks.len());
-                    (idx, remaining)
-                })
-                .collect();
-            sorted_in_progress.sort_by_key(|&(_, remaining)| remaining);
-
-            let mut candidate_block = None;
-            for (idx, _) in sorted_in_progress {
-                let Some(in_prog) = self.in_progress.get(&idx) else {
-                    continue;
-                };
-                if is_choking && !peer_allowed_fast.contains(&idx) {
-                    continue;
+                if is_choking {
+                    let has_missing_allowed_fast = peer_allowed_fast.iter().any(|&idx| {
+                        !self.picker.have(idx)
+                            && self.picker.piece_priority(idx) > 0
+                            && peer_has.has(idx as usize)
+                    });
+                    if !has_missing_allowed_fast || in_flight_count >= 2 {
+                        return;
+                    }
+                } else {
+                    let max_allowed = if is_snubbed { 1 } else { self.max_pipeline };
+                    if in_flight_count >= max_allowed {
+                        return;
+                    }
                 }
-                // Smart-ban parole: a paroled peer only works on pieces reserved for it,
-                // and nobody else touches a piece reserved for a paroled peer.
-                match self.exclusive_pieces.get(&idx) {
-                    Some(owner) if *owner != my_ip => continue,
-                    None if on_parole => continue,
-                    _ => {}
-                }
-                if !self.picker.have(idx) && peer_has.has(idx as usize) {
-                    let piece_len = self.info.piece_len(idx);
-                    let total_blocks = (piece_len as usize).div_ceil(BLOCK_LEN as usize);
-                    if in_prog.received_blocks.len() < total_blocks {
-                        for b in 0..total_blocks {
-                            let offset = (b * BLOCK_LEN as usize) as u32;
-                            if !in_prog.received_blocks.contains(&offset) {
-                                let this_peer_in_flight = {
-                                    let Some(p) = self.peers.get(&id) else {
-                                        return;
-                                    };
-                                    p.in_flight.contains_key(&(idx, offset))
-                                };
-                                if this_peer_in_flight {
-                                    continue;
-                                }
 
-                                let other_peer_in_flight = self.peers.values().find_map(|p| {
-                                    p.in_flight
-                                        .get(&(idx, offset))
-                                        .map(|sent_at| (p.is_snubbed, *sent_at))
-                                });
+                let my_ip = peer.peer_info.addr.ip();
+                let on_parole = self.parole.contains(&my_ip);
 
-                                let should_request = match other_peer_in_flight {
-                                    None => true,
-                                    Some((other_snubbed, sent_at)) => {
-                                        other_snubbed
-                                            || (now.duration_since(sent_at) >= STEAL_THRESHOLD)
-                                            || is_endgame
+                // 1. Single-pass min-remaining scan across `self.in_progress` without allocating:
+                // picks a missing/stealable block in the piece closest to completion.
+                let mut is_endgame_cache: Option<bool> = None;
+                let mut best_remaining = usize::MAX;
+                let mut best_block: Option<(u32, u32)> = None;
+
+                for (&idx, in_prog) in &self.in_progress {
+                    let remaining = in_prog.remaining_blocks();
+                    if remaining == 0 || remaining >= best_remaining {
+                        continue;
+                    }
+                    if is_choking && !peer_allowed_fast.contains(&idx) {
+                        continue;
+                    }
+                    // Smart-ban parole: a paroled peer only works on pieces reserved for it,
+                    // and nobody else touches a piece reserved for a paroled peer.
+                    match self.exclusive_pieces.get(&idx) {
+                        Some(owner) if *owner != my_ip => continue,
+                        None if on_parole => continue,
+                        _ => {}
+                    }
+                    if self.picker.have(idx) || !peer_has.has(idx as usize) {
+                        continue;
+                    }
+
+                    for b in 0..in_prog.expected_blocks {
+                        if in_prog.received[b] {
+                            continue;
+                        }
+                        let should_request = match &in_prog.block_slots[b] {
+                            BlockSlot::Idle => true,
+                            BlockSlot::One(other_id, sent_at) => {
+                                if *other_id == id {
+                                    false
+                                } else {
+                                    let snubbed =
+                                        self.peers.get(other_id).is_some_and(|p| p.is_snubbed);
+                                    if snubbed || now.duration_since(*sent_at) >= STEAL_THRESHOLD {
+                                        true
+                                    } else {
+                                        *is_endgame_cache.get_or_insert_with(|| {
+                                            self.picker.pick(peer_has, false).is_none()
+                                        })
                                     }
-                                };
-
-                                if should_request {
-                                    candidate_block = Some((idx, offset));
-                                    break;
                                 }
                             }
-                        }
-                        if candidate_block.is_some() {
+                            BlockSlot::Many(vec) => {
+                                if vec.iter().any(|(other_id, _)| *other_id == id) {
+                                    false
+                                } else {
+                                    let fast = vec.iter().any(|(other_id, sent_at)| {
+                                        self.peers.get(other_id).is_some_and(|p| p.is_snubbed)
+                                            || now.duration_since(*sent_at) >= STEAL_THRESHOLD
+                                    });
+                                    if fast {
+                                        true
+                                    } else {
+                                        *is_endgame_cache.get_or_insert_with(|| {
+                                            self.picker.pick(peer_has, false).is_none()
+                                        })
+                                    }
+                                }
+                            }
+                        };
+                        if should_request {
+                            best_remaining = remaining;
+                            best_block = Some((idx, (b as u32) * BLOCK_LEN));
                             break;
                         }
                     }
                 }
-            }
 
-            let (target_piece, target_offset) = if let Some(target) = candidate_block {
-                target
-            } else if is_choking {
-                let allowed_cand = peer_allowed_fast.iter().find(|&&idx| {
-                    !self.picker.have(idx)
-                        && !self.in_progress.contains_key(&idx)
-                        && peer_has.has(idx as usize)
-                });
-                match allowed_cand {
-                    Some(&idx) => {
+                if let Some((idx, offset)) = best_block {
+                    Some((idx, offset, false))
+                } else if is_choking {
+                    peer_allowed_fast
+                        .iter()
+                        .find(|&&idx| {
+                            !self.picker.have(idx)
+                                && self.picker.piece_priority(idx) > 0
+                                && !self.in_progress.contains_key(&idx)
+                                && peer_has.has(idx as usize)
+                        })
+                        .and_then(|&idx| {
+                            let piece_len = self.info.piece_len(idx);
+                            self.can_start_new_in_progress_piece(piece_len)
+                                .then_some((idx, 0, true))
+                        })
+                } else {
+                    // 2. Pick a new piece using suggest-pieces, extent affinity, and rarest-first picker
+                    let suggested_cand = peer
+                        .suggested_pieces
+                        .iter()
+                        .find(|&&idx| {
+                            !self.picker.have(idx)
+                                && self.picker.piece_priority(idx) > 0
+                                && !self.in_progress.contains_key(&idx)
+                                && peer_has.has(idx as usize)
+                        })
+                        .copied();
+
+                    let chosen = suggested_cand.or_else(|| {
+                        self.picker.pick_with_extent_affinity(
+                            peer_has,
+                            peer.last_requested_piece,
+                            false,
+                        )
+                    });
+
+                    chosen.and_then(|idx| {
                         let piece_len = self.info.piece_len(idx);
-                        if !self.can_start_new_in_progress_piece(piece_len) {
-                            return;
-                        }
-                        self.picker.mark_requested(idx);
-                        self.in_progress
-                            .entry(idx)
-                            .or_insert_with(|| InProgressPiece::new(piece_len));
-                        if on_parole {
-                            self.exclusive_pieces.insert(idx, my_ip);
-                        }
-                        (idx, 0)
-                    }
-                    None => return,
-                }
-            } else {
-                // 2. Pick a new piece using suggest-pieces, extent affinity, and rarest-first picker
-                let (suggested_pieces, last_piece) = {
-                    let Some(p) = self.peers.get(&id) else {
-                        return;
-                    };
-                    (p.suggested_pieces.clone(), p.last_requested_piece)
-                };
-
-                let suggested_cand = suggested_pieces
-                    .iter()
-                    .find(|&&idx| {
-                        !self.picker.have(idx)
-                            && !self.in_progress.contains_key(&idx)
-                            && peer_has.has(idx as usize)
+                        self.can_start_new_in_progress_piece(piece_len)
+                            .then_some((idx, 0, true))
                     })
-                    .copied();
-
-                let chosen = suggested_cand.or_else(|| {
-                    self.picker
-                        .pick_with_extent_affinity(&peer_has, last_piece, false)
-                });
-
-                match chosen {
-                    Some(idx) => {
-                        let piece_len = self.info.piece_len(idx);
-                        if !self.can_start_new_in_progress_piece(piece_len) {
-                            return;
-                        }
-                        if let Some(p) = self.peers.get_mut(&id) {
-                            p.last_requested_piece = Some(idx);
-                        }
-                        self.picker.mark_requested(idx);
-                        self.in_progress
-                            .entry(idx)
-                            .or_insert_with(|| InProgressPiece::new(piece_len));
-                        if on_parole {
-                            self.exclusive_pieces.insert(idx, my_ip);
-                        }
-                        (idx, 0)
-                    }
-                    None => return,
                 }
+            };
+
+            let Some((target_piece, target_offset, is_new_piece)) = next_target else {
+                return;
             };
 
             let piece_len = self.info.piece_len(target_piece);
@@ -1722,23 +2205,41 @@ impl Torrent {
             }
             let length = BLOCK_LEN.min(piece_len - begin);
 
-            let Some(addr) = self.peers.get(&id).map(|p| p.peer_info.addr) else {
-                return;
+            let (addr, is_choking, on_parole) = {
+                let Some(p) = self.peers.get(&id) else {
+                    return;
+                };
+                let ip = p.peer_info.addr.ip();
+                (p.peer_info.addr, p.peer_choking, self.parole.contains(&ip))
             };
 
             if !self.can_request_block(id, addr, length as usize) {
                 return;
             }
 
+            if is_new_piece {
+                if !is_choking {
+                    if let Some(p) = self.peers.get_mut(&id) {
+                        p.last_requested_piece = Some(target_piece);
+                    }
+                }
+                self.picker.mark_requested(target_piece);
+                self.in_progress
+                    .entry(target_piece)
+                    .or_insert_with(|| InProgressPiece::new(piece_len));
+                if on_parole {
+                    self.exclusive_pieces.insert(target_piece, addr.ip());
+                }
+            }
+
             let Some(peer) = self.peers.get_mut(&id) else {
                 return;
             };
 
-            peer.in_flight
-                .insert((target_piece, begin), std::time::Instant::now());
+            peer.in_flight.insert((target_piece, begin), now);
             let handle = peer.handle.clone();
-            if let Some(ref m) = self.global_metrics {
-                m.piece_requests_total.fetch_add(1, Ordering::Relaxed);
+            if let Some(piece) = self.in_progress.get_mut(&target_piece) {
+                piece.record_request(begin, id, now);
             }
 
             if !handle.try_send(Message::Request {
@@ -1746,7 +2247,17 @@ impl Torrent {
                 begin,
                 length,
             }) {
+                if let Some(p) = self.peers.get_mut(&id) {
+                    p.in_flight.remove(&(target_piece, begin));
+                }
+                if let Some(piece) = self.in_progress.get_mut(&target_piece) {
+                    piece.clear_request(begin, id);
+                }
+                self.cleanup_abandoned_piece(target_piece);
                 break;
+            }
+            if let Some(ref m) = self.global_metrics {
+                m.piece_requests_total.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
@@ -1762,9 +2273,7 @@ impl Torrent {
             .then(|| self.info.piece_len(index))
             .filter(|&pl| begin < pl)
             .map(|pl| BLOCK_LEN.min(pl - begin));
-        if peer.in_flight.remove(&(index, begin)).is_none()
-            || expected_len != Some(data.len() as u32)
-        {
+        if peer.in_flight.remove(&(index, begin)).is_none() {
             tracing::debug!(
                 peer = id,
                 index,
@@ -1772,6 +2281,20 @@ impl Torrent {
                 len = data.len(),
                 "dropping unsolicited or mis-sized block"
             );
+            return;
+        }
+        if expected_len != Some(data.len() as u32) {
+            tracing::debug!(
+                peer = id,
+                index,
+                begin,
+                len = data.len(),
+                "dropping unsolicited or mis-sized block"
+            );
+            if let Some(piece) = self.in_progress.get_mut(&index) {
+                piece.clear_request(begin, id);
+            }
+            self.cleanup_abandoned_piece(index);
             return;
         }
         let source_ip = peer.peer_info.addr.ip();
@@ -1793,6 +2316,7 @@ impl Torrent {
                 }
             })
             .collect();
+        let mut cancelled_peers = Vec::with_capacity(other_peers_with_block.len());
         for (other_id, handle) in other_peers_with_block {
             let length = BLOCK_LEN.min(self.info.piece_len(index) - begin);
             let _ = handle.try_send(Message::Cancel {
@@ -1800,40 +2324,40 @@ impl Torrent {
                 begin,
                 length,
             });
-            self.try_request_more(other_id).await;
+            cancelled_peers.push(other_id);
         }
 
-        let Some(piece) = self.in_progress.get_mut(&index) else {
-            // Stale/unsolicited block (piece already completed or abandoned) - ignore.
-            self.try_request_more(id).await;
-            return;
-        };
-        // A second copy of a block we already hold (endgame duplicates) must not overwrite
-        // it: the first copy may already be part of a verified-so-far piece, and letting a
-        // later sender replace it would let one bad peer poison another peer's good block.
-        if piece.received_blocks.contains(&begin) {
-            self.try_request_more(id).await;
-            return;
+        let mut completed = false;
+        let mut drop_out_of_bounds = false;
+        if let Some(piece) = self.in_progress.get_mut(&index) {
+            piece.clear_all_requests_for_block(begin);
+            if !piece.is_received(begin) {
+                let start = begin as usize;
+                let end = start + data.len();
+                if end > piece.piece_len as usize {
+                    tracing::warn!(
+                        peer = id,
+                        index,
+                        begin,
+                        "block extends past piece end, dropping"
+                    );
+                    drop_out_of_bounds = true;
+                } else {
+                    piece.ensure_allocated();
+                    piece.buf[start..end].copy_from_slice(&data);
+                    piece.mark_received(begin);
+                    piece.contributors.insert(begin, source_ip);
+                    completed = piece.is_complete();
+                }
+            }
         }
-        let start = begin as usize;
-        let end = start + data.len();
-        if end > piece.piece_len as usize {
-            tracing::warn!(
-                peer = id,
-                index,
-                begin,
-                "block extends past piece end, dropping"
-            );
-            self.try_request_more(id).await;
-            return;
-        }
-        piece.ensure_allocated();
-        piece.buf[start..end].copy_from_slice(&data);
-        piece.received_blocks.insert(begin);
-        piece.contributors.insert(begin, source_ip);
-
-        if piece.is_complete() {
+        if drop_out_of_bounds {
+            self.cleanup_abandoned_piece(index);
+        } else if completed {
             self.finish_piece(index).await;
+        }
+        for other_id in cancelled_peers {
+            self.try_request_more(other_id).await;
         }
         self.try_request_more(id).await;
     }
@@ -1910,7 +2434,7 @@ impl Torrent {
             return;
         };
 
-        let piece_buf = piece.buf;
+        let piece_bytes = Bytes::from(piece.buf);
         let contributors = piece.contributors;
         let expected_hash = self
             .info
@@ -1918,7 +2442,7 @@ impl Torrent {
             .or_else(|| self.merkle_hashes.get(&index).copied());
         let verified = if let Some(expected_v1) = expected_hash {
             let computed: [u8; 20] = tokio::task::spawn_blocking({
-                let buf = piece_buf.clone();
+                let buf = piece_bytes.clone();
                 move || Sha1::digest(&buf).into()
             })
             .await
@@ -1930,7 +2454,7 @@ impl Torrent {
             .or_else(|| self.piece_hash_v2_from_dynamic(index))
         {
             let computed: [u8; 32] = tokio::task::spawn_blocking({
-                let buf = piece_buf.clone();
+                let buf = piece_bytes.clone();
                 let info = self.info.clone();
                 move || info.compute_piece_hash_v2(index, &buf)
             })
@@ -1965,7 +2489,7 @@ impl Torrent {
             // only (a hybrid connection is a v1 connection, on which hash messages get us
             // disconnected).
             if self.info.v2_aligned && contributors.len() > 1 {
-                self.request_piece_block_hashes(index, &piece_buf, &contributors);
+                self.request_piece_block_hashes(index, &piece_bytes, &contributors);
             }
 
             self.on_piece_failed(index, &contributors);
@@ -1973,7 +2497,6 @@ impl Torrent {
         }
         self.on_piece_passed(index, &contributors);
 
-        let piece_bytes = Bytes::from(piece_buf);
         let jobs = match self.build_write_jobs(index, &piece_bytes) {
             Ok(jobs) => jobs,
             Err(e) => {
@@ -2022,6 +2545,12 @@ impl Torrent {
 
     async fn on_piece_write_succeeded(&mut self, index: u32) {
         self.picker.mark_complete(index);
+        if self.on_piece_completed.is_none() {
+            let mut bf_guard = self.bitfield.write();
+            let bf =
+                bf_guard.get_or_insert_with(|| RoaringBitfield::new(self.info.pieces() as usize));
+            bf.set(index as usize);
+        }
         self.emit_alert(crate::alert::Alert::PieceFinished {
             info_hash: self.info.hash,
             piece_index: index,
@@ -2045,6 +2574,17 @@ impl Torrent {
             }
             was_dl
         };
+        if self.picker.is_complete() {
+            if let Some(ref dl) = self.downloading_torrents {
+                dl.remove(&self.info.hash);
+            }
+            if let Some(ref missing) = self.missing_wanted_bytes {
+                missing.store(0, Ordering::Release);
+            }
+        }
+        if let Some(ref dirty) = self.dirty_flag {
+            dirty.store(true, Ordering::Release);
+        }
         if let Some(ref m) = self.global_metrics {
             m.total_downloaded_bytes
                 .fetch_add(piece_len, std::sync::atomic::Ordering::Relaxed);
@@ -2067,20 +2607,29 @@ impl Torrent {
         }
 
         if self.picker.is_complete() {
-            self.emit_alert(crate::alert::Alert::TorrentFinished {
-                info_hash: self.info.hash,
-            });
-            self.info.evict_piece_hashes();
-            if !self.completed_fired {
-                self.completed_fired = true;
-                for tx in self.on_complete.drain(..) {
-                    let _ = tx.send(());
-                }
-            }
+            self.finalize_completion().await;
         }
 
         for peer_id in peer_ids {
             self.try_request_more(peer_id).await;
+        }
+    }
+
+    async fn finalize_completion(&mut self) {
+        if !self.completed_fired {
+            if let Some(dest_dir) = self.final_download_dir.take() {
+                self.handle_set_location(dest_dir, true).await;
+            }
+        }
+        self.emit_alert(crate::alert::Alert::TorrentFinished {
+            info_hash: self.info.hash,
+        });
+        self.info.evict_piece_hashes();
+        if !self.completed_fired {
+            self.completed_fired = true;
+            for tx in self.on_complete.drain(..) {
+                let _ = tx.send(());
+            }
         }
     }
 
@@ -2157,18 +2706,33 @@ impl Torrent {
                 }
             })?;
             let normal_path = self.download_dir.join(&self.info.files[loc.file].path);
-            let (target_path, target_offset) =
-                self.part_file
-                    .resolve_read_location(loc.file, loc.file_offset, normal_path);
-            let data = self
-                .disk
-                .read(diskio::ReadJob {
-                    path: std::sync::Arc::new(target_path),
-                    offset: target_offset,
-                    len: loc.piece_range.len(),
-                })
-                .await?;
-            buf[loc.piece_range].copy_from_slice(&data);
+            let mut piece_cursor = loc.piece_range.start;
+            for (target_path, target_offset, sub_len) in self.part_file.resolve_read_ranges(
+                loc.file,
+                loc.file_offset,
+                loc.piece_range.len(),
+                &normal_path,
+            ) {
+                let data = self
+                    .disk
+                    .read(diskio::ReadJob {
+                        path: std::sync::Arc::new(target_path.clone()),
+                        offset: target_offset,
+                        len: sub_len,
+                    })
+                    .await?;
+                if data.len() != sub_len {
+                    return Err(diskio::DiskError::Io {
+                        path: target_path,
+                        source: std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "short read from disk",
+                        ),
+                    });
+                }
+                buf[piece_cursor..piece_cursor + sub_len].copy_from_slice(&data);
+                piece_cursor += sub_len;
+            }
         }
         Ok(buf)
     }
@@ -2213,12 +2777,16 @@ impl Torrent {
             >= MAX_PENDING_SERVES_PER_PEER
             || total_slots.load(Ordering::Relaxed) >= MAX_PENDING_SERVES_TOTAL;
 
-        if !can_serve || over_capacity {
-            let _ = peer.handle.try_send(Message::RejectRequest {
-                index,
-                begin,
-                length,
-            });
+        let supports_fast = peer.peer_info.supports_fast();
+
+        if !can_serve {
+            if supports_fast {
+                let _ = peer.handle.try_send(Message::RejectRequest {
+                    index,
+                    begin,
+                    length,
+                });
+            }
             if let Some(ref m) = self.global_metrics {
                 m.piece_rejects_total.fetch_add(1, Ordering::Relaxed);
             }
@@ -2233,63 +2801,149 @@ impl Torrent {
             }
             return;
         }
+        if over_capacity {
+            if supports_fast {
+                let _ = peer.handle.try_send(Message::RejectRequest {
+                    index,
+                    begin,
+                    length,
+                });
+            }
+            if let Some(ref m) = self.global_metrics {
+                m.piece_rejects_total.fetch_add(1, Ordering::Relaxed);
+            }
+            return;
+        }
         peer.invalid_requests = peer.invalid_requests.saturating_sub(1);
         peer.last_useful_at = std::time::Instant::now();
         peer.pending_serves.fetch_add(1, Ordering::Relaxed);
         total_slots.fetch_add(1, Ordering::Relaxed);
+        let key = ServeKey {
+            peer_id: id,
+            index,
+            begin,
+            length,
+        };
+        let cancel = ServeCancelToken::new();
+        {
+            self.in_flight_serves
+                .lock()
+                .entry(key)
+                .or_default()
+                .push(cancel.clone());
+        }
         let slot = ServeSlot {
             peer: peer.pending_serves.clone(),
             total: total_slots,
+            serves: self.in_flight_serves.clone(),
+            key,
+            cancel: cancel.clone(),
         };
 
         let locations = self.info.block_locations(index, begin, length);
         let disk = self.disk.clone();
         let handle = peer.handle.clone();
         let peer_addr = peer.peer_info.addr;
-        peer.uploaded_to += length as u64;
+        let peer_uploaded = peer.uploaded_to.clone();
 
         let download_dir = self.download_dir.clone();
         for loc in &locations {
-            if !synapse_meta::is_padding_file(&self.info.files[loc.file].path, None)
-                && crate::fs::verify_no_symlinks_under(
-                    &download_dir,
-                    &self.info.files[loc.file].path,
-                )
-                .is_err()
-            {
-                drop(slot);
-                let _ = handle.try_send(Message::RejectRequest {
-                    index,
-                    begin,
-                    length,
-                });
-                return;
+            let file_idx = loc.file;
+            let rel_path = &self.info.files[file_idx].path;
+            if !synapse_meta::is_padding_file(rel_path, None) {
+                // Re-checked on every serve, not just the first time this file index is seen:
+                // a symlink swapped in after an earlier, now-cached verification must still be
+                // caught, or a block read could be redirected outside `download_dir`.
+                if crate::fs::verify_no_symlinks_under(&download_dir, rel_path).is_err() {
+                    drop(slot);
+                    if supports_fast {
+                        let _ = handle.try_send(Message::RejectRequest {
+                            index,
+                            begin,
+                            length,
+                        });
+                    }
+                    return;
+                }
+                self.verified_serve_files
+                    .entry(file_idx)
+                    .or_insert_with(|| Arc::new(download_dir.join(rel_path)));
             }
         }
-        let file_paths: Vec<BlockReadSlice> = locations
-            .into_iter()
-            .map(|loc| {
-                let is_padding =
-                    synapse_meta::is_padding_file(&self.info.files[loc.file].path, None);
-                let normal_path = download_dir.join(&self.info.files[loc.file].path);
-                let (target_path, target_offset) =
-                    self.part_file
-                        .resolve_read_location(loc.file, loc.file_offset, normal_path);
-                BlockReadSlice {
-                    path: Arc::new(target_path),
-                    offset: target_offset,
-                    len: loc.piece_range.len(),
-                    piece_range: loc.piece_range,
-                    is_padding,
-                }
-            })
-            .collect();
 
-        self.total_uploaded += length as u64;
-        if let Some(ref m) = self.global_metrics {
-            m.total_uploaded_bytes
-                .fetch_add(length as u64, std::sync::atomic::Ordering::Relaxed);
-        }
+        let has_part_slices = self.part_file.has_slices();
+        let read_plan = if !has_part_slices
+            && locations.len() == 1
+            && !synapse_meta::is_padding_file(&self.info.files[locations[0].file].path, None)
+            && locations[0].piece_range.start == 0
+            && locations[0].piece_range.end == length as usize
+        {
+            let loc = &locations[0];
+            ServeReadPlan::Single(ReadJob {
+                path: self.verified_serve_files[&loc.file].clone(),
+                offset: loc.file_offset,
+                len: loc.piece_range.len(),
+            })
+        } else {
+            let mut file_paths: Vec<BlockReadSlice> = Vec::with_capacity(locations.len());
+            for loc in locations {
+                let rel_path = &self.info.files[loc.file].path;
+                if synapse_meta::is_padding_file(rel_path, None) {
+                    file_paths.push(BlockReadSlice {
+                        path: Arc::new(PathBuf::new()),
+                        offset: 0,
+                        len: loc.piece_range.len(),
+                        piece_range: loc.piece_range,
+                        is_padding: true,
+                    });
+                    continue;
+                }
+                let cached_path = &self.verified_serve_files[&loc.file];
+                if !has_part_slices {
+                    file_paths.push(BlockReadSlice {
+                        path: cached_path.clone(),
+                        offset: loc.file_offset,
+                        len: loc.piece_range.len(),
+                        piece_range: loc.piece_range,
+                        is_padding: false,
+                    });
+                } else {
+                    let mut piece_cursor = loc.piece_range.start;
+                    for (target_path, target_offset, sub_len) in self.part_file.resolve_read_ranges(
+                        loc.file,
+                        loc.file_offset,
+                        loc.piece_range.len(),
+                        cached_path.as_ref(),
+                    ) {
+                        file_paths.push(BlockReadSlice {
+                            path: Arc::new(target_path),
+                            offset: target_offset,
+                            len: sub_len,
+                            piece_range: piece_cursor..piece_cursor + sub_len,
+                            is_padding: false,
+                        });
+                        piece_cursor += sub_len;
+                    }
+                }
+            }
+            if file_paths.len() == 1
+                && !file_paths[0].is_padding
+                && file_paths[0].piece_range.start == 0
+                && file_paths[0].piece_range.end == length as usize
+            {
+                let slice = file_paths.into_iter().next().expect("checked len == 1");
+                ServeReadPlan::Single(ReadJob {
+                    path: slice.path,
+                    offset: slice.offset,
+                    len: slice.len,
+                })
+            } else {
+                ServeReadPlan::Multi(file_paths)
+            }
+        };
+
+        let total_uploaded = self.total_uploaded.clone();
+        let global_metrics = self.global_metrics.clone();
 
         let (limiter, accounted, is_lan, limit_lan) =
             self.hierarchical_upload_limiter(id, peer_addr, length as usize);
@@ -2297,35 +2951,74 @@ impl Torrent {
         // Offload disk read + throttling + piece send to non-blocking worker
         tokio::spawn(async move {
             let _slot = slot;
-            let mut buf = vec![0u8; length as usize];
-            for slice in file_paths {
-                if slice.is_padding {
-                    buf[slice.piece_range].fill(0);
-                    continue;
-                }
-                match disk
-                    .read(ReadJob {
-                        path: slice.path,
-                        offset: slice.offset,
-                        len: slice.len,
-                    })
-                    .await
-                {
-                    Ok(data) => buf[slice.piece_range].copy_from_slice(&data),
+            if cancel.is_cancelled() {
+                return;
+            }
+            let data = match read_plan {
+                ServeReadPlan::Single(job) => match disk.read(job).await {
+                    Ok(data) => data,
                     Err(e) => {
                         tracing::error!(index, begin, "failed to read block to serve: {e}");
-                        let _ = handle.try_send(Message::RejectRequest {
-                            index,
-                            begin,
-                            length,
-                        });
+                        if supports_fast {
+                            let _ = handle.try_send(Message::RejectRequest {
+                                index,
+                                begin,
+                                length,
+                            });
+                        }
                         return;
                     }
+                },
+                ServeReadPlan::Multi(file_paths) => {
+                    let mut buf = vec![0u8; length as usize];
+                    for slice in file_paths {
+                        if cancel.is_cancelled() {
+                            return;
+                        }
+                        if slice.is_padding {
+                            buf[slice.piece_range].fill(0);
+                            continue;
+                        }
+                        match disk
+                            .read(ReadJob {
+                                path: slice.path,
+                                offset: slice.offset,
+                                len: slice.len,
+                            })
+                            .await
+                        {
+                            Ok(data) => buf[slice.piece_range].copy_from_slice(&data),
+                            Err(e) => {
+                                tracing::error!(index, begin, "failed to read block to serve: {e}");
+                                if supports_fast {
+                                    let _ = handle.try_send(Message::RejectRequest {
+                                        index,
+                                        begin,
+                                        length,
+                                    });
+                                }
+                                return;
+                            }
+                        }
+                    }
+                    Bytes::from(buf)
                 }
-            }
+            };
 
-            limiter.consume(accounted, is_lan, limit_lan).await;
-            let data = Bytes::from(buf);
+            let notified = cancel.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if cancel.is_cancelled() {
+                return;
+            }
+            tokio::select! {
+                biased;
+                _ = &mut notified => return,
+                _ = limiter.consume(accounted, is_lan, limit_lan) => {}
+            }
+            if cancel.is_cancelled() {
+                return;
+            }
             let message = match (merkle_hashlist, merkle_target) {
                 (Some(hashlist), Some(ext_id)) => Message::Extension {
                     id: ext_id,
@@ -2339,7 +3032,14 @@ impl Torrent {
                 },
                 _ => Message::Piece { index, begin, data },
             };
-            let _ = handle.try_send(message);
+            if handle.try_send(message) {
+                let bytes = length as u64;
+                peer_uploaded.fetch_add(bytes, Ordering::Relaxed);
+                total_uploaded.fetch_add(bytes, Ordering::Relaxed);
+                if let Some(ref m) = global_metrics {
+                    m.total_uploaded_bytes.fetch_add(bytes, Ordering::Relaxed);
+                }
+            }
         });
     }
 
@@ -2457,21 +3157,7 @@ impl Torrent {
                         }
                         tracing::warn!(peer = %id, "ut_metadata assembly failed: {e}");
                         self.on_disconnected(id);
-                        let sources: Vec<(PeerId, u8, u32)> = self
-                            .peers
-                            .iter()
-                            .filter_map(|(&pid, p)| {
-                                Some((
-                                    pid,
-                                    *p.peer_extensions.get("ut_metadata")?,
-                                    p.peer_metadata_size?,
-                                ))
-                            })
-                            .collect();
-                        for (pid, ext, size) in sources {
-                            self.maybe_request_metadata(pid, Some(ext), Some(size))
-                                .await;
-                        }
+                        self.request_metadata_from_connected_peers(None).await;
                     }
                 }
             }
@@ -2481,22 +3167,7 @@ impl Torrent {
                     if let Some(fetcher) = self.metadata_fetcher.as_mut() {
                         if fetcher.pieces_received == 0 {
                             fetcher.reset();
-                            let sources: Vec<(PeerId, u8, u32)> = self
-                                .peers
-                                .iter()
-                                .filter(|(&pid, _)| pid != id)
-                                .filter_map(|(&pid, p)| {
-                                    Some((
-                                        pid,
-                                        *p.peer_extensions.get("ut_metadata")?,
-                                        p.peer_metadata_size?,
-                                    ))
-                                })
-                                .collect();
-                            for (pid, ext, size) in sources {
-                                self.maybe_request_metadata(pid, Some(ext), Some(size))
-                                    .await;
-                            }
+                            self.request_metadata_from_connected_peers(Some(id)).await;
                         }
                     }
                 }
@@ -2509,6 +3180,9 @@ impl Torrent {
     /// No-ops on private swarms (`PexManager::generate_pex_message` returns `None`).
     async fn maybe_broadcast_pex(&mut self) {
         const PEX_INTERVAL: Duration = Duration::from_secs(60);
+        if self.info.private || !self.settings.read().pex_enabled {
+            return;
+        }
         if self.last_pex_broadcast.elapsed() < PEX_INTERVAL {
             return;
         }
@@ -2695,22 +3369,40 @@ impl Torrent {
         }
 
         self.webseed.as_mut().unwrap().on_success(seed_idx);
-        let piece_len = buf.len() as u32;
-        self.in_progress.insert(
-            index,
-            InProgressPiece {
-                piece_len,
-                buf,
-                received_blocks: HashSet::new(),
-                expected_blocks: 0,
-                contributors: HashMap::new(),
-            },
-        );
+        self.in_progress
+            .insert(index, InProgressPiece::from_complete_buf(buf));
         self.finish_piece(index).await;
+    }
+
+    async fn request_metadata_from_connected_peers(&mut self, exclude: Option<PeerId>) {
+        let sources: Vec<(PeerId, u8, u32)> = self
+            .peers
+            .iter()
+            .filter(|(&pid, _)| Some(pid) != exclude)
+            .filter_map(|(&pid, p)| {
+                Some((
+                    pid,
+                    *p.peer_extensions.get("ut_metadata")?,
+                    p.peer_metadata_size?,
+                ))
+            })
+            .collect();
+        for (pid, ext, size) in sources {
+            self.maybe_request_metadata(pid, Some(ext), Some(size))
+                .await;
+        }
     }
 
     async fn tick(&mut self) {
         self.maybe_broadcast_pex().await;
+        if !self.metadata_resolved
+            && self
+                .metadata_fetcher
+                .as_mut()
+                .is_some_and(|f| f.reset_if_stalled(Duration::from_secs(30)))
+        {
+            self.request_metadata_from_connected_peers(None).await;
+        }
         self.request_piece_layers();
         if !self.pending_block_audits.is_empty() {
             let now = std::time::Instant::now();
@@ -2764,8 +3456,8 @@ impl Torrent {
             .iter()
             .map(|(id, p)| PeerStats {
                 id: *id,
-                download_rate: p.downloaded_from,
-                upload_rate: p.uploaded_to,
+                download_rate: p.ewma_download_rate,
+                upload_rate: p.ewma_upload_rate,
                 interested: p.peer_interested,
                 progress: p.has.count_ones() as f32 / total_pieces,
                 last_unchoked: None,
@@ -2826,6 +3518,9 @@ impl Torrent {
                         peer.is_snubbed = true;
                     }
                     for (idx, offset) in timed_out_blocks {
+                        if let Some(piece) = self.in_progress.get_mut(&idx) {
+                            piece.clear_request(offset, *peer_id);
+                        }
                         let length = BLOCK_LEN.min(self.info.piece_len(idx) - offset);
                         let _ = peer.handle.try_send(Message::Cancel {
                             index: idx,
@@ -2904,13 +3599,24 @@ impl Torrent {
             let dl_delta = peer
                 .downloaded_from
                 .saturating_sub(peer.prev_downloaded_from);
-            let ul_delta = peer.uploaded_to.saturating_sub(peer.prev_uploaded_to);
+            let ul_now = peer.uploaded_to.load(Ordering::Relaxed);
+            let ul_delta = ul_now.saturating_sub(peer.prev_uploaded_to);
             let p_rate_dl = (dl_delta as f64 / tick_secs) as u64;
             let p_rate_ul = (ul_delta as f64 / tick_secs) as u64;
+            peer.ewma_download_rate = if peer.ewma_download_rate == 0 {
+                p_rate_dl
+            } else {
+                (peer.ewma_download_rate * 3 + p_rate_dl) / 4
+            };
+            peer.ewma_upload_rate = if peer.ewma_upload_rate == 0 {
+                p_rate_ul
+            } else {
+                (peer.ewma_upload_rate * 3 + p_rate_ul) / 4
+            };
             rate_download += p_rate_dl;
             rate_upload += p_rate_ul;
             peer.prev_downloaded_from = peer.downloaded_from;
-            peer.prev_uploaded_to = peer.uploaded_to;
+            peer.prev_uploaded_to = ul_now;
             if dl_delta > 0 {
                 peers_sending += 1;
             }
@@ -2936,6 +3642,9 @@ impl Torrent {
             if peer.peer_info.is_encrypted {
                 flags.push('E');
             }
+            if peer.peer_info.is_utp {
+                flags.push('P');
+            }
             if flags.is_empty() {
                 flags.push('?');
             }
@@ -2950,21 +3659,24 @@ impl Torrent {
                 rate_to_peer: p_rate_ul,
                 progress: peer_progress.min(1.0),
                 is_encrypted: peer.peer_info.is_encrypted,
-                is_utp: false,
+                is_utp: peer.peer_info.is_utp,
                 supports_pex,
                 peer_interested: peer.peer_interested,
             });
         }
 
         *self.live_peers.write() = peer_snapshots;
-        *self.piece_availability.write() = self.picker.availability().to_vec();
+        {
+            let mut pa = self.piece_availability.write();
+            self.picker.write_availability(&mut pa);
+        }
 
         let (prev_dl, prev_ul, prev_peers) = {
             let mut s = self.stats.write();
             let prev = (s.download_rate, s.upload_rate, s.peers_connected);
             s.download_rate = rate_download;
             s.upload_rate = rate_upload;
-            s.uploaded_bytes = self.total_uploaded;
+            s.uploaded_bytes = self.total_uploaded.load(Ordering::Relaxed);
             s.peers_connected = self.peers.len();
             s.peers_sending = peers_sending;
             if rate_download > 0 || rate_upload > 0 {
@@ -3099,29 +3811,37 @@ impl Torrent {
     /// picker/bitfield state to match — previously `recheck` just flipped the reported state
     /// to `Checking` for cosmetic effect and never actually looked at the files on disk.
     pub async fn handle_recheck(&mut self) {
+        let was_complete_before = self.picker.is_complete();
         tracing::info!(name = %self.info.name, "recheck starting");
-        self.stats.write().state = SwarmState::Checking;
+        {
+            let mut s = self.stats.write();
+            let old_state = std::mem::replace(&mut s.state, SwarmState::Checking);
+            if let Some(ref m) = self.global_metrics {
+                m.record_state_transition(&old_state, &SwarmState::Checking);
+            }
+        }
 
         let total = self.info.pieces();
         let mut new_bitfield = Bitfield::new(total as usize);
 
-        // Bounded concurrency pool for pipelined parallel rechecking (buffer pool)
+        // Bounded concurrency pool for pipelined parallel rechecking (drains continuously so
+        // arbitrary piece counts cannot deadlock waiting for space in a results channel).
         let concurrency = 8usize.min(total as usize).max(1);
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
-        let (res_tx, mut res_rx) =
-            tokio::sync::mpsc::channel::<(u32, bool, Option<[u8; 20]>)>(concurrency * 2);
+        let mut join_set: tokio::task::JoinSet<(u32, bool, Option<[u8; 20]>)> =
+            tokio::task::JoinSet::new();
+        let mut results: Vec<(u32, bool, Option<[u8; 20]>)> = Vec::with_capacity(total as usize);
 
         for idx in 0..total {
-            let permit = semaphore
-                .clone()
-                .acquire_owned()
-                .await
-                .expect("recheck semaphore closed");
+            while join_set.len() >= concurrency {
+                if let Some(Ok(r)) = join_set.join_next().await {
+                    results.push(r);
+                }
+            }
+
             let info = self.info.clone();
             let disk = self.disk.clone();
             let piece_len = info.piece_len(idx);
             let locations = info.block_locations(idx, 0, piece_len);
-            let tx = res_tx.clone();
 
             let mut read_slices = Vec::with_capacity(locations.len());
             let mut symlink_blocked = false;
@@ -3138,23 +3858,27 @@ impl Torrent {
                     break;
                 } else {
                     let normal_path = self.download_dir.join(&info.files[loc.file].path);
-                    let (target_path, target_offset) = self.part_file.resolve_read_location(
+                    let mut piece_cursor = loc.piece_range.start;
+                    for (target_path, target_offset, sub_len) in self.part_file.resolve_read_ranges(
                         loc.file,
                         loc.file_offset,
-                        normal_path,
-                    );
-                    read_slices.push((
-                        Some(ReadJob {
-                            path: Arc::new(target_path),
-                            offset: target_offset,
-                            len: loc.piece_range.len(),
-                        }),
-                        loc.piece_range,
-                    ));
+                        loc.piece_range.len(),
+                        &normal_path,
+                    ) {
+                        read_slices.push((
+                            Some(ReadJob {
+                                path: Arc::new(target_path),
+                                offset: target_offset,
+                                len: sub_len,
+                            }),
+                            piece_cursor..piece_cursor + sub_len,
+                        ));
+                        piece_cursor += sub_len;
+                    }
                 }
             }
             if symlink_blocked {
-                let _ = tx.send((idx, false, None)).await;
+                results.push((idx, false, None));
                 continue;
             }
 
@@ -3166,15 +3890,16 @@ impl Torrent {
                 .piece_hash_v2(idx)
                 .or_else(|| self.piece_hash_v2_from_dynamic(idx));
 
-            tokio::spawn(async move {
-                let _permit = permit;
+            join_set.spawn(async move {
                 let mut buf = vec![0u8; piece_len as usize];
                 let mut read_ok = true;
                 for (job_opt, range) in read_slices {
                     if let Some(job) = job_opt {
                         match disk.read(job).await {
-                            Ok(data) => buf[range].copy_from_slice(&data),
-                            Err(_) => {
+                            Ok(data) if data.len() == range.len() => {
+                                buf[range].copy_from_slice(&data);
+                            }
+                            Ok(_) | Err(_) => {
                                 read_ok = false;
                                 break;
                             }
@@ -3206,23 +3931,29 @@ impl Torrent {
                 .await
                 .unwrap_or((false, None));
 
-                let _ = tx.send((idx, verified, sha1)).await;
+                (idx, verified, sha1)
             });
         }
-        drop(res_tx);
 
-        let mut results: Vec<(u32, bool, Option<[u8; 20]>)> = Vec::with_capacity(total as usize);
-        while let Some(r) = res_rx.recv().await {
-            results.push(r);
+        while let Some(res) = join_set.join_next().await {
+            if let Ok(r) = res {
+                results.push(r);
+            }
         }
         // BEP 30: if every piece is present and the tree of their hashes reproduces the root hash,
         // all of them are good, and the tree is what a seeder needs.
         if self.info.is_merkle_v1() && results.iter().all(|(_, _, h)| h.is_some()) {
             results.sort_by_key(|r| r.0);
             let hashes: Vec<[u8; 20]> = results.iter().filter_map(|r| r.2).collect();
-            if let Some(tree) = synapse_meta::merkle_v1::MerkleTreeV1::from_piece_hashes(&hashes)
-                .filter(|t| Some(t.root()) == self.info.root_hash_v1)
-            {
+            let expected_root = self.info.root_hash_v1;
+            let built_tree = tokio::task::spawn_blocking(move || {
+                synapse_meta::merkle_v1::MerkleTreeV1::from_piece_hashes(&hashes)
+                    .filter(|t| Some(t.root()) == expected_root)
+            })
+            .await
+            .ok()
+            .flatten();
+            if let Some(tree) = built_tree {
                 for r in results.iter_mut() {
                     r.1 = true;
                 }
@@ -3264,22 +3995,47 @@ impl Torrent {
             let mut s = self.stats.write();
             s.progress = progress;
             s.downloaded_bytes = ((progress as f64) * (self.info.total_len as f64)) as u64;
-            s.state = if is_complete {
+            let new_state = if is_complete {
                 SwarmState::Seeding
             } else {
                 SwarmState::Downloading
             };
+            let prev_state = std::mem::replace(&mut s.state, new_state.clone());
+            if let Some(ref m) = self.global_metrics {
+                m.record_state_transition(&prev_state, &new_state);
+            }
+        }
+
+        let new_missing = if is_complete {
+            0
+        } else {
+            crate::announcer::compute_missing_wanted_bytes(
+                &self.info,
+                &self.file_priorities,
+                self.bitfield.read().as_ref(),
+            )
+        };
+        if let Some(ref missing) = self.missing_wanted_bytes {
+            missing.store(new_missing, Ordering::Release);
+        }
+        if let Some(ref dl) = self.downloading_torrents {
+            if is_complete {
+                dl.remove(&self.info.hash);
+            } else {
+                dl.insert(self.info.hash);
+            }
+        }
+        if let Some(ref dirty) = self.dirty_flag {
+            dirty.store(true, Ordering::Release);
         }
 
         tracing::info!(name = %self.info.name, progress, is_complete, "recheck complete");
 
         if is_complete {
-            self.info.evict_piece_hashes();
-            if !self.completed_fired {
-                self.completed_fired = true;
-                for tx in self.on_complete.drain(..) {
-                    let _ = tx.send(());
-                }
+            if !was_complete_before {
+                self.finalize_completion().await;
+            } else {
+                self.info.evict_piece_hashes();
             }
         }
     }
@@ -3288,7 +4044,7 @@ impl Torrent {
     /// Tries a same-filesystem rename first, falling back to copy+remove across devices; if
     /// any file fails partway through, already-moved files are moved back so the torrent is
     /// left entirely at the old location rather than split across both.
-    async fn handle_set_location(&mut self, new_dir: PathBuf) {
+    async fn handle_set_location(&mut self, new_dir: PathBuf, move_existing_files: bool) {
         if new_dir == self.download_dir {
             return;
         }
@@ -3314,26 +4070,34 @@ impl Torrent {
                 return;
             }
         }
-        if let Ok(meta) = tokio::fs::symlink_metadata(&self.download_dir).await {
-            if meta.file_type().is_symlink() {
-                tracing::error!(
-                    name = %self.info.name,
-                    from = %self.download_dir.display(),
-                    "set_location: rejecting symlink source directory"
-                );
-                return;
+        if move_existing_files {
+            if let Ok(meta) = tokio::fs::symlink_metadata(&self.download_dir).await {
+                if meta.file_type().is_symlink() {
+                    tracing::error!(
+                        name = %self.info.name,
+                        from = %self.download_dir.display(),
+                        "set_location: rejecting symlink source directory"
+                    );
+                    return;
+                }
             }
         }
 
-        tracing::info!(name = %self.info.name, from = %self.download_dir.display(), to = %new_dir.display(), "moving torrent data");
+        tracing::info!(
+            name = %self.info.name,
+            from = %self.download_dir.display(),
+            to = %new_dir.display(),
+            move_existing_files,
+            "updating torrent download location"
+        );
 
         if let Err(e) = tokio::fs::create_dir_all(&new_dir).await {
             tracing::error!(name = %self.info.name, "set_location: failed to create destination directory {}: {}", new_dir.display(), e);
             return;
         }
 
-        // Only move files when the torrent has verified at least one piece; an unverified
-        // torrent must not relocate preexisting host files out of download_dir.
+        // Only move files when requested and the torrent has verified at least one piece; an
+        // unverified torrent must not relocate preexisting host files out of download_dir.
         let has_verified_data = self.picker.completed_count() > 0
             || self
                 .bitfield
@@ -3342,82 +4106,158 @@ impl Torrent {
                 .is_some_and(|b| b.count_ones() > 0);
 
         let mut moved: Vec<(PathBuf, PathBuf)> = Vec::new();
-        if has_verified_data {
-            for file in &self.info.files {
-                if let Err(e) = crate::fs::verify_no_symlinks_under(&self.download_dir, &file.path)
-                {
-                    tracing::error!(name = %self.info.name, "set_location: unsafe source file path {}: {}, rolling back", file.path.display(), e);
-                    Self::rollback_moves(&moved).await;
-                    return;
-                }
-                if let Err(e) = crate::fs::verify_no_symlinks_under(&new_dir, &file.path) {
-                    tracing::error!(name = %self.info.name, "set_location: unsafe destination file path {}: {}, rolling back", file.path.display(), e);
-                    Self::rollback_moves(&moved).await;
-                    return;
-                }
+        if move_existing_files {
+            if has_verified_data {
+                for file in &self.info.files {
+                    if let Err(e) =
+                        crate::fs::verify_no_symlinks_under(&self.download_dir, &file.path)
+                    {
+                        tracing::error!(name = %self.info.name, "set_location: unsafe source file path {}: {}, rolling back", file.path.display(), e);
+                        Self::rollback_moves(&self.disk, &moved).await;
+                        return;
+                    }
+                    if let Err(e) = crate::fs::verify_no_symlinks_under(&new_dir, &file.path) {
+                        tracing::error!(name = %self.info.name, "set_location: unsafe destination file path {}: {}, rolling back", file.path.display(), e);
+                        Self::rollback_moves(&self.disk, &moved).await;
+                        return;
+                    }
 
-                let src = self.download_dir.join(&file.path);
-                let dst = new_dir.join(&file.path);
+                    let src = self.download_dir.join(&file.path);
+                    let dst = new_dir.join(&file.path);
 
-                match tokio::fs::symlink_metadata(&src).await {
-                    Ok(meta) => {
-                        if !meta.file_type().is_file() {
-                            tracing::error!(name = %self.info.name, "set_location: source {} is not a regular file, rolling back", src.display());
-                            Self::rollback_moves(&moved).await;
+                    match tokio::fs::symlink_metadata(&src).await {
+                        Ok(meta) => {
+                            if !meta.file_type().is_file() {
+                                tracing::error!(name = %self.info.name, "set_location: source {} is not a regular file, rolling back", src.display());
+                                Self::rollback_moves(&self.disk, &moved).await;
+                                return;
+                            }
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(e) => {
+                            tracing::error!(name = %self.info.name, "set_location: failed to stat {}: {}, rolling back", src.display(), e);
+                            Self::rollback_moves(&self.disk, &moved).await;
                             return;
                         }
                     }
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                    Err(e) => {
-                        tracing::error!(name = %self.info.name, "set_location: failed to stat {}: {}, rolling back", src.display(), e);
-                        Self::rollback_moves(&moved).await;
-                        return;
-                    }
-                }
 
-                if let Ok(dst_meta) = tokio::fs::symlink_metadata(&dst).await {
-                    if dst_meta.file_type().is_symlink() || dst_meta.file_type().is_dir() {
-                        tracing::error!(name = %self.info.name, "set_location: destination {} is a symlink or directory, rolling back", dst.display());
-                        Self::rollback_moves(&moved).await;
-                        return;
+                    if let Ok(dst_meta) = tokio::fs::symlink_metadata(&dst).await {
+                        if dst_meta.file_type().is_symlink() || dst_meta.file_type().is_dir() {
+                            tracing::error!(name = %self.info.name, "set_location: destination {} is a symlink or directory, rolling back", dst.display());
+                            Self::rollback_moves(&self.disk, &moved).await;
+                            return;
+                        }
                     }
-                }
 
-                if let Some(parent) = dst.parent() {
-                    if let Err(e) = tokio::fs::create_dir_all(parent).await {
-                        tracing::error!(name = %self.info.name, "set_location: failed to create {}: {}, rolling back", parent.display(), e);
-                        Self::rollback_moves(&moved).await;
-                        return;
+                    if let Some(parent) = dst.parent() {
+                        if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                            tracing::error!(name = %self.info.name, "set_location: failed to create {}: {}, rolling back", parent.display(), e);
+                            Self::rollback_moves(&self.disk, &moved).await;
+                            return;
+                        }
                     }
+                    // Evict cached FDs before renaming/copying so unlinked or replaced files
+                    // don't linger open in `FileCache` or block replacement on strict hosts.
+                    self.disk.evict(&src);
+                    self.disk.evict(&dst);
+                    if let Err(rename_err) = tokio::fs::rename(&src, &dst).await {
+                        if let Err(copy_err) = tokio::fs::copy(&src, &dst).await {
+                            tracing::error!(
+                                name = %self.info.name,
+                                "set_location: failed to move {} (rename: {}, copy: {}), rolling back",
+                                src.display(), rename_err, copy_err
+                            );
+                            let _ = tokio::fs::remove_file(&dst).await;
+                            Self::rollback_moves(&self.disk, &moved).await;
+                            return;
+                        }
+                        if let Err(e) = tokio::fs::remove_file(&src).await {
+                            tracing::warn!(name = %self.info.name, "set_location: copied {} but couldn't remove original {}: {}", dst.display(), src.display(), e);
+                        }
+                    }
+                    moved.push((src, dst));
                 }
-                if let Err(rename_err) = tokio::fs::rename(&src, &dst).await {
-                    if let Err(copy_err) = tokio::fs::copy(&src, &dst).await {
-                        tracing::error!(
-                            name = %self.info.name,
-                            "set_location: failed to move {} (rename: {}, copy: {}), rolling back",
-                            src.display(), rename_err, copy_err
-                        );
-                        Self::rollback_moves(&moved).await;
-                        return;
+            }
+
+            // Also relocate private part-file and its slice map (when present) before updating paths.
+            let part_extras = [
+                self.part_file.part_file_path().to_path_buf(),
+                self.part_file.map_path().to_path_buf(),
+            ];
+            for src in part_extras {
+                if tokio::fs::try_exists(&src).await.unwrap_or(false) {
+                    let Some(fname) = src.file_name() else {
+                        continue;
+                    };
+                    let dst = new_dir.join(fname);
+                    if let Ok(dst_meta) = tokio::fs::symlink_metadata(&dst).await {
+                        if dst_meta.file_type().is_symlink() || dst_meta.file_type().is_dir() {
+                            tracing::error!(name = %self.info.name, "set_location: destination {} is a symlink or directory, rolling back", dst.display());
+                            Self::rollback_moves(&self.disk, &moved).await;
+                            return;
+                        }
                     }
-                    if let Err(e) = tokio::fs::remove_file(&src).await {
-                        tracing::warn!(name = %self.info.name, "set_location: copied {} but couldn't remove original {}: {}", dst.display(), src.display(), e);
+                    self.disk.evict(&src);
+                    self.disk.evict(&dst);
+                    if let Err(rename_err) = tokio::fs::rename(&src, &dst).await {
+                        if let Err(copy_err) = tokio::fs::copy(&src, &dst).await {
+                            tracing::error!(
+                                name = %self.info.name,
+                                "set_location: failed to move {} (rename: {}, copy: {}), rolling back",
+                                src.display(), rename_err, copy_err
+                            );
+                            let _ = tokio::fs::remove_file(&dst).await;
+                            Self::rollback_moves(&self.disk, &moved).await;
+                            return;
+                        }
+                        let _ = tokio::fs::remove_file(&src).await;
                     }
+                    moved.push((src, dst));
                 }
-                moved.push((src, dst));
             }
         }
 
+        self.part_file.relocate_to_dir(&new_dir);
+        self.verified_serve_files.clear();
         self.download_dir = new_dir.clone();
         self.stats.write().download_dir = new_dir.to_string_lossy().to_string();
-        tracing::info!(name = %self.info.name, files_moved = moved.len(), "torrent data moved successfully");
+        if let Some(ref dirty) = self.dirty_flag {
+            dirty.store(true, Ordering::Release);
+        }
+        if let Some(ref store) = self.session_store {
+            let store = store.clone();
+            let hex_hash = hex::encode(self.info.hash);
+            let new_dir_str = new_dir.to_string_lossy().to_string();
+            tokio::task::spawn_blocking(move || {
+                if let Ok(Some(mut state)) = store.load_torrent(&hex_hash) {
+                    state.download_dir = new_dir_str;
+                    state.raw_bencode_hex = None;
+                    let _ = store.save_states_batch(&[state]);
+                }
+            });
+        }
+        tracing::info!(name = %self.info.name, files_moved = moved.len(), "torrent location updated successfully");
     }
 
-    async fn rollback_moves(moved: &[(PathBuf, PathBuf)]) {
+    async fn rollback_moves(disk: &diskio::DiskEngine, moved: &[(PathBuf, PathBuf)]) {
         for (src, dst) in moved.iter().rev() {
+            disk.evict(dst);
+            disk.evict(src);
             if tokio::fs::rename(dst, src).await.is_err() {
-                let _ = tokio::fs::copy(dst, src).await;
-                let _ = tokio::fs::remove_file(dst).await;
+                match tokio::fs::copy(dst, src).await {
+                    Ok(_) => {
+                        let _ = tokio::fs::remove_file(dst).await;
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            src = %src.display(),
+                            dst = %dst.display(),
+                            error = %e,
+                            "set_location rollback copy failed; leaving {} intact to preserve data",
+                            dst.display()
+                        );
+                    }
+                }
             }
         }
     }
@@ -3454,8 +4294,11 @@ impl Torrent {
                     if let Some(ext_id) = sender_hp_id {
                         let _ = sender.handle.try_send(Message::Extension {
                             id: ext_id,
-                            payload: synapse_wire::HolepunchMessage::Failed { err_code: 1 }
-                                .encode(),
+                            payload: synapse_wire::HolepunchMessage::Failed {
+                                target,
+                                err_code: 1,
+                            }
+                            .encode(),
                         });
                     }
                 }
@@ -3478,8 +4321,8 @@ impl Torrent {
                     let _ = tx.try_send(vec![peer]);
                 }
             }
-            synapse_wire::HolepunchMessage::Failed { err_code } => {
-                tracing::debug!(from_peer = %id, err_code, "Received ut_holepunch Failed notification");
+            synapse_wire::HolepunchMessage::Failed { target, err_code } => {
+                tracing::debug!(from_peer = %id, %target, err_code, "Received ut_holepunch Failed notification");
             }
         }
     }
@@ -3961,49 +4804,66 @@ impl Torrent {
         };
         let files = self.info.files.clone();
         for (file_idx, file) in files.iter().enumerate() {
-            if let Some(cached_path) = resolver.find_local_file(&file.path) {
-                if let Ok(meta) = tokio::fs::symlink_metadata(&cached_path).await {
-                    if meta.file_type().is_file() && meta.len() == file.length {
-                        if let Some((start_p, end_p)) = self.info.piece_range_for_file(file_idx) {
-                            for p in start_p..=end_p {
-                                if !self.picker.have(p) {
-                                    let piece_len = self.info.piece_len(p);
-                                    // Only a piece lying wholly inside this file can be checked
-                                    // from it alone; one that straddles a file boundary is skipped.
-                                    let locs = self.info.block_locations(p, 0, piece_len);
-                                    let [loc] = locs.as_slice() else {
-                                        continue;
-                                    };
-                                    let mut buf = vec![0u8; piece_len as usize];
-                                    if let Ok(mut f) = tokio::fs::File::open(&cached_path).await {
-                                        use tokio::io::{AsyncReadExt, AsyncSeekExt};
-                                        if f.seek(std::io::SeekFrom::Start(loc.file_offset))
-                                            .await
-                                            .is_ok()
-                                            && f.read_exact(&mut buf).await.is_ok()
-                                        {
-                                            let verified =
-                                                if let Some(expected) = self.info.piece_hash(p) {
-                                                    let comp: [u8; 20] = Sha1::digest(&buf).into();
-                                                    comp == expected
-                                                } else if let Some(expected_v2) =
-                                                    self.info.piece_hash_v2(p)
-                                                {
-                                                    let comp: [u8; 32] =
-                                                        self.info.compute_piece_hash_v2(p, &buf);
-                                                    comp == expected_v2
-                                                } else {
-                                                    false
-                                                };
-                                            if verified {
-                                                let _ = self.write_piece(p, Bytes::from(buf)).await;
-                                                self.picker.mark_complete(p);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
+            if synapse_meta::is_padding_file(&file.path, None) {
+                continue;
+            }
+            let rel_path = file.path.clone();
+            let resolver_clone = resolver.clone();
+            let Some(cached_path) =
+                tokio::task::spawn_blocking(move || resolver_clone.find_local_file(&rel_path))
+                    .await
+                    .ok()
+                    .flatten()
+            else {
+                continue;
+            };
+            let Ok(meta) = tokio::fs::symlink_metadata(&cached_path).await else {
+                continue;
+            };
+            if !meta.file_type().is_file() || meta.len() != file.length {
+                continue;
+            }
+            let Some((start_p, end_p)) = self.info.piece_range_for_file(file_idx) else {
+                continue;
+            };
+            let Ok(mut f) = tokio::fs::File::open(&cached_path).await else {
+                continue;
+            };
+            use tokio::io::{AsyncReadExt, AsyncSeekExt};
+            for p in start_p..=end_p {
+                if self.picker.have(p) {
+                    continue;
+                }
+                let piece_len = self.info.piece_len(p);
+                // Only a piece lying wholly inside this file can be checked
+                // from it alone; one that straddles a file boundary is skipped.
+                let locs = self.info.block_locations(p, 0, piece_len);
+                let [loc] = locs.as_slice() else {
+                    continue;
+                };
+                let mut buf = vec![0u8; piece_len as usize];
+                if f.seek(std::io::SeekFrom::Start(loc.file_offset))
+                    .await
+                    .is_ok()
+                    && f.read_exact(&mut buf).await.is_ok()
+                {
+                    let info = self.info.clone();
+                    let (buf, verified) = tokio::task::spawn_blocking(move || {
+                        let verified = if let Some(expected) = info.piece_hash(p) {
+                            let comp: [u8; 20] = Sha1::digest(&buf).into();
+                            comp == expected
+                        } else if let Some(expected_v2) = info.piece_hash_v2(p) {
+                            let comp: [u8; 32] = info.compute_piece_hash_v2(p, &buf);
+                            comp == expected_v2
+                        } else {
+                            false
+                        };
+                        (buf, verified)
+                    })
+                    .await
+                    .unwrap_or_else(|_| (Vec::new(), false));
+                    if verified && self.write_piece(p, Bytes::from(buf)).await.is_ok() {
+                        self.on_piece_write_succeeded(p).await;
                     }
                 }
             }
@@ -4059,14 +4919,18 @@ impl Torrent {
             let mut slices = Vec::new();
             for loc in self.info.block_locations(idx, 0, len) {
                 let normal_path = self.download_dir.join(&self.info.files[loc.file].path);
-                let (path, offset) =
-                    self.part_file
-                        .resolve_read_location(loc.file, loc.file_offset, normal_path);
-                slices.push(ReadJob {
-                    path: Arc::new(path),
-                    offset,
-                    len: loc.piece_range.len(),
-                });
+                for (path, offset, sub_len) in self.part_file.resolve_read_ranges(
+                    loc.file,
+                    loc.file_offset,
+                    loc.piece_range.len(),
+                    &normal_path,
+                ) {
+                    slices.push(ReadJob {
+                        path: Arc::new(path),
+                        offset,
+                        len: sub_len,
+                    });
+                }
             }
             jobs.push(slices);
         }
@@ -4078,20 +4942,37 @@ impl Torrent {
         tokio::spawn(async move {
             let mut hashes = Vec::with_capacity(jobs.len());
             for slices in jobs {
-                let mut hasher = Sha1::new();
+                let mut chunks = Vec::with_capacity(slices.len());
                 for job in slices {
                     match disk.read(job).await {
-                        Ok(data) => hasher.update(&data),
+                        Ok(data) => chunks.push(data),
                         Err(_) => {
                             let _ = tx.send(None).await;
                             return;
                         }
                     }
                 }
-                hashes.push(<[u8; 20]>::from(hasher.finalize()));
+                let Ok(digest) = tokio::task::spawn_blocking(move || {
+                    let mut hasher = Sha1::new();
+                    for data in &chunks {
+                        hasher.update(data);
+                    }
+                    <[u8; 20]>::from(hasher.finalize())
+                })
+                .await
+                else {
+                    let _ = tx.send(None).await;
+                    return;
+                };
+                hashes.push(digest);
             }
-            let tree = synapse_meta::merkle_v1::MerkleTreeV1::from_piece_hashes(&hashes)
-                .filter(|t| Some(t.root()) == root);
+            let tree = tokio::task::spawn_blocking(move || {
+                synapse_meta::merkle_v1::MerkleTreeV1::from_piece_hashes(&hashes)
+                    .filter(|t| Some(t.root()) == root)
+            })
+            .await
+            .ok()
+            .flatten();
             let _ = tx.send(tree).await;
         });
     }
@@ -4225,7 +5106,7 @@ mod tests {
         let mut piece = InProgressPiece::new(data.len() as u32);
         piece.ensure_allocated();
         piece.buf.copy_from_slice(&data);
-        piece.received_blocks.insert(0);
+        piece.mark_received(0);
         torrent.in_progress.insert(0, piece);
 
         torrent.finish_piece(0).await;
@@ -4287,6 +5168,8 @@ mod tests {
             local_addr: None,
             is_outbound: false,
             is_encrypted: true,
+            reserved: [0, 0, 0, 0, 0, 0x10, 0, 0x04],
+            is_utp: false,
         };
 
         let start = std::time::Instant::now();
@@ -4300,6 +5183,655 @@ mod tests {
         assert!(
             elapsed < Duration::from_millis(100),
             "actor stalled for {elapsed:?} on a congested peer outbound queue"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_recheck_handles_more_than_24_pieces_without_deadlock() {
+        let piece_len = 16 * 1024usize;
+        let num_pieces = 40usize;
+        let payload = vec![0x5Au8; piece_len * num_pieces];
+        let mut pieces_bytes = Vec::with_capacity(num_pieces * 20);
+        for chunk in payload.chunks(piece_len) {
+            pieces_bytes.extend_from_slice(&Sha1::digest(chunk));
+        }
+
+        let mut file = BTreeMap::new();
+        file.insert(b"length".to_vec(), BEncode::Int(payload.len() as i64));
+        file.insert(
+            b"path".to_vec(),
+            BEncode::List(vec![BEncode::String(b"big.bin".to_vec())]),
+        );
+
+        let mut info_dict = BTreeMap::new();
+        info_dict.insert(b"name".to_vec(), BEncode::String(b"recheck_40".to_vec()));
+        info_dict.insert(b"piece length".to_vec(), BEncode::Int(piece_len as i64));
+        info_dict.insert(b"pieces".to_vec(), BEncode::String(pieces_bytes));
+        info_dict.insert(b"files".to_vec(), BEncode::List(vec![BEncode::Dict(file)]));
+
+        let mut top = BTreeMap::new();
+        top.insert(b"info".to_vec(), BEncode::Dict(info_dict));
+        let info = Arc::new(Info::from_bencode(BEncode::Dict(top)).unwrap());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let file_path = tmp.path().join("recheck_40").join("big.bin");
+        std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+        std::fs::write(&file_path, &payload).unwrap();
+
+        let disk = Arc::new(DiskEngine::new_blocking(64 * 1024 * 1024));
+        let config = test_config(info, tmp.path().to_path_buf(), disk);
+        let mut torrent = Torrent::new(config, None);
+
+        tokio::time::timeout(Duration::from_secs(10), torrent.handle_recheck())
+            .await
+            .expect("handle_recheck deadlocked on >24 pieces");
+
+        assert_eq!(torrent.picker.completed_count(), num_pieces);
+    }
+
+    #[tokio::test]
+    async fn partial_seed_sends_real_bitfield_instead_of_have_all_and_sets_upload_only() {
+        let mut file0 = BTreeMap::new();
+        file0.insert(b"length".to_vec(), BEncode::Int(16_384));
+        file0.insert(
+            b"path".to_vec(),
+            BEncode::List(vec![BEncode::String(b"want.bin".to_vec())]),
+        );
+        let mut file1 = BTreeMap::new();
+        file1.insert(b"length".to_vec(), BEncode::Int(16_384));
+        file1.insert(
+            b"path".to_vec(),
+            BEncode::List(vec![BEncode::String(b"skip.bin".to_vec())]),
+        );
+        let pieces_bytes = [0xAAu8; 40].to_vec();
+        let mut info_dict = BTreeMap::new();
+        info_dict.insert(b"name".to_vec(), BEncode::String(b"partial".to_vec()));
+        info_dict.insert(b"piece length".to_vec(), BEncode::Int(16_384));
+        info_dict.insert(b"pieces".to_vec(), BEncode::String(pieces_bytes));
+        info_dict.insert(
+            b"files".to_vec(),
+            BEncode::List(vec![BEncode::Dict(file0), BEncode::Dict(file1)]),
+        );
+        let mut top = BTreeMap::new();
+        top.insert(b"info".to_vec(), BEncode::Dict(info_dict));
+        let info = Arc::new(Info::from_bencode(BEncode::Dict(top)).unwrap());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let disk = Arc::new(DiskEngine::new_blocking(1024 * 1024));
+        let config = test_config(info, tmp.path().to_path_buf(), disk);
+        let mut have = Bitfield::new(2);
+        have.set(0);
+        let mut torrent = Torrent::new(config, Some(&have));
+        torrent.apply_file_priority(1, 0);
+        assert!(torrent.picker.is_complete());
+        assert!(!torrent.picker.has_all_pieces());
+
+        let (tx, mut rx) = mpsc::channel(16);
+        let handle = PeerHandle::new_for_test(1, "127.0.0.1:6881".parse().unwrap(), tx);
+        let pinfo = PeerInfo {
+            info_hash: torrent.info.hash,
+            addr: "127.0.0.1:6881".parse().unwrap(),
+            peer_id: [0x22; 20],
+            is_encrypted: false,
+            local_addr: None,
+            is_outbound: false,
+            reserved: [0, 0, 0, 0, 0, 0x10, 0, 0x04],
+            is_utp: false,
+        };
+        torrent.on_connected(handle, pinfo).await;
+
+        let mut saw_upload_only = false;
+        let mut saw_have_all = false;
+        let mut saw_bitfield = None;
+        while let Ok(msg) = rx.try_recv() {
+            match msg {
+                Message::Extension { id: 0, payload } => {
+                    let hs = ExtensionHandshake::decode(&payload).unwrap();
+                    saw_upload_only = hs.upload_only == Some(true);
+                }
+                Message::HaveAll => saw_have_all = true,
+                Message::Bitfield(bits) => saw_bitfield = Some(bits),
+                _ => {}
+            }
+        }
+        assert!(saw_upload_only);
+        assert!(!saw_have_all);
+        let bf = Bitfield::from_bytes(&saw_bitfield.unwrap(), 2).unwrap();
+        assert!(bf.has(0) && !bf.has(1));
+    }
+
+    #[tokio::test]
+    async fn over_capacity_rejects_without_banning_peer() {
+        let data = vec![0xCDu8; 16_384];
+        let info = Arc::new(single_piece_info(&data));
+        let tmp = tempfile::tempdir().unwrap();
+        let disk = Arc::new(DiskEngine::new_blocking(1024 * 1024));
+        let config = test_config(info, tmp.path().to_path_buf(), disk);
+        let mut have = Bitfield::new(1);
+        have.set(0);
+        let mut torrent = Torrent::new(config, Some(&have));
+
+        let (tx, mut rx) = mpsc::channel(32);
+        let handle = PeerHandle::new_for_test(7, "127.0.0.1:6882".parse().unwrap(), tx);
+        let pinfo = PeerInfo {
+            info_hash: torrent.info.hash,
+            addr: "127.0.0.1:6882".parse().unwrap(),
+            peer_id: [0x33; 20],
+            is_encrypted: false,
+            local_addr: None,
+            is_outbound: false,
+            reserved: [0, 0, 0, 0, 0, 0x10, 0, 0x04],
+            is_utp: false,
+        };
+        torrent.on_connected(handle, pinfo).await;
+        if let Some(p) = torrent.peers.get_mut(&7) {
+            p.am_choking = false;
+            p.pending_serves
+                .store(MAX_PENDING_SERVES_PER_PEER, Ordering::Relaxed);
+        }
+        while rx.try_recv().is_ok() {}
+
+        for _ in 0..(MAX_INVALID_REQUESTS + 5) {
+            torrent
+                .on_message(
+                    7,
+                    Message::Request {
+                        index: 0,
+                        begin: 0,
+                        length: 16_384,
+                    },
+                )
+                .await;
+        }
+        assert!(torrent.peers.contains_key(&7));
+        assert_eq!(torrent.peers.get(&7).unwrap().invalid_requests, 0);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Message::RejectRequest {
+                index: 0,
+                begin: 0,
+                length: 16_384
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn peer_without_fast_or_extension_bits_only_receives_bitfield_and_no_reject() {
+        let data = vec![0xEFu8; 16_384];
+        let info = Arc::new(single_piece_info(&data));
+        let tmp = tempfile::tempdir().unwrap();
+        let disk = Arc::new(DiskEngine::new_blocking(1024 * 1024));
+        let config = test_config(info, tmp.path().to_path_buf(), disk);
+        let mut have = Bitfield::new(1);
+        have.set(0);
+        let mut torrent = Torrent::new(config, Some(&have));
+
+        let (tx, mut rx) = mpsc::channel(32);
+        let handle = PeerHandle::new_for_test(9, "127.0.0.1:6889".parse().unwrap(), tx);
+        let pinfo = PeerInfo {
+            info_hash: torrent.info.hash,
+            addr: "127.0.0.1:6889".parse().unwrap(),
+            peer_id: [0x44; 20],
+            is_encrypted: false,
+            local_addr: None,
+            is_outbound: false,
+            reserved: [0; 8],
+            is_utp: false,
+        };
+        torrent.on_connected(handle, pinfo).await;
+
+        let mut initial = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            initial.push(msg);
+        }
+        assert!(
+            initial.iter().any(|m| matches!(m, Message::Bitfield(_))),
+            "expected Bitfield for non-Fast full seed, got {initial:?}"
+        );
+        assert!(
+            !initial.iter().any(|m| matches!(
+                m,
+                Message::HaveAll | Message::AllowedFast(_) | Message::Extension { .. }
+            )),
+            "must not send Fast/Extension messages to peer with zero reserved bits: {initial:?}"
+        );
+
+        torrent
+            .on_message(
+                9,
+                Message::Request {
+                    index: 0,
+                    begin: 0,
+                    length: 16_384,
+                },
+            )
+            .await;
+        assert!(
+            rx.try_recv().is_err(),
+            "must not send RejectRequest to peer without Fast Extension"
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_request_caches_verified_paths_and_clears_cache_on_set_location() {
+        let data = vec![0x5Eu8; 16_384];
+        let info = Arc::new(single_piece_info(&data));
+        let tmp1 = tempfile::tempdir().unwrap();
+        let file1 = tmp1.path().join("write_offload_test").join("file.bin");
+        std::fs::create_dir_all(file1.parent().unwrap()).unwrap();
+        std::fs::write(&file1, &data).unwrap();
+
+        let disk = Arc::new(DiskEngine::new_blocking(1024 * 1024));
+        let config = test_config(info, tmp1.path().to_path_buf(), disk);
+        let mut have = Bitfield::new(1);
+        have.set(0);
+        let mut torrent = Torrent::new(config, Some(&have));
+
+        let (tx, mut rx) = mpsc::channel(32);
+        let handle = PeerHandle::new_for_test(11, "127.0.0.1:6891".parse().unwrap(), tx);
+        let pinfo = PeerInfo {
+            info_hash: torrent.info.hash,
+            addr: "127.0.0.1:6891".parse().unwrap(),
+            peer_id: [0x34; 20],
+            is_encrypted: false,
+            local_addr: None,
+            is_outbound: false,
+            reserved: [0, 0, 0, 0, 0, 0x10, 0, 0x04],
+            is_utp: false,
+        };
+        torrent.on_connected(handle, pinfo).await;
+        if let Some(p) = torrent.peers.get_mut(&11) {
+            p.am_choking = false;
+        }
+        while rx.try_recv().is_ok() {}
+
+        assert!(torrent.verified_serve_files.is_empty());
+        torrent
+            .on_message(
+                11,
+                Message::Request {
+                    index: 0,
+                    begin: 0,
+                    length: 16_384,
+                },
+            )
+            .await;
+
+        assert!(
+            torrent.verified_serve_files.contains_key(&0),
+            "single-slice upload should populate verified_serve_files"
+        );
+        let msg = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("timed out waiting for served piece")
+            .expect("channel closed");
+        match msg {
+            Message::Piece {
+                index: 0,
+                begin: 0,
+                data: got,
+            } => assert_eq!(&got[..], &data[..]),
+            other => panic!("expected Piece message, got {other:?}"),
+        }
+
+        // Move to a new location (without moving files) and verify cache is cleared so a
+        // symlink at the new location is detected and rejected.
+        let tmp2 = tempfile::tempdir().unwrap();
+        let file2_parent = tmp2.path().join("write_offload_test");
+        std::fs::create_dir_all(&file2_parent).unwrap();
+        let secret = tmp2.path().join("outside_secret.bin");
+        std::fs::write(&secret, &data).unwrap();
+        let file2 = file2_parent.join("file.bin");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&secret, &file2).unwrap();
+        #[cfg(not(unix))]
+        std::fs::write(&file2, &data).unwrap();
+
+        torrent
+            .handle_set_location(tmp2.path().to_path_buf(), false)
+            .await;
+        assert!(
+            torrent.verified_serve_files.is_empty(),
+            "handle_set_location must clear verified_serve_files"
+        );
+
+        #[cfg(unix)]
+        {
+            torrent
+                .on_message(
+                    11,
+                    Message::Request {
+                        index: 0,
+                        begin: 0,
+                        length: 16_384,
+                    },
+                )
+                .await;
+            assert!(
+                !torrent.verified_serve_files.contains_key(&0),
+                "symlinked file must not be cached"
+            );
+            let rej = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("timed out waiting for RejectRequest")
+                .expect("channel closed");
+            assert!(
+                matches!(
+                    rej,
+                    Message::RejectRequest {
+                        index: 0,
+                        begin: 0,
+                        length: 16_384
+                    }
+                ),
+                "expected RejectRequest on symlinked file, got {rej:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn serve_request_rejects_symlink_without_caching() {
+        let data = vec![0x3Cu8; 16_384];
+        let info = Arc::new(single_piece_info(&data));
+        let tmp = tempfile::tempdir().unwrap();
+        let secret = tmp.path().join("secret.bin");
+        std::fs::write(&secret, &data).unwrap();
+        let link = tmp.path().join("write_offload_test").join("file.bin");
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&secret, &link).unwrap();
+
+        let disk = Arc::new(DiskEngine::new_blocking(1024 * 1024));
+        let config = test_config(info, tmp.path().to_path_buf(), disk);
+        let mut have = Bitfield::new(1);
+        have.set(0);
+        let mut torrent = Torrent::new(config, Some(&have));
+
+        let (tx, mut rx) = mpsc::channel(32);
+        let handle = PeerHandle::new_for_test(12, "127.0.0.1:6892".parse().unwrap(), tx);
+        let pinfo = PeerInfo {
+            info_hash: torrent.info.hash,
+            addr: "127.0.0.1:6892".parse().unwrap(),
+            peer_id: [0x35; 20],
+            is_encrypted: false,
+            local_addr: None,
+            is_outbound: false,
+            reserved: [0, 0, 0, 0, 0, 0x10, 0, 0x04],
+            is_utp: false,
+        };
+        torrent.on_connected(handle, pinfo).await;
+        if let Some(p) = torrent.peers.get_mut(&12) {
+            p.am_choking = false;
+        }
+        while rx.try_recv().is_ok() {}
+
+        torrent
+            .on_message(
+                12,
+                Message::Request {
+                    index: 0,
+                    begin: 0,
+                    length: 16_384,
+                },
+            )
+            .await;
+
+        assert!(torrent.verified_serve_files.is_empty());
+        let rej = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("timed out waiting for RejectRequest")
+            .expect("channel closed");
+        assert!(matches!(
+            rej,
+            Message::RejectRequest {
+                index: 0,
+                begin: 0,
+                length: 16_384
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn pex_enabled_false_omits_ut_pex_and_ignores_incoming_and_broadcast() {
+        let data = vec![0x42u8; 16_384];
+        let info = Arc::new(single_piece_info(&data));
+        let tmp = tempfile::tempdir().unwrap();
+        let disk = Arc::new(DiskEngine::new_blocking(1024 * 1024));
+        let mut config = test_config(info, tmp.path().to_path_buf(), disk);
+        config.settings.write().pex_enabled = false;
+        let (disc_tx, mut disc_rx) = mpsc::channel(8);
+        config.on_peers_discovered = Some(disc_tx);
+
+        let mut torrent = Torrent::new(config, None);
+        let (tx, mut rx) = mpsc::channel(32);
+        let handle = PeerHandle::new_for_test(20, "127.0.0.1:6900".parse().unwrap(), tx);
+        let pinfo = PeerInfo {
+            info_hash: torrent.info.hash,
+            addr: "127.0.0.1:6900".parse().unwrap(),
+            peer_id: [0x36; 20],
+            is_encrypted: false,
+            local_addr: None,
+            is_outbound: false,
+            reserved: [0, 0, 0, 0, 0, 0x10, 0, 0],
+            is_utp: false,
+        };
+        torrent.on_connected(handle, pinfo).await;
+
+        let mut found_ext_hs = false;
+        while let Ok(msg) = rx.try_recv() {
+            if let Message::Extension { id: 0, payload } = msg {
+                let hs = ExtensionHandshake::decode(&payload).expect("valid ext handshake");
+                assert!(
+                    !hs.m.contains_key("ut_pex"),
+                    "ut_pex must be omitted from extension handshake when pex_enabled=false"
+                );
+                found_ext_hs = true;
+            }
+        }
+        assert!(found_ext_hs, "expected outbound extension handshake");
+
+        // Peer advertises ut_pex support back to us.
+        let peer_hs = ExtensionHandshake::for_torrent(false, None);
+        let peer_ut_pex_id = *peer_hs.m.get("ut_pex").unwrap();
+        torrent
+            .on_message(
+                20,
+                Message::Extension {
+                    id: 0,
+                    payload: peer_hs.encode(),
+                },
+            )
+            .await;
+
+        // Incoming ut_pex message must be ignored when pex_enabled=false.
+        let mut incoming_pex = synapse_wire::UtPexMessage::new();
+        incoming_pex
+            .added_v4
+            .push("203.0.113.9:6881".parse().unwrap());
+        incoming_pex.added_v4_flags.push(0);
+        torrent
+            .on_message(
+                20,
+                Message::Extension {
+                    id: EXT_ID_UT_PEX,
+                    payload: incoming_pex.encode(),
+                },
+            )
+            .await;
+        assert!(
+            disc_rx.try_recv().is_err(),
+            "must ignore incoming ut_pex when pex_enabled=false"
+        );
+
+        // Outbound PEX broadcast must no-op when pex_enabled=false even if peers are queued.
+        torrent
+            .pex
+            .peer_connected("203.0.113.10:6882".parse().unwrap());
+        torrent.last_pex_broadcast = std::time::Instant::now() - Duration::from_secs(120);
+        while rx.try_recv().is_ok() {}
+        torrent.maybe_broadcast_pex().await;
+        while let Ok(msg) = rx.try_recv() {
+            if let Message::Extension { id, .. } = msg {
+                assert_ne!(
+                    id, peer_ut_pex_id,
+                    "must not broadcast ut_pex when pex_enabled=false"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn peer_snapshot_reports_real_is_utp_and_flag() {
+        let data = vec![0x43u8; 16_384];
+        let info = Arc::new(single_piece_info(&data));
+        let tmp = tempfile::tempdir().unwrap();
+        let disk = Arc::new(DiskEngine::new_blocking(1024 * 1024));
+        let config = test_config(info, tmp.path().to_path_buf(), disk);
+        let live_peers = config.live_peers.clone();
+        let mut torrent = Torrent::new(config, None);
+
+        let (tx, _rx) = mpsc::channel(16);
+        let handle = PeerHandle::new_for_test(21, "127.0.0.1:6901".parse().unwrap(), tx);
+        let pinfo = PeerInfo {
+            info_hash: torrent.info.hash,
+            addr: "127.0.0.1:6901".parse().unwrap(),
+            peer_id: [0x37; 20],
+            is_encrypted: true,
+            local_addr: None,
+            is_outbound: true,
+            reserved: [0; 8],
+            is_utp: true,
+        };
+        torrent.on_connected(handle, pinfo).await;
+        torrent.tick().await;
+
+        let snaps = live_peers.read();
+        assert_eq!(snaps.len(), 1);
+        assert!(snaps[0].is_utp);
+        assert!(snaps[0].flags.contains('P'));
+        assert!(snaps[0].flags.contains('E'));
+    }
+
+    #[tokio::test]
+    async fn message_cancel_aborts_throttled_serve_request_without_sending_piece() {
+        let data = vec![0x44u8; 16_384];
+        let info = Arc::new(single_piece_info(&data));
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join(&info.files[0].path);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, &data).unwrap();
+
+        let disk = Arc::new(DiskEngine::new_blocking(1024 * 1024));
+        let config = test_config(info, tmp.path().to_path_buf(), disk);
+        let mut have = Bitfield::new(1);
+        have.set(0);
+        let mut torrent = Torrent::new(config, Some(&have));
+        // Configure 1 B/s upload cap and drain initial burst so the next serve_request
+        // genuinely parks waiting on `limiter.consume`.
+        torrent.set_torrent_rate_limits(0, 1);
+        torrent.torrent_upload_bucket.consume(16_384).await;
+
+        let (tx, mut rx) = mpsc::channel(32);
+        let handle = PeerHandle::new_for_test(22, "127.0.0.1:6902".parse().unwrap(), tx);
+        let pinfo = PeerInfo {
+            info_hash: torrent.info.hash,
+            addr: "127.0.0.1:6902".parse().unwrap(),
+            peer_id: [0x38; 20],
+            is_encrypted: false,
+            local_addr: None,
+            is_outbound: false,
+            reserved: [0, 0, 0, 0, 0, 0x10, 0, 0x04],
+            is_utp: false,
+        };
+        torrent.on_connected(handle, pinfo).await;
+        let pending_serves = {
+            let p = torrent.peers.get_mut(&22).unwrap();
+            p.am_choking = false;
+            p.pending_serves.clone()
+        };
+        while rx.try_recv().is_ok() {}
+
+        torrent
+            .on_message(
+                22,
+                Message::Request {
+                    index: 0,
+                    begin: 0,
+                    length: 16_384,
+                },
+            )
+            .await;
+        assert_eq!(pending_serves.load(Ordering::Relaxed), 1);
+
+        torrent
+            .on_message(
+                22,
+                Message::Cancel {
+                    index: 0,
+                    begin: 0,
+                    length: 16_384,
+                },
+            )
+            .await;
+
+        tokio::time::timeout(Duration::from_millis(500), async {
+            while pending_serves.load(Ordering::Relaxed) > 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("cancelled serve_request should drop slot promptly");
+
+        assert!(
+            !matches!(rx.try_recv(), Ok(Message::Piece { .. })),
+            "cancelled request must not send Message::Piece"
+        );
+        assert_eq!(torrent.total_uploaded.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn local_webseed_resolver_completes_torrent_in_run_and_updates_stats_and_bitfield() {
+        let data = vec![0x77u8; 16_384];
+        let info = Arc::new(single_piece_info(&data));
+        let dl_dir = tempfile::tempdir().unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cached_file = cache_dir.path().join(&info.files[0].path);
+        std::fs::create_dir_all(cached_file.parent().unwrap()).unwrap();
+        std::fs::write(&cached_file, &data).unwrap();
+
+        let disk = Arc::new(DiskEngine::new_blocking(1024 * 1024));
+        let mut config = test_config(info.clone(), dl_dir.path().to_path_buf(), disk);
+        let (complete_tx, complete_rx) = oneshot::channel();
+        config.on_torrent_completed = Some(complete_tx);
+        config.local_webseed_resolver = Some(Arc::new(
+            crate::local_webseed::LocalWebSeedResolver::new(vec![cache_dir.path().to_path_buf()]),
+        ));
+        let stats_ref = config.stats.clone();
+        let bitfield_ref = config.bitfield.clone();
+
+        let mut torrent = Torrent::new(config, None);
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        torrent.set_stop_signal(stop_rx);
+        let (_ev_tx, ev_rx) = mpsc::channel(8);
+        let (_cmd_tx, cmd_rx) = mpsc::channel(8);
+
+        let actor = tokio::spawn(torrent.run(ev_rx, cmd_rx));
+        tokio::time::timeout(Duration::from_secs(5), complete_rx)
+            .await
+            .expect("LocalWebSeedResolver completion timed out")
+            .expect("completion channel dropped");
+        let _ = stop_tx.send(true);
+        tokio::time::timeout(Duration::from_secs(5), actor)
+            .await
+            .expect("torrent actor did not exit")
+            .unwrap();
+
+        assert!((stats_ref.read().progress - 1.0).abs() < 1e-6);
+        assert_eq!(stats_ref.read().state, SwarmState::Seeding);
+        assert!(bitfield_ref.read().as_ref().is_some_and(|bf| bf.has(0)));
+        assert_eq!(
+            std::fs::read(dl_dir.path().join(&info.files[0].path)).unwrap(),
+            data
         );
     }
 }

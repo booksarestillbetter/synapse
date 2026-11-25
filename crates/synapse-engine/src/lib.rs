@@ -33,7 +33,7 @@ pub mod v2_layers;
 pub mod webseed;
 pub mod zeroconf;
 
-pub use alert::{Alert, AlertStream};
+pub use alert::{Alert, AlertCategory, AlertStream};
 pub use announcer::{
     AnnounceScheduler, AnnounceStats, Announcer, PeerDiscoverySource, PeerEventRouter,
     TrackerReport,

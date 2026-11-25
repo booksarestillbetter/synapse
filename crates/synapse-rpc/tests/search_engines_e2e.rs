@@ -18,7 +18,8 @@ const RSS: &str = r#"<?xml version="1.0"?>
 <torrent:seeds>42</torrent:seeds><torrent:peers>7</torrent:peers></item>
 </channel></rss>"#;
 
-/// A one-shot-per-connection HTTP server that records the request line and serves `RSS`.
+/// A one-shot-per-connection HTTP server that records the request line and serves either
+/// `.btsearch` descriptions or `RSS` search responses.
 async fn indexer() -> (u16, Arc<parking_lot::Mutex<Vec<String>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -34,11 +35,23 @@ async fn indexer() -> (u16, Arc<parking_lot::Mutex<Vec<String>>>) {
                 let mut buf = vec![0u8; 4096];
                 let n = sock.read(&mut buf).await.unwrap_or(0);
                 let head = String::from_utf8_lossy(&buf[..n]);
-                log.lock()
-                    .push(head.lines().next().unwrap_or("").to_string());
-                let body = RSS;
+                let req_line = head.lines().next().unwrap_or("").to_string();
+                let path = req_line.split_whitespace().nth(1).unwrap_or("/");
+                log.lock().push(req_line.clone());
+                let (ctype, body): (&str, String) = if path == "/example.btsearch" {
+                    (
+                        "application/opensearchdescription+xml",
+                        format!(
+                            r#"<OpenSearchDescription xmlns="http://a9.com/-/spec/opensearch/1.1/"><ShortName>Example</ShortName><Description>d</Description><Url type="application/rss+xml" template="http://127.0.0.1:{port}/rss?q={{searchTerms}}"/></OpenSearchDescription>"#
+                        ),
+                    )
+                } else if path == "/bad.btsearch" {
+                    ("text/xml", "<rss/>".to_string())
+                } else {
+                    ("application/rss+xml", RSS.to_string())
+                };
                 let resp = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/rss+xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    "HTTP/1.1 200 OK\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
                 );
                 let _ = sock.write_all(resp.as_bytes()).await;
@@ -92,13 +105,24 @@ async fn configured_engines_are_queried_and_their_results_returned() {
         StatusCode::NOT_FOUND
     );
 
-    // Register the engine from its .btsearch file.
-    let add = Request::builder()
+    // Register the engine over HTTP URL (local file paths MUST be rejected over HTTP API).
+    let reject_local = Request::builder()
         .method("POST")
         .uri("/api/v1/search/engines")
         .header("Content-Type", "application/json")
         .body(Body::from(
             serde_json::json!({ "source": file.to_string_lossy() }).to_string(),
+        ))
+        .unwrap();
+    assert_eq!(json_of(&app, reject_local).await.0, StatusCode::BAD_REQUEST);
+
+    let add = Request::builder()
+        .method("POST")
+        .uri("/api/v1/search/engines")
+        .header("Content-Type", "application/json")
+        .body(Body::from(
+            serde_json::json!({ "source": format!("http://127.0.0.1:{port}/example.btsearch") })
+                .to_string(),
         ))
         .unwrap();
     let (status, body) = json_of(&app, add).await;
@@ -166,14 +190,13 @@ async fn configured_engines_are_queried_and_their_results_returned() {
     )
     .await;
     assert_eq!(listed["count"], 1);
-    let bad = dir.path().join("bad.btsearch");
-    std::fs::write(&bad, "<rss/>").unwrap();
     let add_bad = Request::builder()
         .method("POST")
         .uri("/api/v1/search/engines")
         .header("Content-Type", "application/json")
         .body(Body::from(
-            serde_json::json!({ "source": bad.to_string_lossy() }).to_string(),
+            serde_json::json!({ "source": format!("http://127.0.0.1:{port}/bad.btsearch") })
+                .to_string(),
         ))
         .unwrap();
     assert_eq!(json_of(&app, add_bad).await.0, StatusCode::BAD_REQUEST);

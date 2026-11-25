@@ -151,22 +151,29 @@ impl UtpPacket {
         self
     }
 
+    /// Serializes this uTP packet into `dst` without allocating a new `Bytes` buffer.
+    pub fn encode_into(&self, dst: &mut BytesMut) {
+        let sack_len = self.sack_bitmask.as_ref().map(|s| 2 + s.len()).unwrap_or(0);
+        dst.reserve(UTP_HEADER_LEN + sack_len + self.payload.len());
+
+        self.header.encode(dst);
+
+        if let Some(ref sack) = self.sack_bitmask {
+            dst.put_u8(UTP_EXT_NONE); // next extension: none
+            dst.put_u8(sack.len() as u8);
+            dst.put_slice(sack);
+        }
+
+        dst.put_slice(&self.payload);
+    }
+
     pub fn encode(&self) -> Bytes {
         let mut buf = BytesMut::with_capacity(
             UTP_HEADER_LEN
                 + self.sack_bitmask.as_ref().map(|s| 2 + s.len()).unwrap_or(0)
                 + self.payload.len(),
         );
-
-        self.header.encode(&mut buf);
-
-        if let Some(ref sack) = self.sack_bitmask {
-            buf.put_u8(UTP_EXT_NONE); // next extension: none
-            buf.put_u8(sack.len() as u8);
-            buf.put_slice(sack);
-        }
-
-        buf.put_slice(&self.payload);
+        self.encode_into(&mut buf);
         buf.freeze()
     }
 
@@ -203,18 +210,19 @@ impl UtpPacket {
     }
 }
 
-/// Builds a BEP 29 Selective ACK (SACK) bitmask.
+/// Builds a BEP 29 Selective ACK (SACK) bitmask from any cloneable sequence iterator.
 ///
 /// The bitmask length is at least 4 bytes and padded to a multiple of 4 bytes.
 /// Bit 0 of byte 0 corresponds to `ack_nr + 2`. Bit `i` corresponds to `ack_nr + 2 + i`.
-pub fn build_sack_bitmask(ack_nr: u16, received_seqs: &[u16]) -> Option<Vec<u8>> {
-    if received_seqs.is_empty() {
-        return None;
-    }
-
+pub fn build_sack_bitmask_iter<I>(ack_nr: u16, received_seqs: I) -> Option<Vec<u8>>
+where
+    I: IntoIterator<Item = u16> + Clone,
+{
     // Find highest received sequence beyond ack_nr + 1
     let mut max_offset: i32 = -1;
-    for &seq in received_seqs {
+    let mut has_any = false;
+    for seq in received_seqs.clone() {
+        has_any = true;
         let diff = (seq.wrapping_sub(ack_nr) as i16) as i32;
         if diff >= 2 {
             let offset = diff - 2;
@@ -224,7 +232,7 @@ pub fn build_sack_bitmask(ack_nr: u16, received_seqs: &[u16]) -> Option<Vec<u8>>
         }
     }
 
-    if max_offset < 0 {
+    if !has_any || max_offset < 0 {
         return None;
     }
 
@@ -233,7 +241,7 @@ pub fn build_sack_bitmask(ack_nr: u16, received_seqs: &[u16]) -> Option<Vec<u8>>
     let num_bytes = (num_bytes + 3) & !3;
     let mut bitmask = vec![0u8; num_bytes];
 
-    for &seq in received_seqs {
+    for seq in received_seqs {
         let diff = (seq.wrapping_sub(ack_nr) as i16) as i32;
         if diff >= 2 {
             let offset = (diff - 2) as usize;
@@ -246,6 +254,14 @@ pub fn build_sack_bitmask(ack_nr: u16, received_seqs: &[u16]) -> Option<Vec<u8>>
     }
 
     Some(bitmask)
+}
+
+/// Builds a BEP 29 Selective ACK (SACK) bitmask.
+///
+/// The bitmask length is at least 4 bytes and padded to a multiple of 4 bytes.
+/// Bit 0 of byte 0 corresponds to `ack_nr + 2`. Bit `i` corresponds to `ack_nr + 2 + i`.
+pub fn build_sack_bitmask(ack_nr: u16, received_seqs: &[u16]) -> Option<Vec<u8>> {
+    build_sack_bitmask_iter(ack_nr, received_seqs.iter().copied())
 }
 
 /// Parses a BEP 29 Selective ACK (SACK) bitmask into a list of acknowledged sequence numbers.

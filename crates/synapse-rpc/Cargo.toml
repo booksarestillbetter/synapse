@@ -22,6 +22,8 @@ dashmap = "6.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"
+sha2 = "0.10"
+subtle = "2"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 url = "2.5"
 axum = { version = "0.7", default-features = false, features = ["json", "tokio", "query"] }
@@ -32,6 +34,9 @@ synapse-config = { path = "../synapse-config" }
 synapse-proto = { path = "../synapse-proto" }
 synapse-picker = { path = "../synapse-picker" }
 synapse-tracker = { path = "../synapse-tracker" }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }

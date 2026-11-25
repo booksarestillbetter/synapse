@@ -47,6 +47,7 @@ pub struct FeedManager {
     /// Feeds the operator removed over the API; configured feeds with these URLs stay removed.
     removed: RwLock<HashSet<String>>,
     state_path: RwLock<Option<PathBuf>>,
+    state_lock: parking_lot::Mutex<()>,
 }
 
 /// The items already handled, in insertion order so the oldest can be forgotten.
@@ -116,6 +117,7 @@ impl FeedManager {
             status: RwLock::new(status_map),
             removed: RwLock::new(HashSet::new()),
             state_path: RwLock::new(None),
+            state_lock: parking_lot::Mutex::new(()),
         }
     }
 
@@ -145,6 +147,8 @@ impl FeedManager {
     }
 
     fn save_state(&self) {
+        static TEMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let _guard = self.state_lock.lock();
         let Some(path) = self.state_path.read().clone() else {
             return;
         };
@@ -156,9 +160,19 @@ impl FeedManager {
         let Ok(bytes) = serde_json::to_vec(&state) else {
             return;
         };
-        let tmp = path.with_extension("tmp");
+        let seq = TEMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = PathBuf::from(format!(
+            "{}.tmp.{}.{}",
+            path.display(),
+            std::process::id(),
+            seq
+        ));
         if std::fs::write(&tmp, bytes).is_ok() {
-            let _ = std::fs::rename(&tmp, &path);
+            if std::fs::rename(&tmp, &path).is_err() {
+                let _ = std::fs::remove_file(&tmp);
+            }
+        } else {
+            let _ = std::fs::remove_file(&tmp);
         }
     }
 
@@ -418,19 +432,33 @@ pub fn item_dedup_key(item: &FeedItem) -> String {
     }
 }
 
-/// Resolves `synapse_meta::Info` metadata from a `FeedItem` link, torrent URL, or info_hash.
-pub async fn resolve_torrent_from_item(item: &FeedItem) -> Result<Info, String> {
-    // 1. Direct magnet fast-path
+/// Strategy selected for resolving a `FeedItem` into `synapse_meta::Info`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FeedResolveStrategy {
+    Magnet(String),
+    HttpTorrent(String),
+    InfoHashMagnet(String),
+}
+
+/// Chooses the torrent resolution source in priority order:
+/// 1. Explicit `magnet:?` URI in enclosure (`torrent_url`) or item `link`
+/// 2. HTTP/HTTPS `.torrent` enclosure (`torrent_url`) — preserves private trackers & passkeys
+/// 3. Bare `<torrent:infoHash>` magnet fallback
+/// 4. HTTP/HTTPS item `link`
+pub fn select_resolve_strategy(item: &FeedItem) -> Result<FeedResolveStrategy, String> {
     if let Some(ref turl) = item.torrent_url {
         if turl.starts_with("magnet:?") {
-            return Info::from_magnet(turl).map_err(|e| format!("Invalid magnet URI: {e}"));
+            return Ok(FeedResolveStrategy::Magnet(turl.clone()));
         }
     }
     if item.link.starts_with("magnet:?") {
-        return Info::from_magnet(&item.link).map_err(|e| format!("Invalid magnet URI: {e}"));
+        return Ok(FeedResolveStrategy::Magnet(item.link.clone()));
     }
-
-    // 2. Info-hash fast-path
+    if let Some(ref turl) = item.torrent_url {
+        if turl.starts_with("http://") || turl.starts_with("https://") {
+            return Ok(FeedResolveStrategy::HttpTorrent(turl.clone()));
+        }
+    }
     if let Some(ih) = item.info_hash {
         let encoded_title: String =
             url::form_urlencoded::byte_serialize(item.title.as_bytes()).collect();
@@ -439,37 +467,46 @@ pub async fn resolve_torrent_from_item(item: &FeedItem) -> Result<Info, String> 
             hex::encode(ih),
             encoded_title
         );
-        return Info::from_magnet(&magnet).map_err(|e| format!("Invalid magnet URI: {e}"));
+        return Ok(FeedResolveStrategy::InfoHashMagnet(magnet));
     }
-
-    // 3. HTTP / HTTPS .torrent download
-    let download_url = item.torrent_url.as_deref().unwrap_or(&item.link);
-    if download_url.starts_with("http://") || download_url.starts_with("https://") {
-        let parsed_url = Url::parse(download_url).map_err(|e| format!("Malformed URL: {e}"))?;
-        let opts = FetchOptions {
-            timeout: FEED_TIMEOUT,
-            max_body: synapse_meta::MAX_TORRENT_FILE_BYTES,
-            user_agent: concat!("Synapse/", env!("CARGO_PKG_VERSION")),
-            // The URL comes from a remote feed, not from the operator: it must not be able to
-            // aim the daemon at the local network.
-            local: LocalPolicy::Deny,
-            range: None,
-        };
-
-        let fetched = fetch(&parsed_url, &opts)
-            .await
-            .map_err(|e| format!("Failed to download torrent file: {e}"))?;
-
-        if !(200..300).contains(&fetched.status) {
-            return Err(format!("Remote server returned HTTP {}", fetched.status));
-        }
-
-        let bencode = synapse_bencode::decode_buf(&fetched.body)
-            .map_err(|e| format!("Invalid bencode format: {e}"))?;
-        return Info::from_bencode(bencode).map_err(|e| format!("Invalid .torrent metadata: {e}"));
+    if item.link.starts_with("http://") || item.link.starts_with("https://") {
+        return Ok(FeedResolveStrategy::HttpTorrent(item.link.clone()));
     }
-
     Err("No valid download link, torrent URL, or info hash found in feed item".to_string())
+}
+
+/// Resolves `synapse_meta::Info` metadata from a `FeedItem` link, torrent URL, or info_hash.
+pub async fn resolve_torrent_from_item(item: &FeedItem) -> Result<Info, String> {
+    match select_resolve_strategy(item)? {
+        FeedResolveStrategy::Magnet(uri) | FeedResolveStrategy::InfoHashMagnet(uri) => {
+            Info::from_magnet(&uri).map_err(|e| format!("Invalid magnet URI: {e}"))
+        }
+        FeedResolveStrategy::HttpTorrent(download_url) => {
+            let parsed_url =
+                Url::parse(&download_url).map_err(|e| format!("Malformed URL: {e}"))?;
+            let opts = FetchOptions {
+                timeout: FEED_TIMEOUT,
+                max_body: synapse_meta::MAX_TORRENT_FILE_BYTES,
+                user_agent: concat!("Synapse/", env!("CARGO_PKG_VERSION")),
+                // The URL comes from a remote feed, not from the operator: it must not be able to
+                // aim the daemon at the local network.
+                local: LocalPolicy::Deny,
+                range: None,
+            };
+
+            let fetched = fetch(&parsed_url, &opts)
+                .await
+                .map_err(|e| format!("Failed to download torrent file: {e}"))?;
+
+            if !(200..300).contains(&fetched.status) {
+                return Err(format!("Remote server returned HTTP {}", fetched.status));
+            }
+
+            let bencode = synapse_bencode::decode_buf(&fetched.body)
+                .map_err(|e| format!("Invalid bencode format: {e}"))?;
+            Info::from_bencode(bencode).map_err(|e| format!("Invalid .torrent metadata: {e}"))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -536,5 +573,34 @@ mod tests {
 
         assert!(mgr.remove_feed("https://example.com/rss"));
         assert_eq!(mgr.list_feeds().len(), 0);
+    }
+
+    #[test]
+    fn http_enclosure_takes_precedence_over_bare_info_hash() {
+        let with_enclosure = FeedItem {
+            title: "Private Release".into(),
+            link: "https://tracker.example.org/details/1".into(),
+            torrent_url: Some("https://tracker.example.org/dl/1.torrent?passkey=abc".into()),
+            info_hash: Some([0xAB; 20]),
+            ..Default::default()
+        };
+        assert_eq!(
+            select_resolve_strategy(&with_enclosure).unwrap(),
+            FeedResolveStrategy::HttpTorrent(
+                "https://tracker.example.org/dl/1.torrent?passkey=abc".into()
+            )
+        );
+
+        let only_hash = FeedItem {
+            title: "Public Hash".into(),
+            link: "https://tracker.example.org/details/2".into(),
+            torrent_url: None,
+            info_hash: Some([0xCD; 20]),
+            ..Default::default()
+        };
+        assert!(matches!(
+            select_resolve_strategy(&only_hash).unwrap(),
+            FeedResolveStrategy::InfoHashMagnet(uri) if uri.contains("cdcdcdcd")
+        ));
     }
 }

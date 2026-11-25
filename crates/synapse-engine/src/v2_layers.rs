@@ -86,6 +86,7 @@ pub struct LayerFetch {
     geo: LayerGeometry,
     hashes: Vec<Option<[u8; 32]>>,
     chunks: Vec<Chunk>,
+    next_peer_cursor: usize,
 }
 
 impl LayerFetch {
@@ -99,6 +100,7 @@ impl LayerFetch {
                 .map(|_| Chunk::Missing { retry_at: now })
                 .collect(),
             geo,
+            next_peer_cursor: 0,
         })
     }
 
@@ -118,7 +120,6 @@ impl LayerFetch {
         }
         let mut outstanding = self.chunks.iter().filter(|c| matches!(c, Chunk::Requested { at, .. } if now.duration_since(*at) < REQUEST_TIMEOUT)).count();
         let mut out = Vec::new();
-        let mut next_peer = 0usize;
         for (i, chunk) in self.chunks.iter_mut().enumerate() {
             if outstanding >= MAX_OUTSTANDING {
                 break;
@@ -131,8 +132,9 @@ impl LayerFetch {
             if !due {
                 continue;
             }
-            let peer = peers[next_peer % peers.len()];
-            next_peer += 1;
+            let idx = self.next_peer_cursor % peers.len();
+            let peer = peers[idx];
+            self.next_peer_cursor = (idx + 1) % peers.len();
             *chunk = Chunk::Requested { peer, at: now };
             outstanding += 1;
             out.push(LayerRequest {
@@ -154,11 +156,12 @@ impl LayerFetch {
         }
     }
 
-    /// A `hash reject` for the chunk at `index`: try again later, from anyone.
-    pub fn on_reject(&mut self, index: u32, now: Instant) {
+    /// A `hash reject` for the chunk at `index`: try again later, only if the reject came
+    /// from the peer currently holding that outstanding chunk request.
+    pub fn on_reject(&mut self, from_peer: PeerId, index: u32, now: Instant) {
         let i = index as usize / self.geo.chunk;
         if let Some(c) = self.chunks.get_mut(i) {
-            if matches!(c, Chunk::Requested { .. }) {
+            if matches!(c, Chunk::Requested { peer, .. } if *peer == from_peer) {
                 *c = Chunk::Missing {
                     retry_at: now + REJECT_BACKOFF,
                 };
@@ -378,10 +381,41 @@ mod tests {
         // After the timeout they are handed out again, to whoever is connected.
         let again = fetch.due_requests(t0 + REQUEST_TIMEOUT + Duration::from_secs(1), &[2]);
         assert!(!again.is_empty() && again.iter().all(|r| r.peer == 2));
-        // A reject backs the chunk off.
+        // A reject from an unrelated peer must be ignored so attackers cannot stall fetches.
         let idx = again[0].index;
-        fetch.on_reject(idx, t0 + REQUEST_TIMEOUT);
+        fetch.on_reject(99, idx, t0 + REQUEST_TIMEOUT);
+        assert!(matches!(
+            fetch.chunks[idx as usize / fetch.geometry().chunk],
+            Chunk::Requested { peer: 2, .. }
+        ));
+
+        // A reject from the owning peer backs the chunk off.
+        fetch.on_reject(2, idx, t0 + REQUEST_TIMEOUT);
         let soon = fetch.due_requests(t0 + REQUEST_TIMEOUT + Duration::from_secs(2), &[3]);
         assert!(soon.iter().all(|r| r.index != idx));
+    }
+
+    #[test]
+    fn round_robin_cursor_advances_across_due_requests_calls() {
+        // 4 blocks at piece_len = 2 blocks => 2 pieces => 1 chunk total.
+        let (_, root, _) = file(BLOCK_SIZE * 4);
+        let mut fetch =
+            LayerFetch::new(root, (BLOCK_SIZE * 4) as u64, (BLOCK_SIZE * 2) as u32).unwrap();
+        assert_eq!(fetch.geometry().chunks(), 1);
+        let t0 = Instant::now();
+
+        let r1 = fetch.due_requests(t0, &[10, 20]);
+        assert_eq!(r1.len(), 1);
+        assert_eq!(r1[0].peer, 10);
+
+        let t1 = t0 + REQUEST_TIMEOUT + Duration::from_secs(1);
+        let r2 = fetch.due_requests(t1, &[10, 20]);
+        assert_eq!(r2.len(), 1);
+        assert_eq!(r2[0].peer, 20);
+
+        let t2 = t1 + REQUEST_TIMEOUT + Duration::from_secs(1);
+        let r3 = fetch.due_requests(t2, &[10, 20]);
+        assert_eq!(r3.len(), 1);
+        assert_eq!(r3[0].peer, 10);
     }
 }

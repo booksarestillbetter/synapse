@@ -398,6 +398,8 @@ pub struct HttpApiConfig {
     pub cors_enabled: bool,
     pub auth_token: Option<String>,
     pub allowed_hosts: Vec<String>,
+    /// Explicit reverse-proxy IPs whose `X-Forwarded-For` header is trusted for client rate limiting.
+    pub trusted_proxies: Vec<std::net::IpAddr>,
 }
 
 impl Default for HttpApiConfig {
@@ -411,6 +413,7 @@ impl Default for HttpApiConfig {
             cors_enabled: true,
             auth_token: None,
             allowed_hosts: Vec::new(),
+            trusted_proxies: Vec::new(),
         }
     }
 }
@@ -475,6 +478,7 @@ pub struct LifecycleConfig {
     pub wal_path: Option<PathBuf>,
     pub post_script: Option<PathBuf>,
     pub copy_script: Option<PathBuf>,
+    pub script_timeout_secs: u64,
     pub start_added_torrents: bool,
     pub trash_original_torrent_files: bool,
     pub instructions: InstructionsWebhookConfig,
@@ -488,6 +492,7 @@ impl Default for LifecycleConfig {
             wal_path: None,
             post_script: None,
             copy_script: None,
+            script_timeout_secs: 300,
             start_added_torrents: true,
             trash_original_torrent_files: false,
             instructions: InstructionsWebhookConfig::default(),
@@ -823,6 +828,90 @@ fn default_session_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".synapse"))
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TomlLexState {
+    Outside,
+    InDoubleQuote { escaped: bool },
+    InSingleQuote,
+    InComment,
+}
+
+fn parse_top_level_string_literal(val: &str) -> Option<String> {
+    let val = val.trim();
+    if let Some(rest) = val.strip_prefix('"') {
+        let mut unescaped = String::new();
+        let mut esc = false;
+        let mut end_idx = None;
+        for (idx, ch) in rest.char_indices() {
+            if esc {
+                match ch {
+                    '\\' => unescaped.push('\\'),
+                    '"' => unescaped.push('"'),
+                    't' => unescaped.push('\t'),
+                    'n' => unescaped.push('\n'),
+                    'r' => unescaped.push('\r'),
+                    other => {
+                        unescaped.push('\\');
+                        unescaped.push(other);
+                    }
+                }
+                esc = false;
+            } else if ch == '\\' {
+                esc = true;
+            } else if ch == '"' {
+                end_idx = Some(idx);
+                break;
+            } else {
+                unescaped.push(ch);
+            }
+        }
+        if let Some(end) = end_idx {
+            let trailing = rest[end + 1..].trim();
+            if trailing.is_empty() || trailing.starts_with('#') {
+                return Some(unescaped);
+            }
+        }
+        None
+    } else if let Some(rest) = val.strip_prefix('\'') {
+        let end = rest.find('\'')?;
+        let trailing = rest[end + 1..].trim();
+        if trailing.is_empty() || trailing.starts_with('#') {
+            return Some(rest[..end].to_string());
+        }
+        None
+    } else {
+        None
+    }
+}
+
+fn sanitize_expanded_var(resolved: &str, state: TomlLexState) -> String {
+    let mut out = String::with_capacity(resolved.len());
+    for ch in resolved.chars() {
+        if matches!(ch, '\n' | '\r' | '\0') || ch.is_control() {
+            continue;
+        }
+        match state {
+            TomlLexState::InDoubleQuote { .. } => match ch {
+                '\\' => out.push_str("\\\\"),
+                '"' => out.push_str("\\\""),
+                other => out.push(other),
+            },
+            TomlLexState::InSingleQuote => {
+                if ch != '\'' {
+                    out.push(ch);
+                }
+            }
+            TomlLexState::Outside => {
+                if !matches!(ch, '"' | '\'' | '\\' | '#') {
+                    out.push(ch);
+                }
+            }
+            TomlLexState::InComment => {}
+        }
+    }
+    out
+}
+
 /// Expands top-level template variables and environment variables of the form `${VAR}` or `${VAR:-default}`.
 pub fn expand_vars(raw: &str) -> String {
     use std::collections::HashMap;
@@ -839,72 +928,80 @@ pub fn expand_vars(raw: &str) -> String {
         }
         if let Some((k, v)) = trimmed.split_once('=') {
             let key = k.trim();
-            let mut val = v.trim();
-            // strip inline comments from value if any
-            if let Some((clean_val, _)) = val.split_once('#') {
-                val = clean_val.trim();
-            }
-            // strip surrounding quotes
-            if ((val.starts_with('"') && val.ends_with('"'))
-                || (val.starts_with('\'') && val.ends_with('\'')))
-                && val.len() >= 2
-            {
-                let unquoted = &val[1..val.len() - 1];
-                local_vars.insert(key.to_string(), unquoted.to_string());
+            if let Some(unquoted) = parse_top_level_string_literal(v) {
+                local_vars.insert(key.to_string(), unquoted);
             }
         }
     }
 
     let mut out = String::with_capacity(raw.len());
-    let mut chars = raw.char_indices().peekable();
-    let mut cursor = 0;
+    let mut i = 0;
+    let mut state = TomlLexState::Outside;
 
-    while let Some((i, c)) = chars.next() {
-        if c == '$' {
-            if let Some(&(_, '{')) = chars.peek() {
-                chars.next(); // consume '{'
-                out.push_str(&raw[cursor..i]);
-                let var_start = i + 2;
-                let mut var_end = None;
-                for (j, inner_c) in chars.by_ref() {
-                    if inner_c == '}' {
-                        var_end = Some(j);
-                        break;
-                    }
-                }
-                if let Some(end) = var_end {
-                    let content = &raw[var_start..end];
-                    let (var_name, default_val) = match content.split_once(":-") {
-                        Some((k, d)) => (k.trim(), Some(d.trim())),
-                        None => (content.trim(), None),
-                    };
+    while i < raw.len() {
+        if state != TomlLexState::InComment
+            && !matches!(state, TomlLexState::InDoubleQuote { escaped: true })
+            && raw[i..].starts_with("${")
+        {
+            let rest = &raw[i + 2..];
+            let line_len = rest.find('\n').unwrap_or(rest.len());
+            if let Some(rel_end) = rest[..line_len].find('}') {
+                let end = i + 2 + rel_end;
+                let content = &raw[i + 2..end];
+                let (var_name, default_val) = match content.split_once(":-") {
+                    Some((k, d)) => (k.trim(), Some(d.trim())),
+                    None => (content.trim(), None),
+                };
 
-                    let resolved = local_vars
-                        .get(var_name)
-                        .cloned()
-                        .or_else(|| std::env::var(var_name).ok())
-                        .or_else(|| default_val.map(|d| d.to_string()))
-                        .unwrap_or_default();
+                let resolved = local_vars
+                    .get(var_name)
+                    .cloned()
+                    .or_else(|| std::env::var(var_name).ok())
+                    .or_else(|| default_val.map(|d| d.to_string()))
+                    .unwrap_or_default();
 
-                    // Strip characters that could break out of a TOML string literal or inject
-                    // new lines/tables/keys before `toml::from_str` parses the document.
-                    let sanitized: String = resolved
-                        .chars()
-                        .filter(|&ch| {
-                            !matches!(ch, '\n' | '\r' | '\0' | '"' | '\'') && !ch.is_control()
-                        })
-                        .collect();
-
-                    out.push_str(&sanitized);
-                    cursor = end + 1;
-                } else {
-                    cursor = i;
-                    break;
-                }
+                out.push_str(&sanitize_expanded_var(&resolved, state));
+                i = end + 1;
+                continue;
             }
         }
+
+        let Some(ch) = raw[i..].chars().next() else {
+            break;
+        };
+        state = match state {
+            TomlLexState::InComment => {
+                if ch == '\n' {
+                    TomlLexState::Outside
+                } else {
+                    TomlLexState::InComment
+                }
+            }
+            TomlLexState::InDoubleQuote { escaped: true } => {
+                TomlLexState::InDoubleQuote { escaped: false }
+            }
+            TomlLexState::InDoubleQuote { escaped: false } => match ch {
+                '\\' => TomlLexState::InDoubleQuote { escaped: true },
+                '"' => TomlLexState::Outside,
+                _ => TomlLexState::InDoubleQuote { escaped: false },
+            },
+            TomlLexState::InSingleQuote => {
+                if ch == '\'' {
+                    TomlLexState::Outside
+                } else {
+                    TomlLexState::InSingleQuote
+                }
+            }
+            TomlLexState::Outside => match ch {
+                '"' => TomlLexState::InDoubleQuote { escaped: false },
+                '\'' => TomlLexState::InSingleQuote,
+                '#' => TomlLexState::InComment,
+                _ => TomlLexState::Outside,
+            },
+        };
+        out.push(ch);
+        i += ch.len_utf8();
     }
-    out.push_str(&raw[cursor..]);
     out
 }
 
@@ -1105,19 +1202,31 @@ impl Config {
         if let Ok(val) = std::env::var("SYNAPSE_RPC_LISTEN_ADDR") {
             self.rpc.listen_addr = val;
         }
-        for var in [
-            "SYNAPSE_AUTH_TOKEN",
-            "SYNAPSE_RPC_AUTH_TOKEN",
-            "SYNAPSE_HTTP_AUTH_TOKEN",
-        ] {
-            if let Ok(val) = std::env::var(var) {
-                let trimmed = val.trim();
-                if !trimmed.is_empty() {
-                    self.rpc.auth_token = Some(trimmed.to_string());
-                    self.http_api.auth_token = Some(trimmed.to_string());
-                    self.web.auth_token = Some(trimmed.to_string());
-                    break;
-                }
+        if let Ok(val) = std::env::var("SYNAPSE_AUTH_TOKEN") {
+            let trimmed = val.trim();
+            if !trimmed.is_empty() {
+                self.rpc.auth_token = Some(trimmed.to_string());
+                self.http_api.auth_token = Some(trimmed.to_string());
+                self.web.auth_token = Some(trimmed.to_string());
+            }
+        }
+        if let Ok(val) = std::env::var("SYNAPSE_RPC_AUTH_TOKEN") {
+            let trimmed = val.trim();
+            if !trimmed.is_empty() {
+                self.rpc.auth_token = Some(trimmed.to_string());
+            }
+        }
+        if let Ok(val) = std::env::var("SYNAPSE_HTTP_AUTH_TOKEN") {
+            let trimmed = val.trim();
+            if !trimmed.is_empty() {
+                self.http_api.auth_token = Some(trimmed.to_string());
+                self.web.auth_token = Some(trimmed.to_string());
+            }
+        }
+        if let Ok(val) = std::env::var("SYNAPSE_WEB_AUTH_TOKEN") {
+            let trimmed = val.trim();
+            if !trimmed.is_empty() {
+                self.web.auth_token = Some(trimmed.to_string());
             }
         }
         if let Ok(val) = std::env::var("SYNAPSE_HTTP_ENABLED")
@@ -1332,6 +1441,74 @@ pub fn validate_config(config: &Config) -> Result<(), ConfigError> {
                     "{field} must not be empty or whitespace-only"
                 )));
             }
+        }
+    }
+
+    if config.rpc.enabled && config.rpc.listen_addr.parse::<SocketAddr>().is_err() {
+        return Err(ConfigError::Validation(format!(
+            "invalid rpc.listen_addr: {:?}",
+            config.rpc.listen_addr
+        )));
+    }
+    if config.disk.max_open_files == 0 {
+        return Err(ConfigError::Validation(
+            "disk.max_open_files must be greater than 0".to_string(),
+        ));
+    }
+    if config.network.max_peers_per_torrent == 0 || config.network.max_global_peers == 0 {
+        return Err(ConfigError::Validation(
+            "network.max_peers_per_torrent and network.max_global_peers must be greater than 0"
+                .to_string(),
+        ));
+    }
+    if config.bandwidth.alt_speed.time_begin_minutes >= 1440
+        || config.bandwidth.alt_speed.time_end_minutes >= 1440
+        || config.bandwidth.alt_speed.time_days > 127
+    {
+        return Err(ConfigError::Validation(
+            "bandwidth.alt_speed schedule minutes must be < 1440 and time_days <= 127".to_string(),
+        ));
+    }
+    if config
+        .queue
+        .seed_ratio_limit
+        .is_some_and(|r| !r.is_finite() || r < 0.0)
+    {
+        return Err(ConfigError::Validation(
+            "queue.seed_ratio_limit must be finite and non-negative".to_string(),
+        ));
+    }
+    if config.circuit_breaker.enabled {
+        if config.circuit_breaker.failure_threshold == 0 {
+            return Err(ConfigError::Validation(
+                "circuit_breaker.failure_threshold must be greater than 0".to_string(),
+            ));
+        }
+        if config.circuit_breaker.max_backoff_seconds > 0
+            && config.circuit_breaker.initial_backoff_seconds
+                > config.circuit_breaker.max_backoff_seconds
+        {
+            return Err(ConfigError::Validation(
+                "circuit_breaker.initial_backoff_seconds must not exceed max_backoff_seconds"
+                    .to_string(),
+            ));
+        }
+    }
+    let proxy_kind = config.proxy.kind.trim().to_ascii_lowercase();
+    match proxy_kind.as_str() {
+        "" | "none" => {}
+        "socks5" | "http" => {
+            if config.proxy.host.trim().is_empty() || config.proxy.port == 0 {
+                return Err(ConfigError::Validation(
+                    "proxy.host and non-zero proxy.port are required when proxy.type is socks5 or http"
+                        .to_string(),
+                ));
+            }
+        }
+        other => {
+            return Err(ConfigError::Validation(format!(
+                "invalid proxy.type: {other:?}"
+            )));
         }
     }
 
@@ -1724,5 +1901,116 @@ download_dir = "${SYNAPSE_TEST_INJECT}"
         let parsed: Config = toml::from_str(&expanded).expect("must remain valid TOML");
         assert_eq!(parsed.rpc.listen_addr, "127.0.0.1:50051");
         assert_eq!(parsed.rpc.auth_token, None);
+    }
+
+    #[test]
+    fn test_expand_vars_preserves_hash_in_quotes_and_escapes_backslashes() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let raw = r#"
+root_tag = "/mnt/media#1" # inline comment
+win_style = "C:\\torrents\\sub"
+# commented out: ${SHOULD_NOT_EXPAND}
+
+[disk]
+download_dir = "${root_tag}/dl"
+incomplete_dir = "${win_style}/inc"
+"#;
+        let expanded = expand_vars(raw);
+        assert!(expanded.contains("# commented out: ${SHOULD_NOT_EXPAND}"));
+        let parsed: Config = toml::from_str(&expanded).expect("must remain valid TOML");
+        assert_eq!(parsed.disk.download_dir, PathBuf::from("/mnt/media#1/dl"));
+        assert_eq!(
+            parsed.disk.incomplete_dir,
+            Some(PathBuf::from("C:\\torrents\\sub/inc"))
+        );
+    }
+
+    #[test]
+    fn test_auth_token_env_override_precedence() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("SYNAPSE_AUTH_TOKEN", "global-tok");
+        std::env::set_var("SYNAPSE_RPC_AUTH_TOKEN", "rpc-only-tok");
+        std::env::set_var("SYNAPSE_HTTP_AUTH_TOKEN", "http-only-tok");
+
+        let mut cfg = Config::default();
+        cfg.apply_env_overrides();
+
+        assert_eq!(cfg.rpc.auth_token.as_deref(), Some("rpc-only-tok"));
+        assert_eq!(cfg.http_api.auth_token.as_deref(), Some("http-only-tok"));
+        assert_eq!(cfg.web.auth_token.as_deref(), Some("http-only-tok"));
+
+        std::env::set_var("SYNAPSE_WEB_AUTH_TOKEN", "web-only-tok");
+        cfg.apply_env_overrides();
+        assert_eq!(cfg.http_api.auth_token.as_deref(), Some("http-only-tok"));
+        assert_eq!(cfg.web.auth_token.as_deref(), Some("web-only-tok"));
+
+        std::env::remove_var("SYNAPSE_AUTH_TOKEN");
+        std::env::remove_var("SYNAPSE_RPC_AUTH_TOKEN");
+        std::env::remove_var("SYNAPSE_HTTP_AUTH_TOKEN");
+        std::env::remove_var("SYNAPSE_WEB_AUTH_TOKEN");
+    }
+
+    #[test]
+    fn test_validate_config_rejects_invalid_limits_schedule_and_proxy() {
+        assert!(validate_config(&Config::default()).is_ok());
+
+        let mut bad_rpc = Config::default();
+        bad_rpc.rpc.enabled = true;
+        bad_rpc.rpc.listen_addr = "not-an-addr".to_string();
+        assert!(matches!(
+            validate_config(&bad_rpc),
+            Err(ConfigError::Validation(_))
+        ));
+
+        let mut bad_open = Config::default();
+        bad_open.disk.max_open_files = 0;
+        assert!(matches!(
+            validate_config(&bad_open),
+            Err(ConfigError::Validation(_))
+        ));
+
+        let mut bad_sched = Config::default();
+        bad_sched.bandwidth.alt_speed.time_begin_minutes = 1440;
+        assert!(matches!(
+            validate_config(&bad_sched),
+            Err(ConfigError::Validation(_))
+        ));
+
+        let mut bad_days = Config::default();
+        bad_days.bandwidth.alt_speed.time_days = 128;
+        assert!(matches!(
+            validate_config(&bad_days),
+            Err(ConfigError::Validation(_))
+        ));
+
+        let mut bad_ratio = Config::default();
+        bad_ratio.queue.seed_ratio_limit = Some(-0.5);
+        assert!(matches!(
+            validate_config(&bad_ratio),
+            Err(ConfigError::Validation(_))
+        ));
+
+        let mut bad_cb = Config::default();
+        bad_cb.circuit_breaker.enabled = true;
+        bad_cb.circuit_breaker.failure_threshold = 0;
+        assert!(matches!(
+            validate_config(&bad_cb),
+            Err(ConfigError::Validation(_))
+        ));
+
+        let mut bad_proxy = Config::default();
+        bad_proxy.proxy.kind = "socks5".to_string();
+        bad_proxy.proxy.host = String::new();
+        assert!(matches!(
+            validate_config(&bad_proxy),
+            Err(ConfigError::Validation(_))
+        ));
+
+        let mut bad_proxy_type = Config::default();
+        bad_proxy_type.proxy.kind = "gopher".to_string();
+        assert!(matches!(
+            validate_config(&bad_proxy_type),
+            Err(ConfigError::Validation(_))
+        ));
     }
 }

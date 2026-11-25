@@ -180,6 +180,23 @@ fn print_migration_banner(client_label: &str, source_dir: &Path, target_dir: &Pa
     }
 }
 
+fn truncate_chars(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    if max_chars <= 3 {
+        return s.chars().take(max_chars).collect();
+    }
+    let prefix: String = s.chars().take(max_chars - 3).collect();
+    format!("{prefix}...")
+}
+
+fn default_migrate_session_dir(config_path: Option<&Path>) -> PathBuf {
+    Config::load(config_path)
+        .map(|c| c.disk.session_dir)
+        .unwrap_or_else(|_| migrate::default_synapse_session_dir())
+}
+
 /// Prints the found/migrated summary table shared by every `migrate` subcommand — generic over
 /// each source client's own entry type (see `migrate::MigratedTorrent`) so this isn't
 /// duplicated per client.
@@ -211,12 +228,7 @@ fn print_migration_report<T: migrate::MigratedTorrent>(
         };
         let hash = entry.info_hash_hex();
         let hash_short = &hash[..8.min(hash.len())];
-        let name = entry.name();
-        let name_truncated = if name.len() > 38 {
-            format!("{}...", &name[..35])
-        } else {
-            name.to_string()
-        };
+        let name_truncated = truncate_chars(entry.name(), 38);
         println!(
             "{:<40} {:<12} {:>8.1} MB {:>6.1}% ({:>4}/{:<4}) {:<12}",
             name_truncated,
@@ -265,7 +277,8 @@ async fn main() -> std::process::ExitCode {
                 let source_dir = transmission_dir
                     .or_else(migrate::default_transmission_dir)
                     .unwrap_or_else(|| PathBuf::from("./Transmission"));
-                let target_dir = synapse_dir.unwrap_or_else(migrate::default_synapse_session_dir);
+                let target_dir = synapse_dir
+                    .unwrap_or_else(|| default_migrate_session_dir(args.config.as_deref()));
 
                 print_migration_banner("Transmission", &source_dir, &target_dir, dry_run);
 
@@ -290,7 +303,8 @@ async fn main() -> std::process::ExitCode {
                 let source_dir = qbittorrent_dir
                     .or_else(migrate::default_qbittorrent_dir)
                     .unwrap_or_else(|| PathBuf::from("./BT_backup"));
-                let target_dir = synapse_dir.unwrap_or_else(migrate::default_synapse_session_dir);
+                let target_dir = synapse_dir
+                    .unwrap_or_else(|| default_migrate_session_dir(args.config.as_deref()));
 
                 print_migration_banner("qBittorrent", &source_dir, &target_dir, dry_run);
 
@@ -315,7 +329,8 @@ async fn main() -> std::process::ExitCode {
                 let source_dir = deluge_dir
                     .or_else(migrate::default_deluge_dir)
                     .unwrap_or_else(|| PathBuf::from("./state"));
-                let target_dir = synapse_dir.unwrap_or_else(migrate::default_synapse_session_dir);
+                let target_dir = synapse_dir
+                    .unwrap_or_else(|| default_migrate_session_dir(args.config.as_deref()));
 
                 print_migration_banner("Deluge", &source_dir, &target_dir, dry_run);
 
@@ -650,6 +665,9 @@ async fn main() -> std::process::ExitCode {
             .or_else(|| Some(config.disk.session_dir.join("completed_wal.jsonl"))),
         post_script: config.lifecycle.post_script.clone(),
         copy_script: config.lifecycle.copy_script.clone(),
+        script_timeout: Some(Duration::from_secs(
+            config.lifecycle.script_timeout_secs.max(1),
+        )),
         instructions,
     };
     let lifecycle = Arc::new(synapse_engine::LifecycleDispatcher::new(lifecycle_config));
@@ -757,6 +775,8 @@ async fn main() -> std::process::ExitCode {
         }
     }
 
+    swarm.set_listener_required(!force_proxy);
+
     // The first address that binds becomes the primary listener (advertised port, NAT mapping,
     // uTP and DHT); IPv6 wildcard sockets are IPv6-only so they can share the port.
     let mut bound_any = force_proxy; // anonymous mode opens no listening socket
@@ -790,6 +810,8 @@ async fn main() -> std::process::ExitCode {
 
     if force_proxy {
         tracing::info!(target: LIFECYCLE_TARGET, "proxy.force_proxy: no listener, DHT, LSD, zeroconf, uTP or port mapping");
+    } else if !config.network.enable_lsd {
+        tracing::info!(target: LIFECYCLE_TARGET, "LSD disabled via network.enable_lsd -- not starting LSD");
     } else {
         match swarm.clone().start_lsd().await {
             Ok(_) => {
@@ -803,7 +825,7 @@ async fn main() -> std::process::ExitCode {
         }
     }
 
-    if config.network.enable_zeroconf {
+    if config.network.enable_zeroconf && !force_proxy {
         if let Ok(group) = synapse_engine::zeroconf::MDNS_IPV4.parse() {
             match swarm.clone().start_zeroconf(group).await {
                 Ok(_) => {
@@ -817,11 +839,16 @@ async fn main() -> std::process::ExitCode {
         }
     }
 
-    if config.privacy.disable_dht_globally {
-        tracing::info!(target: LIFECYCLE_TARGET, "DHT disabled via privacy.disable_dht_globally -- not starting a DHT node");
+    if force_proxy || config.privacy.disable_dht_globally || !config.network.enable_dht {
+        tracing::info!(target: LIFECYCLE_TARGET, "DHT disabled by configuration or force_proxy -- not starting a DHT node");
     } else {
-        // DHT conventionally shares the same port number as the TCP peer listener (just UDP).
-        let dht_bind = SocketAddr::from(([0, 0, 0, 0], config.network.listen_port));
+        // DHT conventionally shares the primary peer listener interface and port.
+        let dht_bind = listen_addrs
+            .iter()
+            .find(|a| a.is_ipv4())
+            .or_else(|| listen_addrs.first())
+            .copied()
+            .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], config.network.listen_port)));
         match swarm.clone().start_dht(dht_bind).await {
             Ok(addr) => {
                 tracing::info!(target: LIFECYCLE_TARGET, "📡 DHT (Kademlia) node active on {}", addr)
@@ -842,13 +869,17 @@ async fn main() -> std::process::ExitCode {
     // Initialize Event Bus and gRPC Control Plane
     let event_bus = Arc::new(EventBus::new(4096));
     let flusher_bus = event_bus.clone();
-    let _flusher_handle = flusher_bus.start_flusher(Duration::from_millis(100));
+    let flusher_handle = flusher_bus.start_flusher(Duration::from_millis(100));
     let (rpc_auth_token, web_auth_token) = resolve_auth_tokens(&config);
+    let shared_auth_rate_limiter = synapse_rpc::http_api::AuthRateLimiter::default();
     let service = SynapseService::new(event_bus.clone())
         .with_swarm_engine(swarm.clone())
-        .with_auth_token(rpc_auth_token.clone());
+        .with_auth_token(rpc_auth_token.clone())
+        .with_rate_limiter(shared_auth_rate_limiter.clone());
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let mut bg_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    let mut server_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
     // Reconciles the RPC layer's active_summaries/session_stats against the real SwarmEngine
     // state every second — the only place that happened before this was inside each RPC
@@ -860,13 +891,13 @@ async fn main() -> std::process::ExitCode {
     {
         let sync_service = service.clone();
         let mut shutdown_rx = shutdown_rx.clone();
-        tokio::spawn(async move {
+        bg_handles.push(tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_secs(1));
             loop {
                 tokio::select! {
                     _ = ticker.tick() => {
-                        sync_service.sync_from_engine();
-                        sync_service.refresh_session_stats();
+                        sync_service.sync_from_engine_if_subscribed();
+                        sync_service.refresh_session_stats().await;
                     }
                     _ = shutdown_rx.changed() => {
                         if *shutdown_rx.borrow() {
@@ -875,7 +906,7 @@ async fn main() -> std::process::ExitCode {
                     }
                 }
             }
-        });
+        }));
     }
 
     // Periodically reconciles queue concurrency, auto-stops seeding torrents that reached ratio
@@ -884,7 +915,7 @@ async fn main() -> std::process::ExitCode {
     {
         let swarm_reconciler = swarm.clone();
         let mut shutdown_rx = shutdown_rx.clone();
-        tokio::spawn(async move {
+        bg_handles.push(tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_secs(1));
             let mut flush_counter: usize = 0;
             loop {
@@ -905,7 +936,7 @@ async fn main() -> std::process::ExitCode {
                     }
                 }
             }
-        });
+        }));
     }
 
     // BEP 39: look for updates to torrents that carry an update-url.
@@ -913,7 +944,7 @@ async fn main() -> std::process::ExitCode {
         let update_swarm = swarm.clone();
         let interval = Duration::from_secs(config.updates.check_interval_secs.max(3600));
         let mut shutdown_rx = shutdown_rx.clone();
-        tokio::spawn(async move {
+        bg_handles.push(tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
             loop {
                 tokio::select! {
@@ -927,7 +958,7 @@ async fn main() -> std::process::ExitCode {
                     }
                 }
             }
-        });
+        }));
     }
 
     // BEP 36 RSS / Atom Feed Automation Background Poller
@@ -935,7 +966,7 @@ async fn main() -> std::process::ExitCode {
         let rss_swarm = swarm.clone();
         let poll_interval = Duration::from_secs(config.rss.poll_interval_secs.max(60));
         let mut shutdown_rx = shutdown_rx.clone();
-        tokio::spawn(async move {
+        bg_handles.push(tokio::spawn(async move {
             tracing::info!(
                 target: LIFECYCLE_TARGET,
                 "📰 BEP 36 RSS feed poller active (interval: {:?})",
@@ -954,7 +985,7 @@ async fn main() -> std::process::ExitCode {
                     }
                 }
             }
-        });
+        }));
     }
 
     if config.rpc.enabled {
@@ -967,6 +998,7 @@ async fn main() -> std::process::ExitCode {
                     config.rpc.listen_addr,
                     e
                 );
+                let _ = shutdown_tx.send(true);
                 return std::process::ExitCode::FAILURE;
             }
         };
@@ -978,6 +1010,26 @@ async fn main() -> std::process::ExitCode {
                 rpc_addr
             );
         }
+
+        let rpc_listener = match tokio::net::TcpListener::bind(rpc_addr).await {
+            Ok(listener) => listener,
+            Err(e) => {
+                tracing::error!(
+                    target: LIFECYCLE_TARGET,
+                    "Failed to bind gRPC control plane address {}: {}",
+                    rpc_addr,
+                    e
+                );
+                let _ = shutdown_tx.send(true);
+                for h in bg_handles {
+                    h.abort();
+                }
+                flusher_handle.abort();
+                return std::process::ExitCode::FAILURE;
+            }
+        };
+        let bound_rpc_addr = rpc_listener.local_addr().unwrap_or(rpc_addr);
+        let rpc_incoming = tokio_stream::wrappers::TcpListenerStream::new(rpc_listener);
 
         // `verify_auth` was previously defined but never invoked from any handler — every RPC
         // was reachable with no token at all regardless of config. A Tonic interceptor runs
@@ -992,8 +1044,8 @@ async fn main() -> std::process::ExitCode {
             };
 
         let mut grpc_shutdown = shutdown_rx.clone();
-        tokio::spawn(async move {
-            tracing::info!(target: LIFECYCLE_TARGET, "⚡ gRPC Control Plane listening on http://{}", rpc_addr);
+        tracing::info!(target: LIFECYCLE_TARGET, "⚡ gRPC Control Plane listening on http://{}", bound_rpc_addr);
+        server_handles.push(tokio::spawn(async move {
             let shutdown_signal = async move {
                 while grpc_shutdown.changed().await.is_ok() {
                     if *grpc_shutdown.borrow() {
@@ -1001,14 +1053,19 @@ async fn main() -> std::process::ExitCode {
                     }
                 }
             };
+            let grpc_server = SynapseControlServer::new(service)
+                .max_decoding_message_size(synapse_rpc::MAX_GRPC_MESSAGE_BYTES)
+                .max_encoding_message_size(synapse_rpc::MAX_GRPC_MESSAGE_BYTES);
+            let grpc_svc =
+                tonic::service::interceptor::InterceptedService::new(grpc_server, interceptor);
             if let Err(e) = tonic::transport::Server::builder()
-                .add_service(SynapseControlServer::with_interceptor(service, interceptor))
-                .serve_with_shutdown(rpc_addr, shutdown_signal)
+                .add_service(grpc_svc)
+                .serve_with_incoming_shutdown(rpc_incoming, shutdown_signal)
                 .await
             {
                 tracing::error!(target: LIFECYCLE_TARGET, "gRPC server error: {}", e);
             }
-        });
+        }));
     }
 
     // Optional Alternative REST HTTP API / Web UI / Swagger UI & Prometheus Metrics
@@ -1042,58 +1099,77 @@ async fn main() -> std::process::ExitCode {
             );
         }
 
+        let http_listener = match tokio::net::TcpListener::bind(http_addr).await {
+            Ok(listener) => listener,
+            Err(e) => {
+                tracing::error!(
+                    target: LIFECYCLE_TARGET,
+                    "Failed to bind HTTP API address {}: {}",
+                    http_addr,
+                    e
+                );
+                let _ = shutdown_tx.send(true);
+                for h in server_handles {
+                    h.abort();
+                }
+                for h in bg_handles {
+                    h.abort();
+                }
+                flusher_handle.abort();
+                return std::process::ExitCode::FAILURE;
+            }
+        };
+        let bound_http_addr = http_listener.local_addr().unwrap_or(http_addr);
+
         let http_engine = swarm.clone();
         let http_auth = web_auth_token.clone();
         let metrics_enabled = config.metrics.enabled;
         let web_config = config.web.clone();
         let allowed_hosts = config.http_api.allowed_hosts.clone();
+        let trusted_proxies = config.http_api.trusted_proxies.clone();
+        let http_rate_limiter = shared_auth_rate_limiter.clone();
         let mut http_shutdown = shutdown_rx.clone();
-        tokio::spawn(async move {
-            let web_enabled = web_config.enabled;
-            let app = synapse_rpc::create_http_router_all(
+        let web_enabled = web_config.enabled;
+        tracing::info!(target: LIFECYCLE_TARGET, "🌐 REST API & Web Server listening on http://{}", bound_http_addr);
+        if web_enabled {
+            tracing::info!(target: LIFECYCLE_TARGET, "   - Web Interface:          http://{}/", bound_http_addr);
+        }
+        tracing::info!(
+            target: LIFECYCLE_TARGET,
+            "   - Interactive Swagger UI: http://{}/swagger-ui",
+            bound_http_addr
+        );
+        if metrics_enabled {
+            tracing::info!(target: LIFECYCLE_TARGET, "   - Prometheus Metrics:     http://{}/metrics", bound_http_addr);
+        }
+
+        server_handles.push(tokio::spawn(async move {
+            let app = synapse_rpc::create_http_router_with_options(
                 http_engine,
                 http_auth,
                 metrics_enabled,
                 web_config,
                 allowed_hosts,
+                trusted_proxies,
+                http_rate_limiter,
             );
-            tracing::info!(target: LIFECYCLE_TARGET, "🌐 REST API & Web Server listening on http://{}", http_addr);
-            if web_enabled {
-                tracing::info!(target: LIFECYCLE_TARGET, "   - Web Interface:          http://{}/", http_addr);
-            }
-            tracing::info!(
-                target: LIFECYCLE_TARGET,
-                "   - Interactive Swagger UI: http://{}/swagger-ui",
-                http_addr
-            );
-            if metrics_enabled {
-                tracing::info!(target: LIFECYCLE_TARGET, "   - Prometheus Metrics:     http://{}/metrics", http_addr);
-            }
-
-            match tokio::net::TcpListener::bind(http_addr).await {
-                Ok(listener) => {
-                    let shutdown_signal = async move {
-                        while http_shutdown.changed().await.is_ok() {
-                            if *http_shutdown.borrow() {
-                                break;
-                            }
-                        }
-                    };
-                    if let Err(e) = axum::serve(
-                        listener,
-                        app.into_make_service_with_connect_info::<SocketAddr>(),
-                    )
-                    .with_graceful_shutdown(shutdown_signal)
-                    .await
-                    {
-                        tracing::error!(target: LIFECYCLE_TARGET, "HTTP server error: {}", e);
+            let shutdown_signal = async move {
+                while http_shutdown.changed().await.is_ok() {
+                    if *http_shutdown.borrow() {
+                        break;
                     }
                 }
-                Err(e) => {
-                    tracing::error!(target: LIFECYCLE_TARGET, "Failed to bind HTTP API address {}: {}", http_addr, e);
-                }
+            };
+            if let Err(e) = axum::serve(
+                http_listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(shutdown_signal)
+            .await
+            {
+                tracing::error!(target: LIFECYCLE_TARGET, "HTTP server error: {}", e);
             }
-        });
+        }));
     } else if config.metrics.enabled {
         tracing::debug!("[metrics] enabled = true, but [http_api] and [web] are disabled — HTTP server will not start");
     }
@@ -1101,9 +1177,8 @@ async fn main() -> std::process::ExitCode {
     // Optional Watch Directory Background Ingestor
     if let Some(watch_dir) = config.disk.watch_dir.clone() {
         let watch_swarm = swarm.clone();
-        let dl_dir = config.disk.download_dir.clone();
         let mut watch_shutdown = shutdown_rx.clone();
-        tokio::spawn(async move {
+        bg_handles.push(tokio::spawn(async move {
             tracing::info!(target: LIFECYCLE_TARGET, "👀 Watch directory active on {}", watch_dir.display());
             let imported_dir = watch_dir.join(".imported");
             let failed_dir = watch_dir.join(".failed");
@@ -1128,140 +1203,194 @@ async fn main() -> std::process::ExitCode {
                     Err(_) => continue,
                 };
 
+                let mut seen_paths = std::collections::HashSet::new();
                 while let Ok(Some(entry)) = entries.next_entry().await {
                     let path = entry.path();
-                    if path.is_file() {
-                        if let Some(ext) = path.extension() {
-                            if ext == "torrent" {
-                                let data = match synapse_rpc::url_fetcher::read_torrent_file(&path)
-                                    .await
-                                {
-                                    Ok(d) if !d.is_empty() => d,
-                                    _ => continue,
+                    if path.is_file()
+                        && path
+                            .extension()
+                            .and_then(|e| e.to_str())
+                            .is_some_and(|e| e.eq_ignore_ascii_case("torrent"))
+                    {
+                        seen_paths.insert(path.clone());
+                        let data = match synapse_rpc::url_fetcher::read_torrent_file(&path).await {
+                            Ok(d) if !d.is_empty() => d,
+                            Ok(_) => {
+                                record_watch_failure(
+                                    &mut failure_counts,
+                                    &path,
+                                    &failed_dir,
+                                    "empty .torrent file",
+                                )
+                                .await;
+                                continue;
+                            }
+                            Err(e) => {
+                                record_watch_failure(&mut failure_counts, &path, &failed_dir, e)
+                                    .await;
+                                continue;
+                            }
+                        };
+
+                        let bencode = match synapse_bencode::decode_buf(&data) {
+                            Ok(b) => b,
+                            Err(e) => {
+                                record_watch_failure(&mut failure_counts, &path, &failed_dir, e)
+                                    .await;
+                                continue;
+                            }
+                        };
+
+                        match synapse_meta::Info::from_bencode(bencode) {
+                            Ok(info) if watch_swarm.check_signature_policy(&info).is_err() => {
+                                tracing::warn!(
+                                    "Refusing watch-directory torrent '{}': not signed by a trusted signer",
+                                    info.name
+                                );
+                                failure_counts.remove(&path);
+                                let fname = path.file_name().unwrap_or_default();
+                                let rejected_dir = path
+                                    .parent()
+                                    .unwrap_or(std::path::Path::new("."))
+                                    .join("rejected");
+                                let _ = tokio::fs::create_dir_all(&rejected_dir).await;
+                                let _ = tokio::fs::rename(&path, rejected_dir.join(fname)).await;
+                            }
+                            Ok(info) => {
+                                tracing::info!(
+                                    "📥 Auto-ingesting .torrent from watch directory: {}",
+                                    info.name
+                                );
+                                let (dl_dir, start_added) = {
+                                    let settings = watch_swarm.settings();
+                                    let s = settings.read();
+                                    (s.download_dir.clone(), s.start_added_torrents)
                                 };
-
-                                let bencode = match synapse_bencode::decode_buf(&data) {
-                                    Ok(b) => b,
-                                    Err(e) => {
-                                        let count = failure_counts.entry(path.clone()).or_insert(0);
-                                        *count += 1;
-                                        if *count >= 3 {
-                                            tracing::error!(
-                                                "Failed to parse watch file after 3 attempts: {}. Moving to .failed: {e}",
-                                                path.display()
-                                            );
-                                            let fname = path.file_name().unwrap_or_default();
-                                            let dest = failed_dir.join(fname);
-                                            let _ = tokio::fs::rename(&path, dest).await;
-                                            failure_counts.remove(&path);
-                                        }
-                                        continue;
-                                    }
-                                };
-
-                                match synapse_meta::Info::from_bencode(bencode) {
-                                    Ok(info)
-                                        if watch_swarm.check_signature_policy(&info).is_err() =>
-                                    {
-                                        tracing::warn!(
-                                            "Refusing watch-directory torrent '{}': not signed by a trusted signer",
-                                            info.name
-                                        );
-                                        failure_counts.remove(&path);
-                                        let fname = path.file_name().unwrap_or_default();
-                                        let rejected_dir = path
-                                            .parent()
-                                            .unwrap_or(std::path::Path::new("."))
-                                            .join("rejected");
-                                        let _ = tokio::fs::create_dir_all(&rejected_dir).await;
-                                        let _ = tokio::fs::rename(&path, rejected_dir.join(fname))
-                                            .await;
-                                    }
-                                    Ok(info) => {
-                                        tracing::info!(
-                                            "📥 Auto-ingesting .torrent from watch directory: {}",
-                                            info.name
-                                        );
-                                        watch_swarm.add_torrent(
-                                            Arc::new(info),
-                                            dl_dir.clone(),
-                                            None,
-                                        );
-                                        failure_counts.remove(&path);
-
-                                        let fname = path.file_name().unwrap_or_default();
-                                        let mut dest = imported_dir.join(fname);
-                                        if dest.exists() {
-                                            let ts = std::time::SystemTime::now()
-                                                .duration_since(std::time::UNIX_EPOCH)
-                                                .unwrap_or_default()
-                                                .as_secs();
-                                            dest = imported_dir.join(format!(
-                                                "{}.{}",
-                                                fname.to_string_lossy(),
-                                                ts
-                                            ));
-                                        }
-                                        let _ = tokio::fs::rename(&path, dest).await;
-                                    }
-                                    Err(e) => {
-                                        let count = failure_counts.entry(path.clone()).or_insert(0);
-                                        *count += 1;
-                                        if *count >= 3 {
-                                            tracing::error!(
-                                                "Invalid torrent metadata in watch file after 3 attempts: {}. Moving to .failed: {e}",
-                                                path.display()
-                                            );
-                                            let fname = path.file_name().unwrap_or_default();
-                                            let dest = failed_dir.join(fname);
-                                            let _ = tokio::fs::rename(&path, dest).await;
-                                            failure_counts.remove(&path);
-                                        }
-                                    }
+                                let handle = watch_swarm.add_torrent(Arc::new(info), dl_dir, None);
+                                if !start_added {
+                                    let hash = handle.stats.read().info_hash;
+                                    watch_swarm.transition_to_cold(&hash);
                                 }
+                                failure_counts.remove(&path);
+
+                                let fname = path.file_name().unwrap_or_default();
+                                let mut dest = imported_dir.join(fname);
+                                if dest.exists() {
+                                    let ts = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_secs();
+                                    dest = imported_dir.join(format!(
+                                        "{}.{}",
+                                        fname.to_string_lossy(),
+                                        ts
+                                    ));
+                                }
+                                let _ = tokio::fs::rename(&path, dest).await;
+                            }
+                            Err(e) => {
+                                record_watch_failure(&mut failure_counts, &path, &failed_dir, e)
+                                    .await;
                             }
                         }
                     }
                 }
+                failure_counts.retain(|p, _| seen_paths.contains(p));
             }
-        });
+        }));
     }
 
     tracing::info!(target: LIFECYCLE_TARGET, "🚀 Synapse 2.0 ready. Standing by for commands and swarm connections.");
 
-    wait_for_shutdown_or_reload(swarm.clone(), args.config.clone(), config).await;
+    wait_for_shutdown_or_reload(
+        swarm.clone(),
+        args.config.clone(),
+        config,
+        args.dht_read_only,
+        force_proxy,
+    )
+    .await;
 
     let _ = shutdown_tx.send(true);
 
     tracing::info!(
         target: LIFECYCLE_TARGET,
-        "Shutting down: stopping torrent actors and flushing state to disk (15s timeout)..."
+        "Shutting down: stopping torrent actors, flushing durable state, and notifying trackers..."
     );
-    let shutdown_future = async {
+    swarm.shutdown();
+    swarm.flush_session().await;
+    swarm.persist_dht_state().await;
+
+    let net_teardown = async {
         swarm.announce_stopped_all().await;
-        swarm.shutdown();
-        swarm.flush_session().await;
-        // Persist the DHT node id and known nodes, and give the gateway its port mappings back.
-        swarm.persist_dht_state().await;
         swarm.release_port_mappings().await;
     };
-
-    if tokio::time::timeout(Duration::from_secs(15), shutdown_future)
+    if tokio::time::timeout(Duration::from_secs(10), net_teardown)
         .await
         .is_err()
     {
-        tracing::warn!(target: LIFECYCLE_TARGET, "⚠️ Graceful shutdown timed out after 15s — forcing process exit.");
-    } else {
-        tracing::info!(target: LIFECYCLE_TARGET, "✅ Session state flushed successfully. Daemon shutdown complete.");
+        tracing::warn!(
+            target: LIFECYCLE_TARGET,
+            "⚠️ Best-effort network teardown timed out after 10s (session state already flushed)."
+        );
     }
 
+    let mut abort_handles: Vec<tokio::task::AbortHandle> = server_handles
+        .iter()
+        .chain(bg_handles.iter())
+        .map(tokio::task::JoinHandle::abort_handle)
+        .collect();
+    abort_handles.push(flusher_handle.abort_handle());
+
+    let drain_tasks = async {
+        for h in server_handles {
+            let _ = h.await;
+        }
+        for h in bg_handles {
+            let _ = h.await;
+        }
+    };
+    if tokio::time::timeout(Duration::from_secs(2), drain_tasks)
+        .await
+        .is_err()
+    {
+        for ah in abort_handles {
+            ah.abort();
+        }
+    }
+    flusher_handle.abort();
+
+    tracing::info!(target: LIFECYCLE_TARGET, "✅ Session state flushed successfully. Daemon shutdown complete.");
+
     std::process::ExitCode::SUCCESS
+}
+
+async fn record_watch_failure(
+    failure_counts: &mut std::collections::HashMap<PathBuf, u32>,
+    path: &Path,
+    failed_dir: &Path,
+    err: impl std::fmt::Display,
+) {
+    let count = failure_counts.entry(path.to_path_buf()).or_insert(0);
+    *count += 1;
+    if *count >= 3 {
+        tracing::error!(
+            "Failed to ingest watch file after 3 attempts: {}. Moving to .failed: {err}",
+            path.display()
+        );
+        let fname = path.file_name().unwrap_or_default();
+        let dest = failed_dir.join(fname);
+        let _ = tokio::fs::rename(path, dest).await;
+        failure_counts.remove(path);
+    }
 }
 
 async fn wait_for_shutdown_or_reload(
     swarm: Arc<SwarmEngine>,
     config_path: Option<PathBuf>,
     mut current_config: Config,
+    cli_dht_read_only: bool,
+    force_proxy: bool,
 ) {
     #[cfg(unix)]
     {
@@ -1288,10 +1417,27 @@ async fn wait_for_shutdown_or_reload(
                     break;
                 }
                 _ = sighup.recv() => {
-                    tracing::info!(target: LIFECYCLE_TARGET, "🔄 Received SIGHUP. Reloading configuration from disk...");
+                    tracing::info!(target: LIFECYCLE_TARGET, "🔄 Received SIGHUP. Reopening log file and reloading configuration from disk...");
+                    match crate::logging::reopen_log_file() {
+                        Ok(true) => tracing::info!(target: LIFECYCLE_TARGET, "📝 Reopened log file after SIGHUP"),
+                        Ok(false) => {}
+                        Err(e) => tracing::warn!(target: LIFECYCLE_TARGET, "Failed to reopen log file on SIGHUP: {e}"),
+                    }
                     let cfg_res = Config::load(config_path.as_deref());
                     match cfg_res {
-                        Ok(new_cfg) => {
+                        Ok(mut new_cfg) => {
+                            if cli_dht_read_only {
+                                new_cfg.network.dht_read_only = true;
+                            }
+                            if force_proxy || new_cfg.proxy.force_proxy {
+                                new_cfg.proxy.force_proxy = true;
+                                new_cfg.network.enable_dht = false;
+                                new_cfg.network.enable_lsd = false;
+                                new_cfg.network.enable_zeroconf = false;
+                                new_cfg.network.enable_utp = false;
+                                new_cfg.network.enable_nat = false;
+                                new_cfg.privacy.disable_dht_globally = true;
+                            }
                             for field in check_non_reloadable_security_changes(&current_config, &new_cfg) {
                                 tracing::warn!(
                                     target: LIFECYCLE_TARGET,
@@ -1315,7 +1461,13 @@ async fn wait_for_shutdown_or_reload(
 
     #[cfg(not(unix))]
     {
-        let _ = (&swarm, &config_path, &mut current_config);
+        let _ = (
+            &swarm,
+            &config_path,
+            &mut current_config,
+            cli_dht_read_only,
+            force_proxy,
+        );
         if let Err(e) = tokio::signal::ctrl_c().await {
             tracing::error!(target: LIFECYCLE_TARGET, "Failed to listen for shutdown signal: {e}");
         } else {
@@ -1588,5 +1740,16 @@ mod tests {
             "expected at least one IP on loopback interface {lo_name}"
         );
         assert!(resolve_interface_ips("nonexistent-iface-xyz-999").is_empty());
+    }
+
+    #[test]
+    fn truncate_chars_handles_multibyte_utf8_without_panicking() {
+        let short = "日本語🎉";
+        assert_eq!(truncate_chars(short, 38), short);
+
+        let long_cjk = "あいうえおかきくけこさしすせそたちつてとなにぬねのはひふへほまみむめもやゆよらりるれろ🎉";
+        let truncated = truncate_chars(long_cjk, 38);
+        assert!(truncated.ends_with("..."));
+        assert_eq!(truncated.chars().count(), 38);
     }
 }

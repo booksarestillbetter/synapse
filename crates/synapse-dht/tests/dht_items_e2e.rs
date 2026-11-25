@@ -99,14 +99,20 @@ async fn mutable_item_needs_a_valid_signature_and_a_higher_sequence_number() {
     ));
     // A proper update with the right CAS succeeds and is what `get` returns, signed, with seq.
     a.put(b_addr, mk(token, 2, b"2:v2", Some(1))).await.unwrap();
-    let (_, item) = a.get(b_addr, target, None).await.unwrap();
+    let (_, item) = a
+        .get_with_salt(b_addr, target, Some(&salt), None)
+        .await
+        .unwrap();
     let item = item.unwrap();
     assert_eq!(
         (item.v.as_slice(), item.seq, item.k),
         (&b"2:v2"[..], Some(2), Some(pk))
     );
     // A requester that already has seq 2 is not sent the value again.
-    let (_, item) = a.get(b_addr, target, Some(2)).await.unwrap();
+    let (_, item) = a
+        .get_with_salt(b_addr, target, Some(&salt), Some(2))
+        .await
+        .unwrap();
     assert!(item.is_none());
 }
 

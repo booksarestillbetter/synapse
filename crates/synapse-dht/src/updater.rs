@@ -10,7 +10,7 @@ use synapse_bencode::BEncode;
 pub struct TorrentUpdatePointer {
     pub public_key: [u8; 32],
     pub salt: Option<Vec<u8>>,
-    pub latest_seq: u64,
+    pub latest_seq: Option<u64>,
     pub current_info_hash: Option<[u8; 20]>,
     pub magnet_uri: Option<String>,
 }
@@ -20,7 +20,7 @@ impl TorrentUpdatePointer {
         Self {
             public_key,
             salt,
-            latest_seq: 0,
+            latest_seq: None,
             current_info_hash: None,
             magnet_uri: None,
         }
@@ -29,7 +29,7 @@ impl TorrentUpdatePointer {
     /// Evaluates an incoming BEP 44 mutable item value.
     /// If the sequence number is newer, updates the current info_hash and returns true.
     pub fn process_update(&mut self, seq: u64, value_bytes: &[u8]) -> bool {
-        if seq <= self.latest_seq && self.latest_seq > 0 {
+        if self.latest_seq.is_some_and(|cur| seq <= cur) {
             return false;
         }
 
@@ -38,7 +38,7 @@ impl TorrentUpdatePointer {
             let mut hash = [0u8; 20];
             hash.copy_from_slice(value_bytes);
             self.current_info_hash = Some(hash);
-            self.latest_seq = seq;
+            self.latest_seq = Some(seq);
             return true;
         }
 
@@ -49,7 +49,7 @@ impl TorrentUpdatePointer {
                         let mut hash = [0u8; 20];
                         hash.copy_from_slice(&ih_bytes);
                         self.current_info_hash = Some(hash);
-                        self.latest_seq = seq;
+                        self.latest_seq = Some(seq);
                         return true;
                     }
                 }
@@ -59,7 +59,7 @@ impl TorrentUpdatePointer {
         if let Ok(s) = std::str::from_utf8(value_bytes) {
             if s.starts_with("magnet:?") {
                 self.magnet_uri = Some(s.to_string());
-                self.latest_seq = seq;
+                self.latest_seq = Some(seq);
                 return true;
             }
         }
@@ -96,7 +96,9 @@ impl TorrentUpdatePointer {
         addr: std::net::SocketAddrV4,
     ) -> Result<bool, crate::node::DhtError> {
         let target = self.target_hash();
-        let (_token, item_opt) = dht.get(addr, target, Some(self.latest_seq)).await?;
+        let (_token, item_opt) = dht
+            .get_with_salt(addr, target, self.salt.as_deref(), self.latest_seq)
+            .await?;
         if let Some(item) = item_opt {
             return Ok(self.process_verified_item(&item));
         }
@@ -115,10 +117,16 @@ mod tests {
         let pk = [0x55; 32];
         let mut updater = TorrentUpdatePointer::new(pk, None);
 
+        let hash0 = [0x01; 20];
+        assert!(updater.process_update(0, &hash0));
+        assert_eq!(updater.current_info_hash, Some(hash0));
+        assert_eq!(updater.latest_seq, Some(0));
+        assert!(!updater.process_update(0, &[0x02; 20]));
+
         let hash1 = [0x11; 20];
         assert!(updater.process_update(1, &hash1));
         assert_eq!(updater.current_info_hash, Some(hash1));
-        assert_eq!(updater.latest_seq, 1);
+        assert_eq!(updater.latest_seq, Some(1));
 
         // Stale update is rejected
         let hash_stale = [0x22; 20];
@@ -133,7 +141,7 @@ mod tests {
 
         assert!(updater.process_update(2, &bencode_bytes));
         assert_eq!(updater.current_info_hash, Some(hash2));
-        assert_eq!(updater.latest_seq, 2);
+        assert_eq!(updater.latest_seq, Some(2));
     }
 
     #[test]
@@ -185,6 +193,6 @@ mod tests {
         };
         assert!(updater.process_verified_item(&valid_item));
         assert_eq!(updater.current_info_hash, Some(valid_hash));
-        assert_eq!(updater.latest_seq, 1);
+        assert_eq!(updater.latest_seq, Some(1));
     }
 }

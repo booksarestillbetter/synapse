@@ -22,16 +22,19 @@ use std::path::Path;
 
 use rsa::pkcs1v15::Pkcs1v15Sign;
 use rsa::pkcs8::DecodePublicKey;
+use rsa::traits::PublicKeyParts;
 use rsa::RsaPublicKey;
 use sha2::{Digest as _, Sha256, Sha384, Sha512};
 use synapse_bencode::BEncode;
-use x509_cert::der::{AnyRef, Decode, DecodePem, Encode, Tag, Tagged};
+use x509_cert::der::{AnyRef, Decode, DecodePem, Encode, Reader, SliceReader, Tag, Tagged};
 use x509_cert::Certificate;
 
 /// Signatures looked at per torrent, and the largest certificate / signature accepted.
 const MAX_SIGNATURES: usize = 16;
 const MAX_CERT_BYTES: usize = 16 * 1024;
 const MAX_SIGNATURE_BYTES: usize = 1024;
+const MIN_RSA_KEY_BITS: usize = 2048;
+const MAX_RSA_KEY_BITS: usize = 8192;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TorrentSignature {
@@ -169,6 +172,7 @@ impl TrustStore {
     pub fn add_public_key_pem(&mut self, name: String, pem: &str) -> Result<(), String> {
         let key = RsaPublicKey::from_public_key_pem(pem)
             .map_err(|e| format!("not an RSA public key: {e}"))?;
+        validate_rsa_key_bits(&key)?;
         self.anchors.push(Anchor {
             name: Some(name),
             key,
@@ -227,13 +231,26 @@ impl TrustStore {
     }
 }
 
+fn validate_rsa_key_bits(key: &RsaPublicKey) -> Result<(), String> {
+    let bits = key.size() * 8;
+    if !(MIN_RSA_KEY_BITS..=MAX_RSA_KEY_BITS).contains(&bits) {
+        return Err(format!(
+            "RSA key size {bits} bits is outside allowed range {MIN_RSA_KEY_BITS}..={MAX_RSA_KEY_BITS}"
+        ));
+    }
+    Ok(())
+}
+
 fn certificate_key(cert: &Certificate) -> Result<RsaPublicKey, String> {
     let spki = cert
         .tbs_certificate
         .subject_public_key_info
         .to_der()
         .map_err(|e| format!("bad public key info: {e}"))?;
-    RsaPublicKey::from_public_key_der(&spki).map_err(|_| "certificate key is not RSA".to_string())
+    let key = RsaPublicKey::from_public_key_der(&spki)
+        .map_err(|_| "certificate key is not RSA".to_string())?;
+    validate_rsa_key_bits(&key)?;
+    Ok(key)
 }
 
 /// Verifies `signature` over `message` with `key` using SHA-256, SHA-384, or SHA-512 (SHA-1 is rejected).
@@ -326,22 +343,17 @@ fn certificate_names(cert: &Certificate) -> Vec<String> {
                 let bytes = ext.extn_value.as_bytes();
                 if let Ok(any) = AnyRef::from_der(bytes) {
                     if any.tag() == Tag::Sequence {
-                        let mut slice = any.value();
-                        while !slice.is_empty() {
-                            if let Ok(item) = AnyRef::from_der(slice) {
-                                let item_len = item.to_der().map(|v| v.len()).unwrap_or(0);
-                                if item_len == 0 || item_len > slice.len() {
+                        if let Ok(mut reader) = SliceReader::new(any.value()) {
+                            while !reader.is_finished() {
+                                let Ok(item) = reader.decode::<AnyRef<'_>>() else {
                                     break;
-                                }
-                                slice = &slice[item_len..];
+                                };
                                 // dNSName is [2] IMPLICIT IA5String (context-specific tag 2 = 0x82)
                                 if u8::from(item.tag()) == 0x82 {
                                     if let Ok(s) = std::str::from_utf8(item.value()) {
                                         names.push(s.to_string());
                                     }
                                 }
-                            } else {
-                                break;
                             }
                         }
                     }
@@ -459,23 +471,33 @@ impl TorrentSignature {
                 }
             }
             None => {
-                // No certificate: the signer must be a root we already trust, found by name.
-                let Some(anchor) = trust
+                // No certificate: check every matching trust anchor by name so key rotation (an
+                // older/rotated key registered alongside a newer key under the same signer name)
+                // tries all valid anchors before failing.
+                let mut matched_name = false;
+                let mut had_current = false;
+                for anchor in trust
                     .anchors
                     .iter()
-                    .find(|a| a.name.as_deref() == Some(self.name.as_str()))
-                else {
-                    return SignatureStatus::Untrusted {
-                        reason: format!("no certificate and no trusted key named '{}'", self.name),
-                    };
-                };
-                if !is_anchor_current(anchor) {
-                    return invalid("the trusted certificate has expired");
-                }
-                if rsa_verify(&anchor.key, &message, &self.signature) {
-                    SignatureStatus::Trusted {
-                        signer: self.name.clone(),
+                    .filter(|a| a.name.as_deref() == Some(self.name.as_str()))
+                {
+                    matched_name = true;
+                    if !is_anchor_current(anchor) {
+                        continue;
                     }
+                    had_current = true;
+                    if rsa_verify(&anchor.key, &message, &self.signature) {
+                        return SignatureStatus::Trusted {
+                            signer: self.name.clone(),
+                        };
+                    }
+                }
+                if !matched_name {
+                    SignatureStatus::Untrusted {
+                        reason: format!("no certificate and no trusted key named '{}'", self.name),
+                    }
+                } else if !had_current {
+                    invalid("the trusted certificate has expired")
                 } else {
                     invalid("the signature does not match the torrent")
                 }
@@ -677,5 +699,63 @@ mod tests {
         assert_eq!(problems.len(), 1, "{problems:?}");
         let s = signature(Some("leaf.der"), "sig_sha256.bin", true);
         assert!(s.verify(&read("info.bin"), &store).is_trusted());
+    }
+
+    #[test]
+    fn multi_san_key_rotation_and_weak_key_size_are_enforced() {
+        // 1. Multi-SAN extraction must read every dNSName entry in order via SliceReader.
+        let mut cert = Certificate::from_der(&read("leaf.der")).unwrap();
+        let mut san_inner = Vec::new();
+        for name in [
+            b"alpha.example.org".as_slice(),
+            b"beta.example.org".as_slice(),
+        ] {
+            san_inner.push(0x82);
+            san_inner.push(name.len() as u8);
+            san_inner.extend_from_slice(name);
+        }
+        let mut san_seq = vec![0x30, san_inner.len() as u8];
+        san_seq.extend_from_slice(&san_inner);
+        cert.tbs_certificate
+            .extensions
+            .get_or_insert_with(Vec::new)
+            .push(x509_cert::ext::Extension {
+                extn_id: x509_cert::der::oid::ObjectIdentifier::new_unwrap("2.5.29.17"),
+                critical: false,
+                extn_value: x509_cert::der::asn1::OctetString::new(san_seq).unwrap(),
+            });
+        assert!(certificate_matches_signer_name(&cert, "alpha.example.org"));
+        assert!(certificate_matches_signer_name(&cert, "beta.example.org"));
+
+        // 2. Rotated anchors with the same signer name must try subsequent matching keys.
+        use rsa::pkcs8::EncodePublicKey;
+        let leaf_cert = Certificate::from_der(&read("leaf.der")).unwrap();
+        let leaf_pub = certificate_key(&leaf_cert).unwrap();
+        let leaf_pem = leaf_pub.to_public_key_pem(Default::default()).unwrap();
+        let mut trust = TrustStore::new();
+        // Register wrong key first under the same signer name, then the active leaf key second.
+        trust
+            .add_certificate_der(Some("com.example.signer".into()), &read("other.der"))
+            .unwrap();
+        trust
+            .add_public_key_pem("com.example.signer".into(), &leaf_pem)
+            .unwrap();
+        let rotated_sig = signature(None, "sig_sha256.bin", true);
+        assert_eq!(
+            rotated_sig.verify(&read("info.bin"), &trust),
+            SignatureStatus::Trusted {
+                signer: "com.example.signer".into()
+            }
+        );
+
+        // 3. RSA keys below 2048 bits (e.g., 1024-bit) must be rejected.
+        let weak_key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 1024).unwrap();
+        let weak_pem = weak_key
+            .to_public_key()
+            .to_public_key_pem(Default::default())
+            .unwrap();
+        assert!(trust
+            .add_public_key_pem("com.example.weak".into(), &weak_pem)
+            .is_err());
     }
 }

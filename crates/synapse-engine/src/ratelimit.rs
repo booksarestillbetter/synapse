@@ -13,7 +13,8 @@ pub struct TokenBucket {
     rate_bytes_per_sec: AtomicU64,
     capacity_bytes: AtomicU64,
     tokens: AtomicI64,
-    last_update: parking_lot::Mutex<Instant>,
+    epoch: Instant,
+    last_update_ns: AtomicU64,
 }
 
 impl TokenBucket {
@@ -22,8 +23,17 @@ impl TokenBucket {
             rate_bytes_per_sec: AtomicU64::new(rate_bytes_per_sec),
             capacity_bytes: AtomicU64::new(burst_bytes.max(rate_bytes_per_sec)),
             tokens: AtomicI64::new(burst_bytes.max(rate_bytes_per_sec) as i64),
-            last_update: parking_lot::Mutex::new(Instant::now()),
+            epoch: Instant::now(),
+            last_update_ns: AtomicU64::new(0),
         }
+    }
+
+    #[inline]
+    fn now_ns(&self) -> u64 {
+        Instant::now()
+            .saturating_duration_since(self.epoch)
+            .as_nanos()
+            .min(u128::from(u64::MAX)) as u64
     }
 
     pub fn new_with_3s_burst(rate_bytes_per_sec: u64) -> Self {
@@ -52,17 +62,25 @@ impl TokenBucket {
     }
 
     pub fn set_rate(&self, rate_bytes_per_sec: u64, burst_bytes: u64) {
-        self.rate_bytes_per_sec
-            .store(rate_bytes_per_sec, Ordering::Relaxed);
+        let prev_rate = self
+            .rate_bytes_per_sec
+            .swap(rate_bytes_per_sec, Ordering::Relaxed);
         let cap = if burst_bytes > 0 {
             burst_bytes.max(rate_bytes_per_sec)
         } else {
             rate_bytes_per_sec.saturating_mul(3)
         };
         self.capacity_bytes.store(cap, Ordering::Relaxed);
-        let current = self.tokens.load(Ordering::Relaxed);
-        if current > cap as i64 {
+        if prev_rate == 0 && rate_bytes_per_sec > 0 {
+            self.last_update_ns.store(self.now_ns(), Ordering::Relaxed);
             self.tokens.store(cap as i64, Ordering::Relaxed);
+        } else {
+            let cap_i64 = cap.min(i64::MAX as u64) as i64;
+            let _ = self
+                .tokens
+                .fetch_update_compat(Ordering::Relaxed, Ordering::Relaxed, |t| {
+                    (t > cap_i64).then_some(cap_i64)
+                });
         }
     }
 
@@ -96,23 +114,48 @@ impl TokenBucket {
             return;
         }
 
-        let mut last = self.last_update.lock();
-        let now = Instant::now();
-        let elapsed = now.duration_since(*last);
-
-        let added_tokens = (elapsed.as_secs_f64() * rate as f64) as i64;
-        if added_tokens > 0 {
-            let cap = self.capacity_bytes.load(Ordering::Relaxed) as i64;
-            // Atomic read-modify-write: consumers subtract without taking the refill lock, and a
-            // plain load/store here could overwrite (lose) a concurrent consumption.
-            let _ = self
-                .tokens
-                .fetch_update_compat(Ordering::Relaxed, Ordering::Relaxed, |t| {
-                    Some((t + added_tokens).min(cap))
-                });
-
-            let time_advanced = Duration::from_secs_f64(added_tokens as f64 / rate as f64);
-            *last += time_advanced;
+        let now_ns = self.now_ns();
+        let mut last_ns = self.last_update_ns.load(Ordering::Acquire);
+        loop {
+            if now_ns <= last_ns {
+                return;
+            }
+            let elapsed_ns = now_ns - last_ns;
+            let added_tokens_u128 = (u128::from(elapsed_ns) * u128::from(rate)) / 1_000_000_000u128;
+            if added_tokens_u128 == 0 {
+                return;
+            }
+            let consumed_ns = added_tokens_u128
+                .saturating_mul(1_000_000_000u128)
+                .div_ceil(u128::from(rate))
+                .min(u128::from(elapsed_ns)) as u64;
+            if consumed_ns == 0 {
+                return;
+            }
+            let next_ns = last_ns.saturating_add(consumed_ns);
+            match self.last_update_ns.compare_exchange_weak(
+                last_ns,
+                next_ns,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    let added = added_tokens_u128.min(i64::MAX as u128) as i64;
+                    let cap = self
+                        .capacity_bytes
+                        .load(Ordering::Relaxed)
+                        .min(i64::MAX as u64) as i64;
+                    let _ = self.tokens.fetch_update_compat(
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                        |t| Some(t.saturating_add(added).min(cap)),
+                    );
+                    return;
+                }
+                Err(actual) => {
+                    last_ns = actual;
+                }
+            }
         }
     }
 
@@ -257,6 +300,44 @@ mod tests {
         assert!(
             taken.load(Ordering::Relaxed) <= 80_000_000,
             "took more than could have been consumed"
+        );
+    }
+
+    #[test]
+    fn set_rate_from_unthrottled_resets_clock_and_caps_refill_under_contention() {
+        let tb = std::sync::Arc::new(TokenBucket::unthrottled());
+        // Simulate idle unthrottled duration so `now_ns > 0`, then enable throttling cleanly.
+        std::thread::sleep(Duration::from_millis(20));
+        tb.set_rate(20_000, 10_000);
+        assert_eq!(tb.available_tokens(), 20_000);
+        assert!(tb.try_consume(20_000));
+        assert!(!tb.try_consume(1_000));
+
+        // Multiple threads calling `try_consume` concurrently must never exceed capacity + refill.
+        let taken = std::sync::Arc::new(AtomicU64::new(0));
+        let start = Instant::now();
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let (tb, taken) = (tb.clone(), taken.clone());
+                std::thread::spawn(move || {
+                    for _ in 0..500 {
+                        if tb.try_consume(100) {
+                            taken.fetch_add(100, Ordering::Relaxed);
+                        }
+                        std::thread::yield_now();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let elapsed = start.elapsed();
+        let max_expected = ((elapsed.as_secs_f64() + 0.05) * 20_000.0) as u64 + 1_000;
+        assert!(
+            taken.load(Ordering::Relaxed) <= max_expected,
+            "took {} exceeding rate budget {max_expected}",
+            taken.load(Ordering::Relaxed)
         );
     }
 }

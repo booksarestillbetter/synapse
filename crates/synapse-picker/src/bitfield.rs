@@ -15,8 +15,11 @@ impl Bitfield {
         }
     }
 
-    /// Builds a `Bitfield` from wire-format bytes. `None` if `data`'s length doesn't
-    /// match what `len` bits requires.
+    /// Builds a `Bitfield` from wire-format bytes. `None` if `data`'s length doesn't match
+    /// what `len` bits requires. Non-zero trailing padding bits in the last byte are
+    /// tolerated and simply ignored (as the struct doc says): `has`/`set`/`unset` all
+    /// bounds-check against `len`, so those bits are never observable regardless of their
+    /// wire value, and some peer implementations send them non-zero despite the spec.
     pub fn from_bytes(data: &[u8], len: usize) -> Option<Bitfield> {
         if data.len() != len.div_ceil(8) {
             return None;
@@ -306,6 +309,23 @@ mod tests {
     fn from_bytes_rejects_wrong_length() {
         assert!(Bitfield::from_bytes(&[0u8; 1], 9).is_none());
         assert!(Bitfield::from_bytes(&[0u8; 2], 9).is_some());
+    }
+
+    #[test]
+    fn from_bytes_ignores_nonzero_trailing_spare_bits() {
+        // 9 pieces -> byte 1 uses only bit 0x80; bits 0x7F are trailing spare bits that a
+        // nonconforming peer may send non-zero. They must not affect `has()` for any in-range
+        // index, and the bitfield as a whole must still be accepted rather than dropped.
+        for second_byte in [0x80u8, 0x81, 0xFF] {
+            let bf = Bitfield::from_bytes(&[0xFF, second_byte], 9).unwrap();
+            assert!(bf.has(8), "the one real bit in byte 1 must still be set");
+            assert!((0..8).all(|i| bf.has(i)), "byte 0's real bits are unaffected");
+        }
+        // 1 piece -> same for a single spare-bit byte.
+        for byte in [0x80u8, 0x81, 0xFF] {
+            let bf = Bitfield::from_bytes(&[byte], 1).unwrap();
+            assert!(bf.has(0));
+        }
     }
 
     #[test]

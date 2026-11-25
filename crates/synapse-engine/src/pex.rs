@@ -16,10 +16,17 @@ use synapse_wire::UtPexMessage;
 /// the candidate pool with junk addresses in a single frame.
 pub const MAX_PEX_PEERS_PER_MESSAGE: usize = 50;
 
+fn canonical_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(ip),
+        v4 => v4,
+    }
+}
+
 /// Whether `ip` is an address that must never be dialled on the word of an untrusted
 /// peer: unspecified, loopback, multicast and link-local ranges, plus IPv4 broadcast.
 fn is_never_dialable(ip: IpAddr) -> bool {
-    match ip {
+    match canonical_ip(ip) {
         IpAddr::V4(v4) => {
             v4.is_unspecified()
                 || v4.octets()[0] == 0
@@ -39,7 +46,7 @@ fn is_never_dialable(ip: IpAddr) -> bool {
 
 /// Whether `ip` is in a private/unique-local/CGNAT range (RFC 1918, RFC 6598 100.64.0.0/10, fc00::/7).
 fn is_private_range(ip: IpAddr) -> bool {
-    match ip {
+    match canonical_ip(ip) {
         IpAddr::V4(v4) => {
             v4.is_private() || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xc0) == 64)
         }
@@ -52,10 +59,12 @@ fn is_private_range(ip: IpAddr) -> bool {
 /// private/loopback network (a genuine LAN swarm), so a remote peer cannot steer us into
 /// dialling addresses on our own internal network.
 pub fn pex_address_allowed(addr: SocketAddr, source: IpAddr) -> bool {
-    if addr.port() == 0 || is_never_dialable(addr.ip()) {
+    let target_ip = canonical_ip(addr.ip());
+    let source_ip = canonical_ip(source);
+    if addr.port() == 0 || is_never_dialable(target_ip) {
         return false;
     }
-    !is_private_range(addr.ip()) || is_private_range(source) || source.is_loopback()
+    !is_private_range(target_ip) || is_private_range(source_ip) || source_ip.is_loopback()
 }
 
 /// Decides whether a peer address learned via BEP 55 holepunch `Connect` from `source` may
@@ -63,13 +72,15 @@ pub fn pex_address_allowed(addr: SocketAddr, source: IpAddr) -> bool {
 /// link-local, unspecified, multicast, broadcast, or port 0. Allows loopback only when the
 /// rendezvous peer `source` is itself on loopback (local test harness).
 pub fn holepunch_address_allowed(addr: SocketAddr, source: IpAddr) -> bool {
+    let target_ip = canonical_ip(addr.ip());
+    let source_ip = canonical_ip(source);
     if addr.port() == 0 {
         return false;
     }
-    if addr.ip().is_loopback() {
-        return source.is_loopback();
+    if target_ip.is_loopback() {
+        return source_ip.is_loopback();
     }
-    pex_address_allowed(addr, source)
+    pex_address_allowed(addr, source_ip)
 }
 
 pub struct PexManager {
@@ -328,5 +339,18 @@ mod tests {
         };
         let discovered = pex.ingest_pex_message(incoming_msg, PUBLIC_SRC);
         assert!(discovered.is_empty()); // Dropped completely for private
+    }
+
+    #[test]
+    fn ipv4_mapped_internal_addresses_from_public_source_are_rejected() {
+        let mapped_loopback: SocketAddr = "[::ffff:127.0.0.1]:6881".parse().unwrap();
+        let mapped_private: SocketAddr = "[::ffff:10.0.0.5]:6881".parse().unwrap();
+        assert!(!pex_address_allowed(mapped_loopback, PUBLIC_SRC));
+        assert!(!pex_address_allowed(mapped_private, PUBLIC_SRC));
+        assert!(!holepunch_address_allowed(mapped_loopback, PUBLIC_SRC));
+        assert!(pex_address_allowed(
+            "[::ffff:93.184.216.34]:6881".parse().unwrap(),
+            PUBLIC_SRC
+        ));
     }
 }

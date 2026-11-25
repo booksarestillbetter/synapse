@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
 
-use crate::cache::FileCache;
+use crate::cache::{FileCache, OpenMode};
 use crate::{DiskError, ReadJob, Result, WriteJob};
 
 pub(crate) const DEFAULT_MAX_WRITE_BUFFER_BYTES: usize = 100 * 1024 * 1024; // 100 MiB
@@ -51,30 +51,40 @@ impl BlockingDiskEngine {
 
     pub async fn write_batch(&self, jobs: Vec<WriteJob>) -> Result<()> {
         let jobs = crate::coalesce_write_jobs(jobs);
-        let total_bytes: usize = jobs.iter().map(|j| j.data.len()).sum();
-        if total_bytes == 0 {
+        if jobs.is_empty() {
             return Ok(());
         }
+        let total_bytes: usize = jobs.iter().map(|j| j.data.len()).sum();
+        let reservation = if total_bytes > 0 {
+            Some(
+                self.budget
+                    .reserve(total_bytes)
+                    .await
+                    .map_err(|e| DiskError::Io {
+                        path: PathBuf::from("<buffer>"),
+                        source: std::io::Error::new(std::io::ErrorKind::BrokenPipe, e),
+                    })?,
+            )
+        } else {
+            None
+        };
 
-        let _reservation = self
-            .budget
-            .reserve(total_bytes)
-            .await
-            .map_err(|e| DiskError::Io {
-                path: PathBuf::from("<buffer>"),
-                source: std::io::Error::new(std::io::ErrorKind::BrokenPipe, e),
-            })?;
-
+        let first_path = (*jobs[0].path).clone();
         let cache = self.cache.clone();
         tokio::task::spawn_blocking(move || {
+            // Keep the reservation alive inside the blocking task until all writes finish,
+            // even if the outer future is dropped/cancelled mid-flight.
+            let _reservation = reservation;
             for job in jobs {
                 write_one(&cache, job)?;
             }
             Ok::<_, DiskError>(())
         })
         .await
-        .expect("blocking disk write task panicked")?;
-        Ok(())
+        .map_err(|e| DiskError::Io {
+            path: first_path,
+            source: std::io::Error::other(e),
+        })?
     }
 
     pub fn in_flight_write_bytes(&self) -> usize {
@@ -91,16 +101,21 @@ impl BlockingDiskEngine {
 
     pub async fn read(&self, job: ReadJob) -> Result<Bytes> {
         let cache = self.cache.clone();
+        let err_path = (*job.path).clone();
         tokio::task::spawn_blocking(move || read_one(&cache, job))
             .await
-            .expect("blocking disk read task panicked")
+            .map_err(|e| DiskError::Io {
+                path: err_path,
+                source: std::io::Error::other(e),
+            })?
     }
 
     pub async fn sync(&self, path: Arc<PathBuf>) -> Result<()> {
         let cache = self.cache.clone();
+        let err_path = (*path).clone();
         tokio::task::spawn_blocking(move || {
             let file = cache
-                .get_or_open(&path, None)
+                .get_or_open(&path, OpenMode::ReadOnly)
                 .map_err(|source| DiskError::Io {
                     path: (*path).clone(),
                     source,
@@ -111,7 +126,10 @@ impl BlockingDiskEngine {
             })
         })
         .await
-        .expect("blocking disk sync task panicked")
+        .map_err(|e| DiskError::Io {
+            path: err_path,
+            source: std::io::Error::other(e),
+        })?
     }
 
     pub fn evict(&self, path: &std::path::Path) {
@@ -121,11 +139,19 @@ impl BlockingDiskEngine {
 
 fn write_one(cache: &FileCache, job: WriteJob) -> Result<()> {
     let file = cache
-        .get_or_open(&job.path, Some(job.file_len))
+        .get_or_open(
+            &job.path,
+            OpenMode::Write {
+                file_len: job.file_len,
+            },
+        )
         .map_err(|source| DiskError::Io {
             path: (*job.path).clone(),
             source,
         })?;
+    if job.data.is_empty() {
+        return Ok(());
+    }
     file.write_all_at(&job.data, job.offset)
         .map_err(|source| DiskError::Io {
             path: (*job.path).clone(),
@@ -135,7 +161,7 @@ fn write_one(cache: &FileCache, job: WriteJob) -> Result<()> {
 
 fn read_one(cache: &FileCache, job: ReadJob) -> Result<Bytes> {
     let file = cache
-        .get_or_open(&job.path, None)
+        .get_or_open(&job.path, OpenMode::ReadOnly)
         .map_err(|source| DiskError::Io {
             path: (*job.path).clone(),
             source,

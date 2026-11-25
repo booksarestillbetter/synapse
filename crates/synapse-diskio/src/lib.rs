@@ -138,6 +138,16 @@ impl DiskEngine {
         }
     }
 
+    /// Drops any cached file handle for `path` so unlinked/moved files can be reclaimed
+    /// immediately and subsequent opens see the current directory entry.
+    pub fn evict(&self, path: &std::path::Path) {
+        match self {
+            DiskEngine::Blocking(e) => e.evict(path),
+            #[cfg(target_os = "linux")]
+            DiskEngine::IoUring(e) => e.evict(path),
+        }
+    }
+
     /// Number of bytes currently queued in in-flight disk writes.
     pub fn in_flight_write_bytes(&self) -> usize {
         match self {
@@ -166,7 +176,7 @@ impl DiskEngine {
     }
 }
 
-/// Coalesces contiguous block writes into unified OS disk writes in O(N) time.
+/// Coalesces contiguous block writes into unified OS disk writes.
 pub fn coalesce_write_jobs(mut jobs: Vec<WriteJob>) -> Vec<WriteJob> {
     if jobs.len() <= 1 {
         return jobs;
@@ -176,13 +186,20 @@ pub fn coalesce_write_jobs(mut jobs: Vec<WriteJob>) -> Vec<WriteJob> {
     let mut coalesced: Vec<WriteJob> = Vec::with_capacity(jobs.len());
     let mut i = 0;
     while i < jobs.len() {
-        let mut end_offset = jobs[i].offset + jobs[i].data.len() as u64;
+        let Some(mut end_offset) = jobs[i].offset.checked_add(jobs[i].data.len() as u64) else {
+            coalesced.push(jobs[i].clone());
+            i += 1;
+            continue;
+        };
         let mut total_len = jobs[i].data.len();
         let mut max_file_len = jobs[i].file_len;
         let mut j = i + 1;
         while j < jobs.len() && jobs[j].path == jobs[i].path && jobs[j].offset == end_offset {
+            let Some(next_end) = end_offset.checked_add(jobs[j].data.len() as u64) else {
+                break;
+            };
             total_len += jobs[j].data.len();
-            end_offset += jobs[j].data.len() as u64;
+            end_offset = next_end;
             max_file_len = max_file_len.max(jobs[j].file_len);
             j += 1;
         }

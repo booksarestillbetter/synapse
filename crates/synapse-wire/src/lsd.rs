@@ -27,19 +27,30 @@ pub enum LsdError {
     InvalidInfoHash,
 }
 
-/// Formats a BEP 14/22 LSD multicast announcement string.
+/// Formats a BEP 14/22 LSD multicast announcement string for the default IPv4 multicast host.
 pub fn format_lsd_announce(port: u16, info_hashes: &[[u8; 20]], cookie: Option<&str>) -> String {
+    format_lsd_announce_for_host(LSD_MULTICAST_IPV4, port, info_hashes, cookie)
+}
+
+/// Formats a BEP 14/22 LSD multicast announcement string with an explicit `Host:` header
+/// (`LSD_MULTICAST_IPV4` or `LSD_MULTICAST_IPV6`).
+pub fn format_lsd_announce_for_host(
+    host: &str,
+    port: u16,
+    info_hashes: &[[u8; 20]],
+    cookie: Option<&str>,
+) -> String {
     let mut msg = String::with_capacity(256);
     msg.push_str("BT-SEARCH * HTTP/1.1\r\n");
-    msg.push_str("Host: 239.192.152.143:6771\r\n");
-    msg.push_str(&format!("Port: {}\r\n", port));
+    msg.push_str(&format!("Host: {host}\r\n"));
+    msg.push_str(&format!("Port: {port}\r\n"));
 
     for hash in info_hashes {
         msg.push_str(&format!("Infohash: {}\r\n", hex::encode(hash)));
     }
 
     if let Some(c) = cookie {
-        msg.push_str(&format!("cookie: {}\r\n", c));
+        msg.push_str(&format!("cookie: {c}\r\n"));
     }
 
     msg.push_str("\r\n\r\n");

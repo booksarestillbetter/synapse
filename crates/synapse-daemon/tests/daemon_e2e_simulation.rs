@@ -122,7 +122,9 @@ async fn test_daemon_full_simulation_with_logging_and_syslog() {
         .text()
         .await
         .unwrap();
-    assert!(swagger_html.contains("SwaggerUIBundle"));
+    assert!(swagger_html.contains("Synapse 2.0 REST API Explorer"));
+    assert!(swagger_html.contains("/api-docs/openapi.json"));
+    assert!(!swagger_html.contains("unpkg.com"));
 
     // 8. Test Simulated Swarm Load (Adding, inspecting, pausing, resuming, deleting)
     for i in 0..10 {

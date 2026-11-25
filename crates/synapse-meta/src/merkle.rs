@@ -29,21 +29,11 @@ pub fn compute_file_merkle_root(file_bytes: &[u8]) -> [u8; 32] {
         return [0u8; 32];
     }
 
-    let mut current_layer: Vec<[u8; 32]> = file_bytes.chunks(BLOCK_SIZE).map(hash_block).collect();
-
-    // Round up to next power of 2 with zero hashes
-    let num_leaves = current_layer.len().next_power_of_two();
-    current_layer.resize(num_leaves, [0u8; 32]);
-
-    while current_layer.len() > 1 {
-        let mut next_layer = Vec::with_capacity(current_layer.len() / 2);
-        for chunk in current_layer.as_chunks::<2>().0.iter() {
-            next_layer.push(hash_parent(&chunk[0], &chunk[1]));
-        }
-        current_layer = next_layer;
+    let mut hasher = MerkleFileHasher::new(BLOCK_SIZE);
+    for block in file_bytes.chunks(BLOCK_SIZE) {
+        hasher.push_block(block);
     }
-
-    current_layer[0]
+    hasher.finish().0
 }
 
 /// Computes the piece layer hashes for a file given a specific `piece_length`.
@@ -78,19 +68,103 @@ pub fn compute_file_piece_layer(file_bytes: &[u8], piece_length: usize) -> Vec<[
     piece_hashes
 }
 
+/// Precomputed root hash of an all-zero Merkle subtree at `height` (where height `0` is a single
+/// all-zero 32-byte leaf hash and height `h` has `2^h` leaves).
+fn zero_hash_at_height(height: usize) -> [u8; 32] {
+    static ZERO_HASHES: std::sync::OnceLock<[[u8; 32]; 64]> = std::sync::OnceLock::new();
+    let table = ZERO_HASHES.get_or_init(|| {
+        let mut t = [[0u8; 32]; 64];
+        for i in 1..64 {
+            t[i] = hash_parent(&t[i - 1], &t[i - 1]);
+        }
+        t
+    });
+    table[height.min(63)]
+}
+
 /// Root of the subtree of `leaves_per_piece` zero leaf hashes, i.e. the padding hash used
 /// above the piece layer when a file's piece count is not a power of two.
 fn zero_subtree_root(leaves_per_piece: usize) -> [u8; 32] {
-    let mut layer = vec![[0u8; 32]; leaves_per_piece.max(1)];
-    while layer.len() > 1 {
-        layer = layer
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|c| hash_parent(&c[0], &c[1]))
-            .collect();
+    let target = leaves_per_piece.max(1).next_power_of_two();
+    zero_hash_at_height(target.trailing_zeros() as usize)
+}
+
+/// O(log N)-space streaming BEP 52 Merkle hasher producing both the file's `pieces root` and its
+/// `piece layers` entry in a single sequential pass over 16 KiB blocks.
+pub struct MerkleFileHasher {
+    piece_height: usize,
+    blocks_per_piece: u64,
+    block_count: u64,
+    stack: [Option<[u8; 32]>; 64],
+    piece_layer: Vec<[u8; 32]>,
+}
+
+impl MerkleFileHasher {
+    pub fn new(piece_length: usize) -> Self {
+        let blocks_per_piece = (piece_length / BLOCK_SIZE).max(1).next_power_of_two() as u64;
+        let piece_height = blocks_per_piece.trailing_zeros() as usize;
+        Self {
+            piece_height,
+            blocks_per_piece,
+            block_count: 0,
+            stack: [None; 64],
+            piece_layer: Vec::new(),
+        }
     }
-    layer[0]
+
+    pub fn push_leaf(&mut self, leaf: [u8; 32]) {
+        let mut node = leaf;
+        let mut h = 0usize;
+        if h == self.piece_height {
+            self.piece_layer.push(node);
+        }
+        while let Some(left) = self.stack[h].take() {
+            node = hash_parent(&left, &node);
+            h += 1;
+            if h == self.piece_height {
+                self.piece_layer.push(node);
+            }
+        }
+        self.stack[h] = Some(node);
+        self.block_count += 1;
+    }
+
+    pub fn push_block(&mut self, block: &[u8]) {
+        self.push_leaf(hash_block(block));
+    }
+
+    pub fn finish(mut self) -> ([u8; 32], Vec<[u8; 32]>) {
+        if self.block_count == 0 {
+            return ([0u8; 32], Vec::new());
+        }
+        let target_height = self.block_count.next_power_of_two().trailing_zeros() as usize;
+        let root = if self.block_count.is_power_of_two() {
+            self.stack[target_height].expect("power-of-two root present")
+        } else {
+            let mut h = self
+                .stack
+                .iter()
+                .position(Option::is_some)
+                .expect("non-empty carry stack");
+            let mut node = self.stack[h].take().expect("checked");
+            while h < target_height {
+                if let Some(left) = self.stack[h].take() {
+                    node = hash_parent(&left, &node);
+                } else {
+                    node = hash_parent(&node, &zero_hash_at_height(h));
+                }
+                h += 1;
+                if h == self.piece_height {
+                    self.piece_layer.push(node);
+                }
+            }
+            node
+        };
+        if self.block_count <= self.blocks_per_piece {
+            self.piece_layer.clear();
+        }
+        (root, self.piece_layer)
+    }
 }
 
 /// A file's Merkle root and piece layer from the hashes of its 16 KiB blocks (the leaves),
@@ -98,31 +172,11 @@ fn zero_subtree_root(leaves_per_piece: usize) -> [u8; 32] {
 /// empty for a file that fits in one piece (its root is then its only hash). Equivalent to
 /// [`compute_file_merkle_root`] and [`compute_file_piece_layer`] over the same bytes.
 pub fn root_and_piece_layer(leaves: &[[u8; 32]], piece_length: usize) -> ([u8; 32], Vec<[u8; 32]>) {
-    if leaves.is_empty() {
-        return ([0u8; 32], Vec::new());
+    let mut hasher = MerkleFileHasher::new(piece_length);
+    for &leaf in leaves {
+        hasher.push_leaf(leaf);
     }
-    let blocks_per_piece = (piece_length / BLOCK_SIZE).max(1).next_power_of_two();
-    let mut level: Vec<[u8; 32]> = leaves.to_vec();
-    level.resize(level.len().next_power_of_two(), [0u8; 32]);
-    let mut piece_layer = Vec::new();
-    let mut width = 1usize;
-    loop {
-        if width == blocks_per_piece && leaves.len() > blocks_per_piece {
-            let pieces = leaves.len().div_ceil(blocks_per_piece);
-            piece_layer = level[..pieces].to_vec();
-        }
-        if level.len() == 1 {
-            break;
-        }
-        level = level
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|c| hash_parent(&c[0], &c[1]))
-            .collect();
-        width *= 2;
-    }
-    (level[0], piece_layer)
+    hasher.finish()
 }
 
 /// Recomputes a file's Merkle root from its piece layer (`piece_layer` is the concatenated
@@ -688,6 +742,65 @@ mod tests {
                 Vec::new()
             };
             assert_eq!(layer, expected, "layer for {len}/{piece}");
+        }
+    }
+
+    #[test]
+    fn streaming_carry_stack_matches_full_tree_and_zero_subtree_up_to_1024() {
+        for pow in [1usize, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024] {
+            let mut layer = vec![[0u8; 32]; pow];
+            while layer.len() > 1 {
+                layer = layer
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|c| hash_parent(&c[0], &c[1]))
+                    .collect();
+            }
+            assert_eq!(zero_subtree_root(pow), layer[0], "zero_subtree_root({pow})");
+        }
+
+        fn ref_root_and_layer(
+            leaves: &[[u8; 32]],
+            piece_blocks: usize,
+        ) -> ([u8; 32], Vec<[u8; 32]>) {
+            if leaves.is_empty() {
+                return ([0u8; 32], Vec::new());
+            }
+            let mut level = leaves.to_vec();
+            level.resize(level.len().next_power_of_two(), [0u8; 32]);
+            let mut layer = Vec::new();
+            let mut width = 1usize;
+            loop {
+                if width == piece_blocks && leaves.len() > piece_blocks {
+                    layer = level[..leaves.len().div_ceil(piece_blocks)].to_vec();
+                }
+                if level.len() == 1 {
+                    break;
+                }
+                level = level
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|c| hash_parent(&c[0], &c[1]))
+                    .collect();
+                width *= 2;
+            }
+            (level[0], layer)
+        }
+
+        let all_leaves: Vec<[u8; 32]> = (0..35u8).map(|i| hash_block(&[i; 64])).collect();
+        for piece_blocks in [1usize, 2, 4, 8, 16] {
+            let piece_len = piece_blocks * BLOCK_SIZE;
+            for n in 0..=35 {
+                let mut hasher = MerkleFileHasher::new(piece_len);
+                for &leaf in &all_leaves[..n] {
+                    hasher.push_leaf(leaf);
+                }
+                let got = hasher.finish();
+                let want = ref_root_and_layer(&all_leaves[..n], piece_blocks);
+                assert_eq!(got, want, "mismatch for n={n}, piece_blocks={piece_blocks}");
+            }
         }
     }
 }

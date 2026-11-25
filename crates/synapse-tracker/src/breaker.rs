@@ -13,6 +13,9 @@ pub enum CircuitState {
     Recovering,
 }
 
+const CANARY_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_TRACKED_HOSTS: usize = 4096;
+
 #[derive(Debug, Clone)]
 pub struct HostCircuitInfo {
     pub consecutive_failures: u32,
@@ -20,6 +23,7 @@ pub struct HostCircuitInfo {
     pub last_failure: Option<Instant>,
     pub backoff_duration: Duration,
     pub canary_in_flight: bool,
+    pub canary_started_at: Option<Instant>,
     pub recovery_started_at: Option<Instant>,
     pub consecutive_successes: u32,
     pub last_dispatched: Option<Instant>,
@@ -33,6 +37,7 @@ impl Default for HostCircuitInfo {
             last_failure: None,
             backoff_duration: Duration::from_secs(30),
             canary_in_flight: false,
+            canary_started_at: None,
             recovery_started_at: None,
             consecutive_successes: 0,
             last_dispatched: None,
@@ -79,19 +84,65 @@ impl CanaryCircuitBreaker {
         }
     }
 
+    fn evict_one(map: &mut HashMap<String, HostCircuitInfo>) {
+        const STALE_TRIPPED_CUTOFF: Duration = Duration::from_secs(3600);
+        let key = map
+            .iter()
+            .find(|(_, info)| info.state == CircuitState::Healthy)
+            .or_else(|| {
+                map.iter().find(|(_, info)| {
+                    info.state == CircuitState::Tripped
+                        && info.last_failure.is_some_and(|f| {
+                            f.elapsed() >= info.backoff_duration.max(STALE_TRIPPED_CUTOFF)
+                        })
+                })
+            })
+            .map(|(k, _)| k.clone())
+            .or_else(|| {
+                map.iter()
+                    .min_by_key(|(_, info)| info.last_failure)
+                    .map(|(k, _)| k.clone())
+            });
+        if let Some(k) = key {
+            map.remove(&k);
+        }
+    }
+
     /// Checks whether an announce request to this tracker URL is permitted.
     pub fn can_announce(&self, tracker_url: &str) -> bool {
         let host = Self::extract_host(tracker_url);
+        {
+            let map = self.hosts.read();
+            match map.get(&host) {
+                None => return true,
+                Some(entry) if entry.state == CircuitState::Healthy => return true,
+                Some(entry)
+                    if entry.state == CircuitState::Tripped
+                        && entry
+                            .last_failure
+                            .is_none_or(|f| f.elapsed() < entry.backoff_duration) =>
+                {
+                    return false;
+                }
+                Some(_) => {}
+            }
+        }
+
         let mut map = self.hosts.write();
-        let entry = map.entry(host.clone()).or_default();
+        let Some(entry) = map.get_mut(&host) else {
+            return true;
+        };
 
         match entry.state {
             CircuitState::Healthy => true,
             CircuitState::Tripped => {
                 if let Some(last_fail) = entry.last_failure {
                     if last_fail.elapsed() >= entry.backoff_duration {
+                        let now = Instant::now();
                         entry.state = CircuitState::HalfOpenCanary;
                         entry.canary_in_flight = true;
+                        entry.canary_started_at = Some(now);
+                        entry.last_dispatched = Some(now);
                         info!(
                             "Circuit breaker for host {} transitioned to HalfOpenCanary. Dispatching canary probe.",
                             host
@@ -105,9 +156,14 @@ impl CanaryCircuitBreaker {
                 }
             }
             CircuitState::HalfOpenCanary => {
-                if !entry.canary_in_flight {
+                let timed_out = entry
+                    .canary_started_at
+                    .is_some_and(|started| started.elapsed() >= CANARY_TIMEOUT);
+                if !entry.canary_in_flight || timed_out {
+                    let now = Instant::now();
                     entry.canary_in_flight = true;
-                    entry.last_dispatched = Some(Instant::now());
+                    entry.canary_started_at = Some(now);
+                    entry.last_dispatched = Some(now);
                     true
                 } else {
                     false
@@ -125,9 +181,7 @@ impl CanaryCircuitBreaker {
                         "Host {} completed recovery ramp-up with {} successes. Circuit breaker promoted to Healthy.",
                         host, entry.consecutive_successes
                     );
-                    entry.state = CircuitState::Healthy;
-                    entry.recovery_started_at = None;
-                    entry.last_dispatched = Some(now);
+                    map.remove(&host);
                     return true;
                 }
 
@@ -159,38 +213,47 @@ impl CanaryCircuitBreaker {
     /// or progressing through recovery towards healthy.
     pub fn record_success(&self, tracker_url: &str) {
         let host = Self::extract_host(tracker_url);
+        if !self.hosts.read().contains_key(&host) {
+            return;
+        }
         let mut map = self.hosts.write();
-        if let Some(entry) = map.get_mut(&host) {
-            match entry.state {
-                CircuitState::HalfOpenCanary => {
-                    info!(
-                        "Canary probe succeeded for host {}! Circuit breaker entering Recovering ramp-up phase.",
-                        host
-                    );
-                    entry.consecutive_failures = 0;
-                    entry.state = CircuitState::Recovering;
-                    entry.recovery_started_at = Some(Instant::now());
-                    entry.consecutive_successes = 1;
-                    entry.last_failure = None;
-                    entry.backoff_duration = self.initial_backoff;
-                    entry.canary_in_flight = false;
-                    entry.last_dispatched = Some(Instant::now());
-                }
-                CircuitState::Recovering => {
-                    entry.consecutive_successes += 1;
-                    entry.consecutive_failures = 0;
-                    entry.canary_in_flight = false;
-                }
-                CircuitState::Healthy => {
-                    entry.consecutive_failures = 0;
-                    entry.last_failure = None;
-                    entry.canary_in_flight = false;
-                }
-                CircuitState::Tripped => {
-                    entry.consecutive_failures = 0;
-                    entry.canary_in_flight = false;
+        let remove_healthy = match map.get_mut(&host) {
+            Some(entry) => {
+                entry.canary_started_at = None;
+                match entry.state {
+                    CircuitState::HalfOpenCanary => {
+                        info!(
+                            "Canary probe succeeded for host {}! Circuit breaker entering Recovering ramp-up phase.",
+                            host
+                        );
+                        entry.consecutive_failures = 0;
+                        entry.state = CircuitState::Recovering;
+                        entry.recovery_started_at = Some(Instant::now());
+                        entry.consecutive_successes = 1;
+                        entry.last_failure = None;
+                        entry.backoff_duration = self.initial_backoff;
+                        entry.canary_in_flight = false;
+                        entry.last_dispatched = Some(Instant::now());
+                        false
+                    }
+                    CircuitState::Recovering => {
+                        entry.consecutive_successes += 1;
+                        entry.consecutive_failures = 0;
+                        entry.canary_in_flight = false;
+                        false
+                    }
+                    CircuitState::Healthy => true,
+                    CircuitState::Tripped => {
+                        entry.consecutive_failures = 0;
+                        entry.canary_in_flight = false;
+                        false
+                    }
                 }
             }
+            None => false,
+        };
+        if remove_healthy {
+            map.remove(&host);
         }
     }
 
@@ -199,11 +262,15 @@ impl CanaryCircuitBreaker {
     pub fn record_failure(&self, tracker_url: &str) {
         let host = Self::extract_host(tracker_url);
         let mut map = self.hosts.write();
+        if !map.contains_key(&host) && map.len() >= MAX_TRACKED_HOSTS {
+            Self::evict_one(&mut map);
+        }
         let entry = map.entry(host.clone()).or_default();
 
         entry.consecutive_failures += 1;
         entry.last_failure = Some(Instant::now());
         entry.canary_in_flight = false;
+        entry.canary_started_at = None;
         entry.consecutive_successes = 0;
 
         match entry.state {
@@ -271,12 +338,16 @@ impl CanaryCircuitBreaker {
     pub fn force_trip(&self, host: &str) {
         let host = host.to_lowercase();
         let mut map = self.hosts.write();
+        if !map.contains_key(&host) && map.len() >= MAX_TRACKED_HOSTS {
+            Self::evict_one(&mut map);
+        }
         let entry = map.entry(host.clone()).or_default();
         entry.state = CircuitState::Tripped;
         entry.consecutive_failures = self.failure_threshold.max(entry.consecutive_failures);
         entry.last_failure = Some(Instant::now());
         entry.backoff_duration = self.initial_backoff;
         entry.canary_in_flight = false;
+        entry.canary_started_at = None;
         entry.recovery_started_at = None;
         entry.consecutive_successes = 0;
         warn!("Tracker host {} force-tripped via manual override.", host);
@@ -470,5 +541,73 @@ mod tests {
             .recovery_progress_pct(&status)
             .expect("should be Some while Recovering");
         assert!((0.0..=100.0).contains(&pct));
+    }
+
+    #[test]
+    fn healthy_read_fast_path_stuck_canary_timeout_and_bounded_eviction() {
+        let cb = CanaryCircuitBreaker::new(1, Duration::from_millis(5), Duration::from_secs(1));
+        assert!(cb.can_announce("http://healthy-fastpath.example/announce"));
+        assert!(
+            cb.all_hosts().is_empty(),
+            "healthy host check must not allocate or insert"
+        );
+
+        let url = "http://stuck-canary.example/announce";
+        cb.record_failure(url);
+        std::thread::sleep(Duration::from_millis(10));
+        assert!(cb.can_announce(url));
+        assert!(!cb.can_announce(url));
+        {
+            let mut map = cb.hosts.write();
+            map.get_mut("stuck-canary.example")
+                .unwrap()
+                .canary_started_at = Some(Instant::now() - CANARY_TIMEOUT - Duration::from_secs(1));
+        }
+        assert!(
+            cb.can_announce(url),
+            "stuck canary past CANARY_TIMEOUT should allow re-probing"
+        );
+
+        for i in 0..(MAX_TRACKED_HOSTS + 25) {
+            cb.record_failure(&format!("http://host-{i}.example/announce"));
+        }
+        assert_eq!(cb.hosts.read().len(), MAX_TRACKED_HOSTS);
+    }
+
+    #[test]
+    fn healthy_record_success_and_graduation_retain_zero_entries() {
+        let cb = CanaryCircuitBreaker::new(2, Duration::from_millis(5), Duration::from_secs(1))
+            .with_recovery_duration(Duration::from_millis(10));
+        let url = "http://clean-host.example/announce";
+
+        cb.record_success(url);
+        assert!(cb.all_hosts().is_empty());
+
+        // Single failure below threshold inserts a Healthy entry; subsequent success removes it.
+        cb.record_failure(url);
+        assert_eq!(cb.hosts.read().len(), 1);
+        cb.record_success(url);
+        assert!(
+            cb.hosts.read().is_empty(),
+            "healthy host entry must be removed on success"
+        );
+
+        // Full trip -> canary -> recovering -> graduation must remove entry completely.
+        cb.record_failure(url);
+        cb.record_failure(url);
+        std::thread::sleep(Duration::from_millis(10));
+        assert!(cb.can_announce(url));
+        cb.record_success(url);
+        for _ in 0..5 {
+            std::thread::sleep(Duration::from_millis(4));
+            let _ = cb.can_announce(url);
+            cb.record_success(url);
+        }
+        std::thread::sleep(Duration::from_millis(15));
+        assert!(cb.can_announce(url));
+        assert!(
+            cb.hosts.read().is_empty(),
+            "graduated host must be removed from map"
+        );
     }
 }

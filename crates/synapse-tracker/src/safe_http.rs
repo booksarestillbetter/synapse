@@ -18,10 +18,133 @@
 //!   `Content-Length` claims. No `Accept-Encoding` is sent, so a compressed-bomb response
 //!   is never inflated.
 
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::time::Duration;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
+use parking_lot::{Mutex, RwLock};
 use url::Url;
+
+const PINNED_DNS_TTL: Duration = Duration::from_secs(30);
+const MAX_PINNED_DNS_HOSTS: usize = 4096;
+const MAX_POOLED_CLIENTS: usize = 16;
+
+type PinnedDnsMap = HashMap<String, (Instant, Vec<SocketAddr>)>;
+type PooledClientKey = (Option<tokio::runtime::Id>, Option<String>, bool);
+type PooledClientMap = HashMap<PooledClientKey, reqwest::Client>;
+
+static PINNED_DNS: OnceLock<RwLock<PinnedDnsMap>> = OnceLock::new();
+static POOLED_CLIENTS: OnceLock<Mutex<PooledClientMap>> = OnceLock::new();
+
+fn pinned_dns() -> &'static RwLock<PinnedDnsMap> {
+    PINNED_DNS.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+fn record_pinned_dns(host: &str, addrs: Vec<SocketAddr>) {
+    let key = host.to_ascii_lowercase();
+    let now = Instant::now();
+    let mut map = pinned_dns().write();
+    if map.len() >= MAX_PINNED_DNS_HOSTS && !map.contains_key(&key) {
+        map.retain(|_, (inserted_at, _)| {
+            now.saturating_duration_since(*inserted_at) < PINNED_DNS_TTL
+        });
+        if map.len() >= MAX_PINNED_DNS_HOSTS {
+            if let Some(oldest) = map
+                .iter()
+                .min_by_key(|(_, (t, _))| *t)
+                .map(|(k, _)| k.clone())
+            {
+                map.remove(&oldest);
+            }
+        }
+    }
+    map.insert(key, (now, addrs));
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SsrfPinnedResolver {
+    allow_local: bool,
+}
+
+impl reqwest::dns::Resolve for SsrfPinnedResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_string();
+        let allow_local = self.allow_local;
+        Box::pin(async move {
+            let key = host.to_ascii_lowercase();
+            let now = Instant::now();
+            if let Some((_, addrs)) = pinned_dns()
+                .read()
+                .get(&key)
+                .filter(|(t, _)| now.saturating_duration_since(*t) < PINNED_DNS_TTL)
+            {
+                let valid = allow_local
+                    || (!is_internal_hostname(&key) && addrs.iter().all(|a| is_public_ip(a.ip())));
+                if !valid {
+                    return Err("pinned DNS target rejected by SSRF policy".into());
+                }
+                let out: reqwest::dns::Addrs = Box::new(addrs.clone().into_iter());
+                return Ok(out);
+            }
+
+            if !allow_local && is_internal_hostname(&key) {
+                return Err("internal hostname rejected by SSRF resolver".into());
+            }
+
+            let looked_up: Vec<SocketAddr> = tokio::net::lookup_host((host.as_str(), 0))
+                .await
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?
+                .collect();
+            if looked_up.is_empty() {
+                return Err("could not resolve host".into());
+            }
+            if !allow_local && !looked_up.iter().all(|a| is_public_ip(a.ip())) {
+                return Err("non-public resolved address rejected by SSRF resolver".into());
+            }
+            let out: reqwest::dns::Addrs = Box::new(looked_up.into_iter());
+            Ok(out)
+        })
+    }
+}
+
+fn pooled_client(
+    proxy_url: Option<&str>,
+    allow_local: bool,
+) -> Result<reqwest::Client, FetchError> {
+    let clients = POOLED_CLIENTS.get_or_init(|| Mutex::new(HashMap::new()));
+    let rt_id = tokio::runtime::Handle::try_current().ok().map(|h| h.id());
+    let key = (rt_id, proxy_url.map(str::to_owned), allow_local);
+    {
+        let guard = clients.lock();
+        if let Some(existing) = guard.get(&key) {
+            return Ok(existing.clone());
+        }
+    }
+
+    let mut builder = reqwest::Client::builder()
+        .use_rustls_tls()
+        .redirect(reqwest::redirect::Policy::none())
+        .dns_resolver(Arc::new(SsrfPinnedResolver { allow_local }))
+        .pool_max_idle_per_host(16)
+        .pool_idle_timeout(Duration::from_secs(60));
+    if let Some(proxy_str) = proxy_url {
+        builder = builder.proxy(reqwest::Proxy::all(proxy_str)?);
+    } else {
+        builder = builder.no_proxy();
+    }
+    let client = builder.build()?;
+
+    let mut guard = clients.lock();
+    if let Some(existing) = guard.get(&key) {
+        return Ok(existing.clone());
+    }
+    if guard.len() >= MAX_POOLED_CLIENTS {
+        guard.clear();
+    }
+    guard.insert(key, client.clone());
+    Ok(client)
+}
 
 static PROXY: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
 
@@ -73,18 +196,28 @@ pub enum FetchError {
     Blocked(&'static str),
     #[error("too many redirects")]
     TooManyRedirects,
+    #[error("request timed out")]
+    Timeout,
     #[error("response body exceeded {0} bytes")]
     TooLarge(usize),
     #[error("could not resolve host")]
     Resolve,
     #[error("http error: {0}")]
-    Http(#[from] reqwest::Error),
+    Http(reqwest::Error),
+}
+
+impl From<reqwest::Error> for FetchError {
+    fn from(e: reqwest::Error) -> Self {
+        FetchError::Http(e.without_url())
+    }
 }
 
 pub struct Fetched {
     pub status: u16,
     /// `Content-Range` header of the final response, if any.
     pub content_range: Option<String>,
+    /// Remote socket address the final HTTP hop connected to, if reported by the transport.
+    pub remote_addr: Option<SocketAddr>,
     pub body: Vec<u8>,
 }
 
@@ -103,7 +236,9 @@ pub fn is_public_ip(ip: IpAddr) -> bool {
                 || v6.is_multicast()
                 || (s[0] & 0xfe00) == 0xfc00 // unique local fc00::/7
                 || (s[0] & 0xffc0) == 0xfe80 // link local fe80::/10
+                || (s[0] & 0xffc0) == 0xfec0 // deprecated site-local fec0::/10
                 || (s[0] == 0x2001 && s[1] == 0x0db8) // documentation 2001:db8::/32
+                || (s[0] == 0x2001 && s[1] < 0x0200) // IETF protocol assignments 2001::/23 (incl. Teredo)
                 || (s[0] == 0x0064 && s[1] == 0xff9b && s[2..6] == [0, 0, 0, 0]) // RFC 6052 NAT64 64:ff9b::/96
                 || (s[0] == 0x0064 && s[1] == 0xff9b && s[2] == 0x0001) // RFC 8215 Local-Use NAT64 64:ff9b:1::/48
                 || s[0..6] == [0, 0, 0, 0, 0, 0] // Deprecated IPv4-compatible ::/96
@@ -183,7 +318,8 @@ async fn resolve(url: &Url) -> Result<Vec<SocketAddr>, FetchError> {
 
 fn path_has_segment(url: &Url, allowed: &[&str]) -> bool {
     url.path_segments()
-        .is_some_and(|mut segs| segs.any(|s| allowed.contains(&s)))
+        .and_then(|mut segs| segs.rfind(|s| !s.is_empty()))
+        .is_some_and(|last| allowed.contains(&last))
 }
 
 /// Decides whether a hop to `url`, which resolved to `addrs`, is allowed, given whether
@@ -227,8 +363,13 @@ fn check_hop(
 pub async fn fetch(url: &Url, opts: &FetchOptions) -> Result<Fetched, FetchError> {
     let mut current = url.clone();
     let mut origin_public: Option<bool> = None;
+    let deadline = Instant::now() + opts.timeout;
 
     for hop in 0..=MAX_REDIRECTS {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(FetchError::Timeout);
+        }
         if current.scheme() != "http" && current.scheme() != "https" {
             return Err(FetchError::InvalidUrl("only http and https are allowed"));
         }
@@ -266,19 +407,18 @@ pub async fn fetch(url: &Url, opts: &FetchOptions) -> Result<Fetched, FetchError
             opts.local,
         )?;
 
-        let mut builder = reqwest::Client::builder()
-            .timeout(opts.timeout)
-            .user_agent(opts.user_agent)
-            .redirect(reqwest::redirect::Policy::none());
-        if let Some(proxy_url) = &proxy_url {
-            builder = builder.proxy(reqwest::Proxy::all(proxy_url).map_err(FetchError::Http)?);
-        } else if let Some(host) = current.host_str() {
-            if host.parse::<IpAddr>().is_err() && !host.starts_with('[') {
-                builder = builder.resolve_to_addrs(host, &addrs);
+        let allow_local = !matches!(opts.local, LocalPolicy::Deny) && !origin_is_public;
+        if !remote_dns_proxy && host_is_name {
+            if let Some(host) = current.host_str() {
+                let normalized = host.trim_start_matches('[').trim_end_matches(']');
+                record_pinned_dns(normalized, addrs.clone());
             }
         }
-        let client = builder.build()?;
-        let mut req = client.get(current.clone());
+        let client = pooled_client(proxy_url.as_deref(), allow_local)?;
+        let mut req = client
+            .get(current.clone())
+            .timeout(remaining)
+            .header(reqwest::header::USER_AGENT, opts.user_agent);
         if let Some(ref range) = opts.range {
             req = req.header(reqwest::header::RANGE, range);
         }
@@ -296,6 +436,11 @@ pub async fn fetch(url: &Url, opts: &FetchOptions) -> Result<Fetched, FetchError
             let mut next = current
                 .join(location)
                 .map_err(|_| FetchError::InvalidUrl("invalid redirect target"))?;
+            if current.scheme() == "https" && next.scheme() == "http" {
+                return Err(FetchError::Blocked(
+                    "HTTPS to HTTP redirect downgrade not permitted",
+                ));
+            }
             if next.host_str() != current.host_str() {
                 let _ = next.set_username("");
                 let _ = next.set_password(None);
@@ -304,6 +449,7 @@ pub async fn fetch(url: &Url, opts: &FetchOptions) -> Result<Fetched, FetchError
             continue;
         }
 
+        let remote_addr = resp.remote_addr();
         if let Some(len) = resp.content_length() {
             if len > opts.max_body as u64 {
                 return Err(FetchError::TooLarge(opts.max_body));
@@ -324,6 +470,7 @@ pub async fn fetch(url: &Url, opts: &FetchOptions) -> Result<Fetched, FetchError
         return Ok(Fetched {
             status: status.as_u16(),
             content_range,
+            remote_addr,
             body,
         });
     }
@@ -370,6 +517,8 @@ mod tests {
             "ff02::1",
             "::ffff:127.0.0.1",
             "::ffff:10.0.0.1",
+            "fec0::1",
+            "2001:2::1",
             "64:ff9b::127.0.0.1",
             "64:ff9b::a00:1",
             "64:ff9b:1::1",
@@ -393,9 +542,11 @@ mod tests {
     fn local_policy_governs_the_first_hop() {
         let tracker = Url::parse("http://192.168.1.10/announce?k=1").unwrap();
         let admin = Url::parse("http://192.168.1.10/admin/reboot").unwrap();
+        let nested_admin = Url::parse("http://192.168.1.10/announce/reboot").unwrap();
         let allow = LocalPolicy::AllowPathSegments(&["announce", "scrape"]);
         assert!(check_hop(&tracker, &sa("192.168.1.10"), false, allow).is_ok());
         assert!(check_hop(&admin, &sa("192.168.1.10"), false, allow).is_err());
+        assert!(check_hop(&nested_admin, &sa("192.168.1.10"), false, allow).is_err());
         assert!(check_hop(&tracker, &sa("192.168.1.10"), false, LocalPolicy::Deny).is_err());
         assert!(check_hop(&admin, &sa("192.168.1.10"), false, LocalPolicy::AllowAny).is_ok());
     }
@@ -461,5 +612,111 @@ mod tests {
         assert!(proxy_resolves_dns_remotely("http://127.0.0.1:8080"));
         assert!(!proxy_resolves_dns_remotely("socks5://127.0.0.1:1080"));
         assert!(!proxy_resolves_dns_remotely("socks4://127.0.0.1:1080"));
+    }
+
+    #[tokio::test]
+    async fn pooled_client_reuses_keepalive_connection_and_preserves_ssrf_blocks() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept_count = Arc::new(AtomicUsize::new(0));
+        let accept_bg = accept_count.clone();
+
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                accept_bg.fetch_add(1, Ordering::Relaxed);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 2048];
+                    loop {
+                        match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => {
+                                let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+                                if sock.write_all(resp).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+
+        let denied = Url::parse(&format!("http://{addr}/announce")).unwrap();
+        let deny_opts = FetchOptions {
+            timeout: Duration::from_secs(2),
+            max_body: 1024,
+            user_agent: "SynapseTest/1.0",
+            local: LocalPolicy::Deny,
+            range: None,
+        };
+        assert!(matches!(
+            fetch(&denied, &deny_opts).await,
+            Err(FetchError::Blocked(_))
+        ));
+
+        let allow_opts = FetchOptions {
+            timeout: Duration::from_secs(2),
+            max_body: 1024,
+            user_agent: "SynapseTest/1.0",
+            local: LocalPolicy::AllowAny,
+            range: None,
+        };
+        let r1 = fetch(&denied, &allow_opts).await.unwrap();
+        let r2 = fetch(&denied, &allow_opts).await.unwrap();
+        assert_eq!(r1.body, b"ok");
+        assert_eq!(r2.body, b"ok");
+        assert_eq!(
+            accept_count.load(Ordering::Relaxed),
+            1,
+            "sequential fetch() calls should reuse the pooled HTTP keep-alive connection"
+        );
+    }
+
+    #[test]
+    fn pooled_clients_are_isolated_across_tokio_runtimes() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        fn fetch_in_fresh_runtime(payload: &'static [u8]) -> Vec<u8> {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr = listener.local_addr().unwrap();
+                tokio::spawn(async move {
+                    if let Ok((mut sock, _)) = listener.accept().await {
+                        let mut buf = [0u8; 2048];
+                        let _ = sock.read(&mut buf).await;
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            payload.len()
+                        );
+                        let _ = sock.write_all(resp.as_bytes()).await;
+                        let _ = sock.write_all(payload).await;
+                    }
+                });
+                let url = Url::parse(&format!("http://{addr}/announce")).unwrap();
+                let opts = FetchOptions {
+                    timeout: Duration::from_secs(2),
+                    max_body: 1024,
+                    user_agent: "SynapseTest/1.0",
+                    local: LocalPolicy::AllowAny,
+                    range: None,
+                };
+                let fetched = tokio::time::timeout(Duration::from_secs(2), fetch(&url, &opts))
+                    .await
+                    .expect("fetch timed out across runtimes")
+                    .unwrap();
+                assert_eq!(fetched.status, 200);
+                fetched.body
+            })
+        }
+
+        assert_eq!(fetch_in_fresh_runtime(b"rt1"), b"rt1");
+        assert_eq!(fetch_in_fresh_runtime(b"rt2"), b"rt2");
     }
 }

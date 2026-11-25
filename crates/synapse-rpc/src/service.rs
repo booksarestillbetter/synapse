@@ -18,7 +18,11 @@ pub struct SynapseService {
     swarm_engine: Option<Arc<synapse_engine::SwarmEngine>>,
     base_download_dir: Option<std::path::PathBuf>,
     auth_token: Option<String>,
+    rate_limiter: crate::http_api::AuthRateLimiter,
     sync_tick: Arc<std::sync::atomic::AtomicU64>,
+    last_roster_version: Arc<std::sync::atomic::AtomicU64>,
+    last_queue_version: Arc<std::sync::atomic::AtomicU64>,
+    cached_queue_positions: Arc<parking_lot::RwLock<std::collections::HashMap<[u8; 20], u32>>>,
 }
 
 /// `sync_from_engine` runs once a second; re-read every torrent's tracker hosts this often.
@@ -47,6 +51,12 @@ impl SynapseService {
             base_download_dir: None,
             sync_tick: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             auth_token: None,
+            rate_limiter: crate::http_api::AuthRateLimiter::default(),
+            last_roster_version: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            last_queue_version: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            cached_queue_positions: Arc::new(parking_lot::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
         }
     }
 
@@ -63,9 +73,23 @@ impl SynapseService {
         self
     }
 
+    pub fn with_rate_limiter(mut self, rate_limiter: crate::http_api::AuthRateLimiter) -> Self {
+        self.rate_limiter = rate_limiter;
+        self
+    }
+
     #[allow(clippy::result_large_err)]
     pub fn verify_auth<T>(&self, request: &Request<T>) -> Result<(), Status> {
         if let Some(ref expected) = self.auth_token {
+            let client_key = request
+                .remote_addr()
+                .map(|a| crate::http_api::canonical_ip(a.ip()).to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            if self.rate_limiter.is_blocked(&client_key) {
+                return Err(Status::resource_exhausted(
+                    "Too many failed authentication attempts",
+                ));
+            }
             let expected_trimmed = expected.trim();
             if expected_trimmed.is_empty() {
                 return Err(Status::unauthenticated(
@@ -83,6 +107,7 @@ impl SynapseService {
                     }
                 }
             }
+            self.rate_limiter.record_failure(&client_key);
             return Err(Status::unauthenticated(
                 "Invalid or missing authorization token",
             ));
@@ -124,6 +149,14 @@ impl SynapseService {
         *self.session_stats.write() = stats;
     }
 
+    /// Syncs engine state only when at least one `SubscribeTorrents` client is connected.
+    pub fn sync_from_engine_if_subscribed(&self) {
+        if self.event_bus.subscriber_count() == 0 {
+            return;
+        }
+        self.sync_from_engine();
+    }
+
     /// Diffs live engine state against `active_summaries` and emits accurate add/update/remove
     /// events for anything that changed *without* an RPC call driving it — piece-progress
     /// ticking up, rate/peer/ETA/ratio moving, recheck finishing, an autonomous transition to
@@ -137,113 +170,197 @@ impl SynapseService {
         let Some(ref engine) = self.swarm_engine else {
             return;
         };
-        let live = engine.list_torrents();
-        let positions = engine.queue_positions();
+        let sync_start = std::time::Instant::now();
+        let queue_v = engine.queue_version();
+        if queue_v
+            != self
+                .last_queue_version
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            let positions = engine.queue_positions();
+            *self.cached_queue_positions.write() = positions;
+            self.last_queue_version
+                .store(queue_v, std::sync::atomic::Ordering::Release);
+        }
+
+        let roster_v = engine.roster_version();
         let tick = self
             .sync_tick
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let mut seen = std::collections::HashSet::with_capacity(live.len());
+        let positions = self.cached_queue_positions.read();
 
-        for stats in &live {
-            let hash = hex::encode(stats.info_hash);
-            seen.insert(hash.clone());
-            let mut new_summary = swarm_stats_to_summary(stats);
-            new_summary.queue_position = positions.get(&stats.info_hash).copied().unwrap_or(0);
-            if let Some(handle) = engine.get_torrent(&stats.info_hash) {
+        engine.for_each_torrent_handle(|info_hash, handle| {
+            let mut hex_buf = [0u8; 40];
+            hex::encode_to_slice(info_hash, &mut hex_buf)
+                .expect("20-byte info_hash fits 40 hex bytes");
+            let hash_str = std::str::from_utf8(&hex_buf).expect("hex encoding is ASCII");
+            let queue_pos = positions.get(info_hash).copied().unwrap_or(0);
+
+            let existing_ref = self.active_summaries.get(hash_str);
+            let refresh_hosts = tick.is_multiple_of(TRACKER_HOSTS_REFRESH_TICKS)
+                || existing_ref
+                    .as_ref()
+                    .is_none_or(|o| o.value().tracker_hosts.is_empty());
+
+            if let Some(ref existing) = existing_ref {
+                if !refresh_hosts {
+                    let old = existing.value();
+                    let s = handle.stats.read();
+                    let (mapped_state, expected_err): (i32, Option<&str>) = match &s.state {
+                        synapse_engine::SwarmState::Stopped => {
+                            (TorrentState::StateStopped as i32, None)
+                        }
+                        synapse_engine::SwarmState::Checking => {
+                            (TorrentState::StateChecking as i32, None)
+                        }
+                        synapse_engine::SwarmState::Queued => {
+                            (TorrentState::StateQueued as i32, None)
+                        }
+                        synapse_engine::SwarmState::Downloading => {
+                            (TorrentState::StateDownloading as i32, None)
+                        }
+                        synapse_engine::SwarmState::Seeding => {
+                            (TorrentState::StateSeeding as i32, None)
+                        }
+                        synapse_engine::SwarmState::Error(msg) => {
+                            (TorrentState::StateError as i32, Some(msg.as_str()))
+                        }
+                    };
+                    let meta = handle.metadata.read();
+                    let super_seeding = handle
+                        .super_seeding
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    let first_last = handle
+                        .first_last_piece_priority
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    let unchanged = old.state == mapped_state
+                        && old.error_message.as_deref() == expected_err
+                        && (old.progress - s.progress).abs() <= f32::EPSILON
+                        && old.rate_download == s.download_rate
+                        && old.rate_upload == s.upload_rate
+                        && old.peers_connected == s.peers_connected as u32
+                        && old.peers_sending == s.peers_sending as u32
+                        && old.eta_seconds == s.eta_seconds
+                        && (old.ratio - s.ratio).abs() <= f32::EPSILON
+                        && old.queue_position == queue_pos
+                        && old.name == s.name
+                        && old.download_dir == s.download_dir
+                        && old.total_size == s.total_size
+                        && old.piece_count == s.piece_count
+                        && old.piece_size == s.piece_size
+                        && old.category == meta.category
+                        && old.tags == meta.tags
+                        && old.seed_ratio_limit == meta.seed_ratio_limit
+                        && old.seed_time_limit_secs == meta.seed_time_limit_secs
+                        && old.super_seeding == super_seeding
+                        && old.first_last_piece_priority == first_last;
+                    if unchanged {
+                        return;
+                    }
+                }
+            }
+
+            let existing = existing_ref.map(|r| {
+                let cloned = r.value().clone();
+                drop(r);
+                cloned
+            });
+
+            let mut new_summary = {
+                let stats = handle.stats.read();
+                swarm_stats_to_summary(&stats)
+            };
+            new_summary.queue_position = queue_pos;
+            {
                 let meta = handle.metadata.read();
                 new_summary.category = meta.category.clone();
                 new_summary.tags = meta.tags.clone();
                 new_summary.seed_ratio_limit = meta.seed_ratio_limit;
                 new_summary.seed_time_limit_secs = meta.seed_time_limit_secs;
-                drop(meta);
-                new_summary.super_seeding = handle
-                    .super_seeding
-                    .load(std::sync::atomic::Ordering::Relaxed);
-                new_summary.first_last_piece_priority = handle
-                    .first_last_piece_priority
-                    .load(std::sync::atomic::Ordering::Relaxed);
             }
+            new_summary.super_seeding = handle
+                .super_seeding
+                .load(std::sync::atomic::Ordering::Relaxed);
+            new_summary.first_last_piece_priority = handle
+                .first_last_piece_priority
+                .load(std::sync::atomic::Ordering::Relaxed);
 
-            let existing = self.active_summaries.get(&hash).map(|r| r.value().clone());
-
-            // Tracker hosts barely ever change, so don't recompute them every tick: reuse the
-            // last value, and re-read when it's empty (announce data not in yet), on a slow
-            // cadence, or for a brand-new torrent.
-            let refresh_hosts = tick.is_multiple_of(TRACKER_HOSTS_REFRESH_TICKS)
-                || existing.as_ref().is_none_or(|o| o.tracker_hosts.is_empty());
             new_summary.tracker_hosts = match (&existing, refresh_hosts) {
                 (Some(old), false) => old.tracker_hosts.clone(),
                 _ => {
-                    let reports = engine.get_tracker_reports(&stats.info_hash);
+                    let reports = engine.tracker_reports_for_handle(handle);
                     tracker_hosts_from_urls(reports.iter().map(|r| r.url.as_str()))
                 }
             };
 
             match existing {
                 Some(old) => {
-                    let hosts_changed = old.tracker_hosts != new_summary.tracker_hosts;
+                    let meta_changed = summary_metadata_changed(&old, &new_summary);
                     let delta = diff_summary(&old, &new_summary);
-                    if delta.is_some() || hosts_changed {
-                        self.active_summaries.insert(hash, new_summary.clone());
+                    if delta.is_some() || meta_changed {
+                        self.active_summaries
+                            .insert(new_summary.hash.clone(), new_summary.clone());
                     }
-                    if let Some(delta) = delta {
-                        self.event_bus.record_delta(delta);
-                    }
-                    // `TorrentDelta` has no tracker field; a changed host list goes out as a
-                    // fresh "added" event, which subscribers treat as replace-by-hash.
-                    if hosts_changed {
+                    if meta_changed {
                         self.event_bus.emit_summary_added(new_summary);
+                    } else if let Some(delta) = delta {
+                        self.event_bus.record_delta(delta);
                     }
                 }
                 None => self.upsert_torrent(new_summary),
             }
-        }
+        });
 
-        let stale: Vec<String> = self
-            .active_summaries
-            .iter()
-            .map(|r| r.key().clone())
-            .filter(|h| !seen.contains(h))
-            .collect();
-        for hash in stale {
-            self.active_summaries.remove(&hash);
-            self.event_bus.emit_removed(hash);
+        drop(positions);
+
+        if roster_v
+            != self
+                .last_roster_version
+                .load(std::sync::atomic::Ordering::Acquire)
+            || self.active_summaries.len() != engine.torrent_count()
+        {
+            self.last_roster_version
+                .store(roster_v, std::sync::atomic::Ordering::Release);
+            let stale: Vec<String> = self
+                .active_summaries
+                .iter()
+                .filter_map(|r| {
+                    let k = r.key();
+                    (!parse_hash(k).is_some_and(|h| engine.has_torrent(&h))).then(|| k.clone())
+                })
+                .collect();
+            for hash in stale {
+                self.active_summaries.remove(&hash);
+                self.event_bus.emit_removed(hash);
+            }
         }
+        engine.record_rpc_sync_duration_ms(sync_start.elapsed().as_millis() as u64);
     }
 
-    /// Companion to `sync_from_engine` for the aggregate session stats — same live-engine
-    /// source `get_session_stats`'s unary handler already uses, just also pushed into
-    /// `session_stats` so `SubscribeSessionStats` (the streaming sibling that was still
-    /// hardcoded at its `SynapseService::new()` default forever) reflects reality too.
-    pub fn refresh_session_stats(&self) {
+    /// Companion to `sync_from_engine` for the aggregate session stats — uses O(1) engine
+    /// atomic counters so `SubscribeSessionStats` stays O(1) even at 50k swarms.
+    pub async fn refresh_session_stats(&self) {
         let Some(ref engine) = self.swarm_engine else {
             return;
         };
-        let swarms = engine.list_torrents();
-        let downloading = swarms
-            .iter()
-            .filter(|s| matches!(s.state, synapse_engine::SwarmState::Downloading))
-            .count() as u32;
-        let seeding = swarms
-            .iter()
-            .filter(|s| matches!(s.state, synapse_engine::SwarmState::Seeding))
-            .count() as u32;
+        let m = engine.global_metrics();
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as i64;
-        let free_space = engine.free_disk_space_bytes();
+        let free_space = engine.free_disk_space_bytes_async().await;
+        let dht_nodes = engine.dht_node_count_fast() as u32;
         self.update_stats(SessionStatsUpdate {
-            rate_download: swarms.iter().map(|s| s.download_rate).sum(),
-            rate_upload: swarms.iter().map(|s| s.upload_rate).sum(),
-            total_downloaded: swarms.iter().map(|s| s.downloaded_bytes).sum(),
-            total_uploaded: swarms.iter().map(|s| s.uploaded_bytes).sum(),
-            torrent_count: swarms.len() as u32,
-            active_downloading: downloading,
-            active_seeding: seeding,
+            rate_download: m.download_rate,
+            rate_upload: m.upload_rate,
+            total_downloaded: m.downloaded_bytes,
+            total_uploaded: m.uploaded_bytes,
+            torrent_count: m.total_torrents as u32,
+            active_downloading: m.downloading_torrents as u32,
+            active_seeding: m.seeding_torrents as u32,
             free_disk_space_bytes: free_space,
             timestamp_ms: now_ms,
-            dht_nodes: 0,
+            dht_nodes,
         });
     }
 }
@@ -342,6 +459,21 @@ fn host_status_to_proto(
     }
 }
 
+fn summary_metadata_changed(old: &TorrentSummary, new: &TorrentSummary) -> bool {
+    old.name != new.name
+        || old.total_size != new.total_size
+        || old.download_dir != new.download_dir
+        || old.piece_count != new.piece_count
+        || old.piece_size != new.piece_size
+        || old.tracker_hosts != new.tracker_hosts
+        || old.category != new.category
+        || old.tags != new.tags
+        || old.seed_ratio_limit != new.seed_ratio_limit
+        || old.seed_time_limit_secs != new.seed_time_limit_secs
+        || old.super_seeding != new.super_seeding
+        || old.first_last_piece_priority != new.first_last_piece_priority
+}
+
 /// `None` when nothing actually changed — callers use this to avoid emitting a no-op delta
 /// every sync tick for a torrent that's genuinely idle (e.g. fully seeded, no peers).
 fn diff_summary(old: &TorrentSummary, new: &TorrentSummary) -> Option<TorrentDelta> {
@@ -384,18 +516,11 @@ fn diff_summary(old: &TorrentSummary, new: &TorrentSummary) -> Option<TorrentDel
         changed = true;
     }
     if old.error_message != new.error_message {
-        delta.error_message = new.error_message.clone();
+        delta.error_message = Some(new.error_message.clone().unwrap_or_default());
         changed = true;
     }
     if old.queue_position != new.queue_position {
         delta.queue_position = Some(new.queue_position);
-        changed = true;
-    }
-    if old.download_dir != new.download_dir {
-        // download_dir isn't part of TorrentDelta's schema (only set_location's immediate RPC
-        // handler updates it optimistically) — still worth tracking here so `existing` in the
-        // caller's Some(old) branch gets the field refreshed even though no delta event carries
-        // it, otherwise a later comparison would keep re-diffing a field that never converges.
         changed = true;
     }
 
@@ -419,6 +544,10 @@ impl SynapseControl for SynapseService {
             req.chunk_size as usize
         };
 
+        if self.swarm_engine.is_some() && self.event_bus.subscriber_count() == 0 {
+            self.sync_from_engine();
+        }
+        let rx = self.event_bus.subscribe();
         let summaries: Vec<TorrentSummary> = self
             .active_summaries
             .iter()
@@ -463,10 +592,15 @@ impl SynapseControl for SynapseService {
             }
         }
 
-        let rx = self.event_bus.subscribe();
-        let live_stream = BroadcastStream::new(rx).filter_map(|res| match res {
+        let event_bus = self.event_bus.clone();
+        let swarm_for_lag = self.swarm_engine.clone();
+        let live_stream = BroadcastStream::new(rx).filter_map(move |res| match res {
             Ok(item) => Some(Ok(item)),
             Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(skipped)) => {
+                event_bus.record_lag(skipped);
+                if let Some(ref engine) = swarm_for_lag {
+                    engine.record_event_bus_lag(skipped);
+                }
                 Some(Err(Status::resource_exhausted(format!(
                     "torrent event stream lagged by {} events; resync required",
                     skipped
@@ -570,11 +704,9 @@ impl SynapseControl for SynapseService {
                             piece_bitfield = empty_bf.as_bytes().to_vec();
                         }
 
-                        availability = handle.piece_availability.read().clone();
-                        if availability.is_empty() && total_pieces > 0 {
-                            availability = vec![if is_seeding { 1 } else { 0 }; total_pieces];
-                        }
+                        availability = handle.piece_availability_snapshot();
 
+                        let file_priorities = handle.file_priorities.read().clone();
                         for (idx, f) in handle.info.files.iter().enumerate() {
                             let (bytes_completed, progress) = if is_seeding {
                                 (f.length, 1.0)
@@ -610,7 +742,7 @@ impl SynapseControl for SynapseService {
                                 size_bytes: f.length,
                                 bytes_completed,
                                 progress,
-                                priority: 4, // 4 = normal priority
+                                priority: u32::from(file_priorities.get(idx).copied().unwrap_or(4)),
                             });
                         }
 
@@ -626,6 +758,7 @@ impl SynapseControl for SynapseService {
                                 is_circuit_broken: rep.is_circuit_broken,
                                 cb_state: rep.cb_state.map(circuit_state_to_proto).map(|s| s as i32),
                                 recovery_progress_pct: rep.recovery_progress_pct,
+                                last_announce_time: rep.last_announce_time,
                             });
                         }
 
@@ -850,20 +983,38 @@ impl SynapseControl for SynapseService {
                 }
             }
             Some(add_torrent_request::Source::FilePath(path)) => {
-                let p = std::path::Path::new(&path);
-                let has_parent_dir = p
-                    .components()
-                    .any(|c| matches!(c, std::path::Component::ParentDir));
-                let is_torrent_ext = p
+                let safe_path = self.validate_dir_path(&path)?;
+                let is_torrent_ext = safe_path
                     .extension()
                     .and_then(|e| e.to_str())
                     .is_some_and(|e| e.eq_ignore_ascii_case("torrent"));
-                if path.contains('\0') || has_parent_dir || !is_torrent_ext {
+                if !is_torrent_ext {
                     return Err(Status::permission_denied(
-                        "FilePath must be a valid .torrent path without '..' traversal",
+                        "FilePath must be a valid .torrent file inside the download directory",
                     ));
                 }
-                match crate::url_fetcher::read_torrent_file(p).await {
+                match tokio::fs::symlink_metadata(&safe_path).await {
+                    Ok(meta) if meta.file_type().is_file() => {}
+                    Ok(_) => {
+                        return Err(Status::permission_denied(
+                            "FilePath must point to a regular file, not a symlink or directory",
+                        ));
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        return Ok(Response::new(AddTorrentResponse {
+                            success: false,
+                            hash: String::new(),
+                            name: String::new(),
+                            error: Some(format!("Torrent file not found: {e}")),
+                        }));
+                    }
+                    Err(e) => {
+                        return Err(Status::permission_denied(format!(
+                            "Cannot inspect FilePath: {e}"
+                        )));
+                    }
+                }
+                match crate::url_fetcher::read_torrent_file(&safe_path).await {
                     Ok(bytes) => {
                         if let Ok(bencode) = synapse_bencode::decode_buf(&bytes) {
                             if let Ok(info) = synapse_meta::Info::from_bencode(bencode) {
@@ -985,17 +1136,36 @@ impl SynapseControl for SynapseService {
     ) -> Result<Response<CommandResponse>, Status> {
         self.verify_auth(&request)?;
         let req = request.into_inner();
-        if let Ok(bytes) = hex::decode(&req.hash) {
-            if bytes.len() == 20 {
-                let mut arr = [0u8; 20];
-                arr.copy_from_slice(&bytes);
-                if let Some(ref swarm) = self.swarm_engine {
-                    swarm.remove_torrent(&arr);
+        let hash = req.hash.to_lowercase();
+        if let Some(arr) = parse_hash(&hash) {
+            if let Some(ref swarm) = self.swarm_engine {
+                let target_info = swarm.get_torrent(&arr).map(|h| {
+                    let s = h.stats.read();
+                    (s.download_dir.clone(), s.name.clone())
+                });
+                if swarm.remove_torrent(&arr) && req.delete_data {
+                    if let Some((dl_dir_str, torrent_name)) = target_info {
+                        let base = self
+                            .base_download_dir
+                            .clone()
+                            .unwrap_or_else(|| swarm.settings().read().download_dir.clone());
+                        let _ = tokio::task::spawn_blocking(move || {
+                            crate::http_api::delete_torrent_data_under_base(
+                                &base,
+                                &dl_dir_str,
+                                &torrent_name,
+                            );
+                        })
+                        .await;
+                    }
                 }
             }
         }
-        self.active_summaries.remove(&req.hash);
-        self.event_bus.emit_removed(req.hash);
+        if hash != req.hash {
+            self.active_summaries.remove(&req.hash);
+        }
+        self.active_summaries.remove(&hash);
+        self.event_bus.emit_removed(hash);
         Ok(Response::new(CommandResponse {
             success: true,
             error: None,
@@ -1009,16 +1179,13 @@ impl SynapseControl for SynapseService {
         self.verify_auth(&request)?;
         let raw_hash = request.into_inner().hash;
         let hash = raw_hash.to_lowercase();
-        if let Ok(bytes) = hex::decode(&hash) {
-            if bytes.len() == 20 {
-                let mut arr = [0u8; 20];
-                arr.copy_from_slice(&bytes);
-                if let Some(ref swarm) = self.swarm_engine {
-                    swarm.transition_to_cold(&arr);
-                }
+        if let Some(arr) = parse_hash(&hash) {
+            if let Some(ref swarm) = self.swarm_engine {
+                swarm.transition_to_cold(&arr);
             }
         }
         if let Some(mut item) = self.active_summaries.get_mut(&hash) {
+            let cleared_error = item.error_message.take().map(|_| String::new());
             item.state = TorrentState::StateStopped as i32;
             item.rate_download = 0;
             item.rate_upload = 0;
@@ -1031,6 +1198,7 @@ impl SynapseControl for SynapseService {
                 rate_upload: Some(0),
                 peers_connected: Some(0),
                 peers_sending: Some(0),
+                error_message: cleared_error,
                 ..Default::default()
             });
         }
@@ -1047,16 +1215,13 @@ impl SynapseControl for SynapseService {
         self.verify_auth(&request)?;
         let raw_hash = request.into_inner().hash;
         let hash = raw_hash.to_lowercase();
-        if let Ok(bytes) = hex::decode(&hash) {
-            if bytes.len() == 20 {
-                let mut arr = [0u8; 20];
-                arr.copy_from_slice(&bytes);
-                if let Some(ref swarm) = self.swarm_engine {
-                    swarm.transition_to_hot(&arr);
-                }
+        if let Some(arr) = parse_hash(&hash) {
+            if let Some(ref swarm) = self.swarm_engine {
+                swarm.transition_to_hot(&arr);
             }
         }
         if let Some(mut item) = self.active_summaries.get_mut(&hash) {
+            let cleared_error = item.error_message.take().map(|_| String::new());
             let target_state = if item.progress >= 1.0 {
                 TorrentState::StateSeeding as i32
             } else {
@@ -1066,6 +1231,7 @@ impl SynapseControl for SynapseService {
             self.event_bus.record_delta(TorrentDelta {
                 hash,
                 state: Some(target_state),
+                error_message: cleared_error,
                 ..Default::default()
             });
         }
@@ -1080,21 +1246,19 @@ impl SynapseControl for SynapseService {
         request: Request<TorrentHashRequest>,
     ) -> Result<Response<CommandResponse>, Status> {
         self.verify_auth(&request)?;
-        let hash = request.into_inner().hash;
-        if let Ok(bytes) = hex::decode(&hash) {
-            if bytes.len() == 20 {
-                let mut arr = [0u8; 20];
-                arr.copy_from_slice(&bytes);
-                if let Some(ref swarm) = self.swarm_engine {
-                    swarm.recheck_torrent(&arr);
-                }
+        let hash = request.into_inner().hash.to_lowercase();
+        if let Some(arr) = parse_hash(&hash) {
+            if let Some(ref swarm) = self.swarm_engine {
+                swarm.recheck_torrent(&arr);
             }
         }
         if let Some(mut item) = self.active_summaries.get_mut(&hash) {
+            let cleared_error = item.error_message.take().map(|_| String::new());
             item.state = TorrentState::StateChecking as i32;
             self.event_bus.record_delta(TorrentDelta {
                 hash,
                 state: Some(TorrentState::StateChecking as i32),
+                error_message: cleared_error,
                 ..Default::default()
             });
         }
@@ -1131,19 +1295,36 @@ impl SynapseControl for SynapseService {
     ) -> Result<Response<CommandResponse>, Status> {
         self.verify_auth(&request)?;
         let req = request.into_inner();
+        let hash = req.hash.to_lowercase();
         let validated = self.validate_dir_path(&req.new_download_dir)?;
         let validated_str = validated.to_string_lossy().into_owned();
-        if let Ok(bytes) = hex::decode(&req.hash) {
-            if bytes.len() == 20 {
-                let mut arr = [0u8; 20];
-                arr.copy_from_slice(&bytes);
-                if let Some(ref swarm) = self.swarm_engine {
-                    swarm.set_location(&arr, &validated_str);
-                }
+        if let Some(ref swarm) = self.swarm_engine {
+            let Some(arr) = parse_hash(&hash) else {
+                return Err(Status::invalid_argument("malformed info hash"));
+            };
+            let engine = swarm.clone();
+            let dir_arg = validated_str.clone();
+            let move_files = req.move_existing_files.unwrap_or(true);
+            let ok = tokio::task::spawn_blocking(move || {
+                engine.set_location_with_options(&arr, &dir_arg, move_files)
+            })
+            .await
+            .map_err(|e| Status::internal(format!("set_location failed: {e}")))?;
+            if !ok {
+                return Ok(command_result(
+                    false,
+                    "torrent not found or failed to set location",
+                ));
             }
         }
-        if let Some(mut item) = self.active_summaries.get_mut(&req.hash) {
+        let updated = if let Some(mut item) = self.active_summaries.get_mut(&hash) {
             item.download_dir = validated_str;
+            Some(item.clone())
+        } else {
+            None
+        };
+        if let Some(summary) = updated {
+            self.event_bus.emit_summary_added(summary);
         }
         Ok(Response::new(CommandResponse {
             success: true,
@@ -1158,10 +1339,21 @@ impl SynapseControl for SynapseService {
         self.verify_auth(&request)?;
         let req = request.into_inner();
         if let Some(ref swarm) = self.swarm_engine {
-            swarm.set_rate_limits(
-                req.global_download_limit.unwrap_or(0),
-                req.global_upload_limit.unwrap_or(0),
-            );
+            if req.global_download_limit.is_some() || req.global_upload_limit.is_some() {
+                swarm.update_global_rate_limits(req.global_download_limit, req.global_upload_limit);
+            }
+            if let Some(ref raw_hash) = req.per_torrent_hash {
+                let Some(arr) = parse_hash(raw_hash.trim()) else {
+                    return Err(Status::invalid_argument("malformed per_torrent_hash"));
+                };
+                if !swarm.set_torrent_rate_limits(
+                    &arr,
+                    req.torrent_download_limit,
+                    req.torrent_upload_limit,
+                ) {
+                    return Ok(command_result(false, "torrent not found"));
+                }
+            }
         }
         Ok(Response::new(CommandResponse {
             success: true,
@@ -1175,34 +1367,21 @@ impl SynapseControl for SynapseService {
     ) -> Result<Response<SessionStatsUpdate>, Status> {
         self.verify_auth(&request)?;
         if let Some(ref engine) = self.swarm_engine {
-            let swarms = engine.list_torrents();
-            let total = swarms.len() as u32;
-            let downloading = swarms
-                .iter()
-                .filter(|s| matches!(s.state, synapse_engine::SwarmState::Downloading))
-                .count() as u32;
-            let seeding = swarms
-                .iter()
-                .filter(|s| matches!(s.state, synapse_engine::SwarmState::Seeding))
-                .count() as u32;
-            let total_dl: u64 = swarms.iter().map(|s| s.downloaded_bytes).sum();
-            let total_ul: u64 = swarms.iter().map(|s| s.uploaded_bytes).sum();
-            let rate_dl: u64 = swarms.iter().map(|s| s.download_rate).sum();
-            let rate_ul: u64 = swarms.iter().map(|s| s.upload_rate).sum();
-            let free_space = engine.free_disk_space_bytes();
-            let dht_nodes = engine.dht_node_count().await as u32;
+            let m = engine.global_metrics();
+            let free_space = engine.free_disk_space_bytes_async().await;
+            let dht_nodes = engine.dht_node_count_fast() as u32;
             let now_ms = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis() as i64;
             return Ok(Response::new(SessionStatsUpdate {
-                rate_download: rate_dl,
-                rate_upload: rate_ul,
-                total_downloaded: total_dl,
-                total_uploaded: total_ul,
-                torrent_count: total,
-                active_downloading: downloading,
-                active_seeding: seeding,
+                rate_download: m.download_rate,
+                rate_upload: m.upload_rate,
+                total_downloaded: m.downloaded_bytes,
+                total_uploaded: m.uploaded_bytes,
+                torrent_count: m.total_torrents as u32,
+                active_downloading: m.downloading_torrents as u32,
+                active_seeding: m.seeding_torrents as u32,
                 free_disk_space_bytes: free_space,
                 timestamp_ms: now_ms,
                 dht_nodes,
@@ -1279,15 +1458,17 @@ impl SynapseControl for SynapseService {
             return Err(Status::unavailable("SwarmEngine not configured"));
         };
 
-        let req = request.into_inner();
+        let mut req = request.into_inner();
         if let Some(ref dl_dir) = req.download_dir {
             if !dl_dir.trim().is_empty() {
-                self.validate_dir_path(dl_dir)?;
+                let canonical = self.validate_dir_path(dl_dir)?;
+                req.download_dir = Some(canonical.to_string_lossy().into_owned());
             }
         }
         if let Some(ref inc_dir) = req.incomplete_dir {
             if !inc_dir.trim().is_empty() {
-                self.validate_dir_path(inc_dir)?;
+                let canonical = self.validate_dir_path(inc_dir)?;
+                req.incomplete_dir = Some(canonical.to_string_lossy().into_owned());
             }
         }
         let update = synapse_engine::SessionSettingsUpdate {
@@ -1647,7 +1828,11 @@ impl SynapseControl for SynapseService {
         let Some(hash) = parse_hash(&req.hash) else {
             return Err(Status::invalid_argument("malformed info hash"));
         };
-        match engine.export_torrent_bytes(&hash) {
+        let engine = engine.clone();
+        let exported = tokio::task::spawn_blocking(move || engine.export_torrent_bytes(&hash))
+            .await
+            .map_err(|e| Status::internal(format!("export_torrent failed: {e}")))?;
+        match exported {
             None => Ok(Response::new(ExportTorrentResponse {
                 success: false,
                 error: Some("no such torrent, or it has no retrievable metainfo".to_string()),
@@ -1662,11 +1847,204 @@ impl SynapseControl for SynapseService {
             })),
         }
     }
+
+    async fn pause_torrents(
+        &self,
+        request: Request<TorrentHashesRequest>,
+    ) -> Result<Response<BatchCommandResponse>, Status> {
+        self.verify_auth(&request)?;
+        let parsed = parse_hashes_list(&request.into_inner().hashes)
+            .ok_or_else(|| Status::invalid_argument("malformed info hash"))?;
+        Ok(self.batch_state_action(parsed, BatchStateAction::Pause))
+    }
+
+    async fn resume_torrents(
+        &self,
+        request: Request<TorrentHashesRequest>,
+    ) -> Result<Response<BatchCommandResponse>, Status> {
+        self.verify_auth(&request)?;
+        let parsed = parse_hashes_list(&request.into_inner().hashes)
+            .ok_or_else(|| Status::invalid_argument("malformed info hash"))?;
+        Ok(self.batch_state_action(parsed, BatchStateAction::Resume))
+    }
+
+    async fn recheck_torrents(
+        &self,
+        request: Request<TorrentHashesRequest>,
+    ) -> Result<Response<BatchCommandResponse>, Status> {
+        self.verify_auth(&request)?;
+        let parsed = parse_hashes_list(&request.into_inner().hashes)
+            .ok_or_else(|| Status::invalid_argument("malformed info hash"))?;
+        Ok(self.batch_state_action(parsed, BatchStateAction::Recheck))
+    }
+
+    async fn remove_torrents(
+        &self,
+        request: Request<RemoveTorrentsRequest>,
+    ) -> Result<Response<BatchCommandResponse>, Status> {
+        self.verify_auth(&request)?;
+        let req = request.into_inner();
+        let parsed = parse_hashes_list(&req.hashes)
+            .ok_or_else(|| Status::invalid_argument("malformed info hash"))?;
+        let mut succeeded = 0u32;
+        let mut failed_hashes = Vec::new();
+        let mut to_delete: Vec<(String, String)> = Vec::new();
+
+        for (raw, hash, arr) in parsed {
+            let removed = if let Some(ref swarm) = self.swarm_engine {
+                let target_info = swarm.get_torrent(&arr).map(|h| {
+                    let s = h.stats.read();
+                    (s.download_dir.clone(), s.name.clone())
+                });
+                let ok = swarm.remove_torrent(&arr);
+                if ok && req.delete_data {
+                    if let Some(info) = target_info {
+                        to_delete.push(info);
+                    }
+                }
+                if hash != raw {
+                    self.active_summaries.remove(&raw);
+                }
+                self.active_summaries.remove(&hash);
+                ok
+            } else {
+                let mut existed = self.active_summaries.remove(&hash).is_some();
+                if hash != raw {
+                    existed |= self.active_summaries.remove(&raw).is_some();
+                }
+                existed
+            };
+
+            if removed {
+                self.event_bus.emit_removed(hash);
+                succeeded += 1;
+            } else {
+                failed_hashes.push(hash);
+            }
+        }
+
+        if req.delete_data && !to_delete.is_empty() {
+            if let Some(ref swarm) = self.swarm_engine {
+                let base = self
+                    .base_download_dir
+                    .clone()
+                    .unwrap_or_else(|| swarm.settings().read().download_dir.clone());
+                let _ = tokio::task::spawn_blocking(move || {
+                    for (dl_dir_str, torrent_name) in to_delete {
+                        crate::http_api::delete_torrent_data_under_base(
+                            &base,
+                            &dl_dir_str,
+                            &torrent_name,
+                        );
+                    }
+                })
+                .await;
+            }
+        }
+
+        Ok(Response::new(batch_command_response(
+            succeeded,
+            failed_hashes,
+        )))
+    }
+}
+
+#[derive(Clone, Copy)]
+enum BatchStateAction {
+    Pause,
+    Resume,
+    Recheck,
+}
+
+fn parse_hashes_list(raw_hashes: &[String]) -> Option<Vec<(String, String, [u8; 20])>> {
+    raw_hashes
+        .iter()
+        .map(|raw| {
+            let hash = raw.to_lowercase();
+            let arr = parse_hash(&hash)?;
+            Some((raw.clone(), hash, arr))
+        })
+        .collect()
+}
+
+fn batch_command_response(succeeded: u32, failed_hashes: Vec<String>) -> BatchCommandResponse {
+    let error = (!failed_hashes.is_empty())
+        .then(|| format!("{} torrent(s) not found", failed_hashes.len()));
+    BatchCommandResponse {
+        success: failed_hashes.is_empty(),
+        succeeded,
+        failed_hashes,
+        error,
+    }
+}
+
+impl SynapseService {
+    fn batch_state_action(
+        &self,
+        parsed: Vec<(String, String, [u8; 20])>,
+        action: BatchStateAction,
+    ) -> Response<BatchCommandResponse> {
+        let mut succeeded = 0u32;
+        let mut failed_hashes = Vec::new();
+
+        for (_, hash, arr) in parsed {
+            let ok = if let Some(ref swarm) = self.swarm_engine {
+                match action {
+                    BatchStateAction::Pause => swarm.transition_to_cold(&arr),
+                    BatchStateAction::Resume => swarm.transition_to_hot(&arr),
+                    BatchStateAction::Recheck => swarm.recheck_torrent(&arr),
+                }
+            } else {
+                self.active_summaries.contains_key(&hash)
+            };
+
+            if !ok {
+                failed_hashes.push(hash);
+                continue;
+            }
+            succeeded += 1;
+
+            if let Some(mut item) = self.active_summaries.get_mut(&hash) {
+                let cleared_error = item.error_message.take().map(|_| String::new());
+                let target_state = match action {
+                    BatchStateAction::Pause => TorrentState::StateStopped as i32,
+                    BatchStateAction::Resume => {
+                        if item.progress >= 1.0 {
+                            TorrentState::StateSeeding as i32
+                        } else {
+                            TorrentState::StateDownloading as i32
+                        }
+                    }
+                    BatchStateAction::Recheck => TorrentState::StateChecking as i32,
+                };
+                item.state = target_state;
+                let mut delta = TorrentDelta {
+                    hash: hash.clone(),
+                    state: Some(target_state),
+                    error_message: cleared_error,
+                    ..Default::default()
+                };
+                if matches!(action, BatchStateAction::Pause) {
+                    item.rate_download = 0;
+                    item.rate_upload = 0;
+                    item.peers_connected = 0;
+                    item.peers_sending = 0;
+                    delta.rate_download = Some(0);
+                    delta.rate_upload = Some(0);
+                    delta.peers_connected = Some(0);
+                    delta.peers_sending = Some(0);
+                }
+                self.event_bus.record_delta(delta);
+            }
+        }
+
+        Response::new(batch_command_response(succeeded, failed_hashes))
+    }
 }
 
 #[cfg(test)]
 mod tracker_host_tests {
-    use super::tracker_hosts_from_urls;
+    use super::*;
 
     #[test]
     fn hosts_only_deduplicated_and_never_the_passkey() {
@@ -1690,7 +2068,6 @@ mod tracker_host_tests {
 
     #[tokio::test]
     async fn all_23_grpc_endpoints_reject_unauthenticated_requests_when_token_is_set() {
-        use super::*;
         use tonic::Code;
 
         let tmp = tempfile::tempdir().unwrap();
@@ -1700,7 +2077,8 @@ mod tracker_host_tests {
 
         let service = SynapseService::new(Arc::new(EventBus::new(16)))
             .with_swarm_engine(engine)
-            .with_auth_token(Some("top-secret-grpc-token".to_string()));
+            .with_auth_token(Some("top-secret-grpc-token".to_string()))
+            .with_rate_limiter(crate::http_api::AuthRateLimiter::with_max_failures(100));
 
         // Verify all 23 RPC handlers reject unauthenticated calls with Code::Unauthenticated
         assert_eq!(
@@ -1904,7 +2282,7 @@ mod tracker_host_tests {
         let mut bad_loc = Request::new(SetLocationRequest {
             hash: "0123456789abcdef0123456789abcdef01234567".into(),
             new_download_dir: "/etc".into(),
-            move_existing_files: false,
+            move_existing_files: Some(false),
         });
         bad_loc.metadata_mut().insert(
             "authorization",
@@ -1928,5 +2306,356 @@ mod tracker_host_tests {
             service.add_torrent(bad_file).await.unwrap_err().code(),
             Code::PermissionDenied
         );
+
+        // Verify FilePath outside base_download_dir is rejected even with a .torrent extension
+        let outside_dir = tempfile::tempdir().unwrap();
+        let outside_path = outside_dir.path().join("outside.torrent");
+        std::fs::write(
+            &outside_path,
+            b"d4:infod4:name1:ae12:piece lengthi16384e6:pieces20:aaaaaaaaaaaaaaaaaaaaee",
+        )
+        .unwrap();
+        let mut outside_torrent = Request::new(AddTorrentRequest {
+            source: Some(add_torrent_request::Source::FilePath(
+                outside_path.to_string_lossy().into_owned(),
+            )),
+            download_dir: None,
+            start_paused: None,
+        });
+        outside_torrent.metadata_mut().insert(
+            "authorization",
+            "Bearer top-secret-grpc-token".parse().unwrap(),
+        );
+        assert_eq!(
+            service
+                .add_torrent(outside_torrent)
+                .await
+                .unwrap_err()
+                .code(),
+            Code::PermissionDenied
+        );
+
+        // Verify gRPC auth rate limiter blocks after repeated failed attempts
+        let rate_limited_service = SynapseService::new(Arc::new(EventBus::new(16)))
+            .with_auth_token(Some("top-secret-grpc-token".into()));
+        let mut saw_exhausted = false;
+        for _ in 0..20 {
+            let mut bad_req = Request::new(Empty::default());
+            bad_req
+                .metadata_mut()
+                .insert("authorization", "Bearer wrong".parse().unwrap());
+            match rate_limited_service.get_capabilities(bad_req).await {
+                Err(status) if status.code() == Code::ResourceExhausted => {
+                    saw_exhausted = true;
+                    break;
+                }
+                Err(status) => assert_eq!(status.code(), Code::Unauthenticated),
+                Ok(_) => panic!("unexpected auth success"),
+            }
+        }
+        assert!(
+            saw_exhausted,
+            "gRPC auth rate limiter must block brute force"
+        );
+    }
+
+    fn make_single_file_info(name: &str) -> synapse_meta::Info {
+        let mut info_dict = std::collections::BTreeMap::new();
+        info_dict.insert(
+            b"name".to_vec(),
+            synapse_bencode::BEncode::String(name.as_bytes().to_vec()),
+        );
+        info_dict.insert(
+            b"piece length".to_vec(),
+            synapse_bencode::BEncode::Int(16_384),
+        );
+        info_dict.insert(
+            b"pieces".to_vec(),
+            synapse_bencode::BEncode::String(vec![0xAB; 20]),
+        );
+        info_dict.insert(b"length".to_vec(), synapse_bencode::BEncode::Int(16_384));
+        let mut top = std::collections::BTreeMap::new();
+        top.insert(b"info".to_vec(), synapse_bencode::BEncode::Dict(info_dict));
+        synapse_meta::Info::from_bencode(synapse_bencode::BEncode::Dict(top)).unwrap()
+    }
+
+    #[tokio::test]
+    async fn remove_torrent_respects_delete_data_under_base_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let disk = Arc::new(diskio::DiskEngine::auto().await);
+        let engine = Arc::new(synapse_engine::SwarmEngine::new(disk, [0x21; 20]));
+        engine.settings().write().download_dir = tmp.path().to_path_buf();
+        let service =
+            SynapseService::new(Arc::new(EventBus::new(16))).with_swarm_engine(engine.clone());
+
+        let keep_info = Arc::new(make_single_file_info("keep-file.bin"));
+        let keep_path = tmp.path().join("keep-file.bin");
+        std::fs::write(&keep_path, b"keep").unwrap();
+        engine.add_torrent(keep_info.clone(), tmp.path().to_path_buf(), None);
+
+        let del_info = Arc::new(make_single_file_info("delete-file.bin"));
+        let del_path = tmp.path().join("delete-file.bin");
+        std::fs::write(&del_path, b"delete").unwrap();
+        engine.add_torrent(del_info.clone(), tmp.path().to_path_buf(), None);
+
+        service
+            .remove_torrent(Request::new(RemoveTorrentRequest {
+                hash: hex::encode(keep_info.hash).to_uppercase(),
+                delete_data: false,
+            }))
+            .await
+            .unwrap();
+        assert!(keep_path.exists());
+
+        service
+            .remove_torrent(Request::new(RemoveTorrentRequest {
+                hash: hex::encode(del_info.hash).to_uppercase(),
+                delete_data: true,
+            }))
+            .await
+            .unwrap();
+        assert!(!del_path.exists());
+    }
+
+    #[tokio::test]
+    async fn grpc_set_location_and_rate_limits_honor_partial_and_move_flags() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir_a = tmp.path().join("a");
+        let dir_b = tmp.path().join("b");
+        let dir_c = tmp.path().join("c");
+        std::fs::create_dir_all(&dir_a).unwrap();
+
+        let disk = Arc::new(diskio::DiskEngine::auto().await);
+        let engine = Arc::new(synapse_engine::SwarmEngine::new(disk, [0x22; 20]));
+        engine.settings().write().download_dir = tmp.path().to_path_buf();
+        let event_bus = Arc::new(EventBus::new(32));
+        let service = SynapseService::new(event_bus.clone()).with_swarm_engine(engine.clone());
+
+        let info = Arc::new(make_single_file_info("moved.bin"));
+        std::fs::write(dir_a.join("moved.bin"), vec![0x55; 16_384]).unwrap();
+        let mut bf = synapse_picker::Bitfield::new(1);
+        bf.set(0);
+        let resume = synapse_engine::SwarmResumeOptions {
+            is_paused: true,
+            ..Default::default()
+        };
+        let handle =
+            engine.add_torrent_with_resume(info.clone(), dir_a.clone(), Some(&bf), Some(resume));
+        engine.transition_to_cold(&info.hash);
+        service.sync_from_engine();
+
+        // Move files = true on paused torrent stays Cold and relocates file + summary.
+        let resp = service
+            .set_location(Request::new(SetLocationRequest {
+                hash: hex::encode(info.hash),
+                new_download_dir: dir_b.to_string_lossy().into_owned(),
+                move_existing_files: Some(true),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.success);
+        assert!(dir_b.join("moved.bin").exists());
+        assert!(!dir_a.join("moved.bin").exists());
+        assert_eq!(handle.stats.read().tier, synapse_engine::SwarmTier::Cold);
+
+        // Move files = false updates download_dir without moving disk files.
+        let resp2 = service
+            .set_location(Request::new(SetLocationRequest {
+                hash: hex::encode(info.hash),
+                new_download_dir: dir_c.to_string_lossy().into_owned(),
+                move_existing_files: Some(false),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp2.success);
+        assert!(dir_b.join("moved.bin").exists());
+        assert!(!dir_c.join("moved.bin").exists());
+        let expected_c = std::fs::canonicalize(&dir_c).unwrap();
+        assert_eq!(
+            handle.stats.read().download_dir,
+            expected_c.to_string_lossy()
+        );
+
+        // Partial global + per-torrent rate limits.
+        service
+            .set_rate_limits(Request::new(RateLimitsRequest {
+                global_download_limit: Some(50_000),
+                global_upload_limit: Some(80_000),
+                per_torrent_hash: None,
+                torrent_download_limit: None,
+                torrent_upload_limit: None,
+            }))
+            .await
+            .unwrap();
+        service
+            .set_rate_limits(Request::new(RateLimitsRequest {
+                global_download_limit: Some(90_000),
+                global_upload_limit: None,
+                per_torrent_hash: Some(hex::encode(info.hash)),
+                torrent_download_limit: Some(12_000),
+                torrent_upload_limit: None,
+            }))
+            .await
+            .unwrap();
+        assert_eq!(engine.settings().read().download_limit_bytes, 90_000);
+        assert_eq!(engine.settings().read().upload_limit_bytes, 80_000);
+        assert_eq!(
+            handle
+                .download_limit_bytes
+                .load(std::sync::atomic::Ordering::Relaxed),
+            12_000
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_diff_and_detail_propagate_metadata_error_clearing_and_priorities() {
+        let bus = Arc::new(EventBus::new(16));
+        let mut rx = bus.subscribe();
+
+        // diff_summary clears error via Some("") and EventBus preserves queue_position.
+        let old = TorrentSummary {
+            hash: "01".repeat(20),
+            name: "n".into(),
+            error_message: Some("disk full".into()),
+            queue_position: 1,
+            ..Default::default()
+        };
+        let new = TorrentSummary {
+            hash: "01".repeat(20),
+            name: "n".into(),
+            error_message: None,
+            queue_position: 3,
+            ..Default::default()
+        };
+        let delta = diff_summary(&old, &new).expect("delta expected");
+        assert_eq!(delta.error_message.as_deref(), Some(""));
+        assert_eq!(delta.queue_position, Some(3));
+        bus.record_delta(delta.clone());
+        bus.record_delta(TorrentDelta {
+            hash: old.hash.clone(),
+            progress: Some(0.5),
+            ..Default::default()
+        });
+
+        let flusher = bus
+            .clone()
+            .start_flusher(std::time::Duration::from_millis(10));
+        let ev = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        flusher.abort();
+        match ev.event {
+            Some(torrent_list_event::Event::Updated(d)) => {
+                assert_eq!(d.error_message.as_deref(), Some(""));
+                assert_eq!(d.queue_position, Some(3));
+                assert_eq!(d.progress, Some(0.5));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        // sync_from_engine emits Added when metadata changes, and detail reflects file_priorities.
+        let tmp = tempfile::tempdir().unwrap();
+        let disk = Arc::new(diskio::DiskEngine::auto().await);
+        let engine = Arc::new(synapse_engine::SwarmEngine::new(disk, [0x23; 20]));
+        engine.settings().write().download_dir = tmp.path().to_path_buf();
+        let bus2 = Arc::new(EventBus::new(16));
+        let service = SynapseService::new(bus2.clone()).with_swarm_engine(engine.clone());
+
+        let info = Arc::new(make_single_file_info("prio.bin"));
+        engine.add_torrent(info.clone(), tmp.path().to_path_buf(), None);
+        service.sync_from_engine();
+
+        let mut rx2 = bus2.subscribe();
+        engine.set_torrent_metadata(
+            &info.hash,
+            synapse_engine::TorrentMetadataPatch {
+                category: Some(Some("linux".into())),
+                ..Default::default()
+            },
+        );
+        service.sync_from_engine();
+        let meta_ev = rx2.try_recv().expect("metadata change should emit Added");
+        assert!(matches!(
+            meta_ev.event,
+            Some(torrent_list_event::Event::Added(ref s)) if s.category.as_deref() == Some("linux")
+        ));
+
+        engine.set_file_priority(&info.hash, 0, 7);
+        let mut detail_stream = service
+            .subscribe_torrent_detail(Request::new(TorrentDetailRequest {
+                hash: hex::encode(info.hash),
+                refresh_interval_ms: 100,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let first_detail =
+            tokio::time::timeout(std::time::Duration::from_secs(1), detail_stream.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        assert_eq!(first_detail.files.len(), 1);
+        assert_eq!(first_detail.files[0].priority, 7);
+    }
+
+    #[tokio::test]
+    async fn sync_if_subscribed_skips_idle_and_stats_match_global_metrics() {
+        let tmp = tempfile::tempdir().unwrap();
+        let disk = Arc::new(diskio::DiskEngine::auto().await);
+        let engine = Arc::new(synapse_engine::SwarmEngine::new(disk, [0x24; 20]));
+        engine.settings().write().download_dir = tmp.path().to_path_buf();
+        let bus = Arc::new(EventBus::new(16));
+        let service = SynapseService::new(bus.clone()).with_swarm_engine(engine.clone());
+
+        let info = Arc::new(make_single_file_info("sub-stats.bin"));
+        engine.add_torrent(info.clone(), tmp.path().to_path_buf(), None);
+
+        // With 0 subscribers, sync_from_engine_if_subscribed does no work.
+        service.sync_from_engine_if_subscribed();
+        assert_eq!(service.active_summaries.len(), 0);
+
+        // subscribe_torrents initializes active_summaries synchronously when subscriber count was 0.
+        let mut stream = service
+            .subscribe_torrents(Request::new(SubscribeTorrentsRequest {
+                chunk_size: 100,
+                flush_window_ms: 50,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(service.active_summaries.len(), 1);
+        let first = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            first.event,
+            Some(torrent_list_event::Event::Snapshot(snap)) if snap.items.len() == 1
+        ));
+
+        service.sync_from_engine_if_subscribed();
+        service.refresh_session_stats().await;
+        let expected_metrics = engine.global_metrics();
+        let expected_dht = engine.dht_node_count_fast() as u32;
+        let unary = service
+            .get_session_stats(Request::new(SessionStatsRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        let streamed = *service.session_stats.read();
+        assert_eq!(unary.torrent_count, expected_metrics.total_torrents as u32);
+        assert_eq!(
+            unary.active_downloading,
+            expected_metrics.downloading_torrents as u32
+        );
+        assert_eq!(unary.dht_nodes, expected_dht);
+        assert_eq!(streamed.torrent_count, unary.torrent_count);
+        assert_eq!(streamed.active_downloading, unary.active_downloading);
+        assert_eq!(streamed.dht_nodes, unary.dht_nodes);
     }
 }

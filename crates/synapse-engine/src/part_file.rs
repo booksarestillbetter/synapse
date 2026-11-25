@@ -130,12 +130,31 @@ impl PartFileManager {
         !self.unwanted_files.is_empty()
     }
 
+    pub fn has_slices(&self) -> bool {
+        !self.slices.is_empty()
+    }
+
     pub fn download_dir(&self) -> &Path {
         &self.download_dir
     }
 
     pub fn part_file_path(&self) -> &Path {
         &self.part_file_path
+    }
+
+    pub fn map_path(&self) -> &Path {
+        &self.map_path
+    }
+
+    /// Updates internal part-file and map paths after relocating a torrent to `new_dir`.
+    pub fn relocate_to_dir(&mut self, new_dir: &Path) {
+        if let Some(name) = self.part_file_path.file_name().map(ToOwned::to_owned) {
+            self.part_file_path = new_dir.join(name);
+        }
+        if let Some(name) = self.map_path.file_name().map(ToOwned::to_owned) {
+            self.map_path = new_dir.join(name);
+        }
+        self.download_dir = new_dir.to_path_buf();
     }
 
     /// Resolves target path and offset for writing a slice.
@@ -148,18 +167,38 @@ impl PartFileManager {
         normal_path: PathBuf,
     ) -> (PathBuf, u64, u64) {
         if self.is_unwanted(file_idx) {
-            let before = self.slices.len();
-            let part_offset = self
-                .slices
-                .entry((file_idx, file_offset))
-                .and_modify(|(len, _)| *len = (*len).max(slice_len as u64))
-                .or_insert_with(|| {
+            let needed = slice_len as u64;
+            let mut dirty = false;
+            let part_offset = match self.slices.get_mut(&(file_idx, file_offset)) {
+                Some((existing_len, existing_off)) => {
+                    if needed <= *existing_len {
+                        *existing_off
+                    } else {
+                        // Never expand an existing slice in place over adjacent slices:
+                        // relocate to fresh non-overlapping space at `next_part_offset`.
+                        let new_off = self.next_part_offset;
+                        self.next_part_offset = self
+                            .next_part_offset
+                            .checked_add(needed)
+                            .expect("part file offset overflow");
+                        *existing_len = needed;
+                        *existing_off = new_off;
+                        dirty = true;
+                        new_off
+                    }
+                }
+                None => {
                     let off = self.next_part_offset;
-                    self.next_part_offset += slice_len as u64;
-                    (slice_len as u64, off)
-                })
-                .1;
-            if self.slices.len() != before {
+                    self.next_part_offset = self
+                        .next_part_offset
+                        .checked_add(needed)
+                        .expect("part file offset overflow");
+                    self.slices.insert((file_idx, file_offset), (needed, off));
+                    dirty = true;
+                    off
+                }
+            };
+            if dirty {
                 self.persist();
             }
             (
@@ -170,6 +209,67 @@ impl PartFileManager {
         } else {
             (normal_path, file_offset, 0)
         }
+    }
+
+    /// Resolves `[file_offset, file_offset + len)` into a sequence of `(path, offset, sub_len)`
+    /// segments covering any stored part-file slices and normal-file gaps without ever
+    /// overflowing past a stored slice's length into adjacent part-file data.
+    pub fn resolve_read_ranges(
+        &self,
+        file_idx: usize,
+        file_offset: u64,
+        len: usize,
+        normal_path: &Path,
+    ) -> Vec<(PathBuf, u64, usize)> {
+        if len == 0 {
+            return Vec::new();
+        }
+        let req_end = file_offset.saturating_add(len as u64);
+        let mut overlapping: Vec<(u64, u64, u64)> = Vec::new();
+        if let Some((&(idx, start), &(slen, part_off))) =
+            self.slices.range(..=(file_idx, file_offset)).next_back()
+        {
+            if idx == file_idx && start.saturating_add(slen) > file_offset {
+                overlapping.push((start, slen, part_off));
+            }
+        }
+        for (&(idx, start), &(slen, part_off)) in self
+            .slices
+            .range((file_idx, file_offset.saturating_add(1))..)
+        {
+            if idx != file_idx || start >= req_end {
+                break;
+            }
+            overlapping.push((start, slen, part_off));
+        }
+
+        if overlapping.is_empty() {
+            return vec![(normal_path.to_path_buf(), file_offset, len)];
+        }
+
+        let mut out = Vec::new();
+        let mut cur = file_offset;
+        for (start, slen, part_off) in overlapping {
+            let slice_end = start.saturating_add(slen);
+            let s_start = start.max(cur);
+            let s_end = slice_end.min(req_end);
+            if s_end <= s_start {
+                continue;
+            }
+            if s_start > cur {
+                out.push((normal_path.to_path_buf(), cur, (s_start - cur) as usize));
+            }
+            out.push((
+                self.part_file_path.clone(),
+                part_off + (s_start - start),
+                (s_end - s_start) as usize,
+            ));
+            cur = s_end;
+        }
+        if cur < req_end {
+            out.push((normal_path.to_path_buf(), cur, (req_end - cur) as usize));
+        }
+        out
     }
 
     /// Resolves target path and offset for reading `file_offset` of a file. If that byte was
@@ -208,6 +308,9 @@ impl PartFileManager {
     /// file (the part-file bytes are simply left behind, unreferenced).
     pub fn forget_file(&mut self, file_idx: usize) {
         self.slices.retain(|&(idx, _), _| idx != file_idx);
+        if self.slices.is_empty() {
+            self.next_part_offset = 0;
+        }
         self.persist();
     }
 }
@@ -333,5 +436,58 @@ mod tests {
         assert!(PartFileManager::new(temp.path().to_path_buf(), hash)
             .slices_for_file(1)
             .is_empty());
+    }
+
+    #[test]
+    fn expanding_existing_slice_relocates_without_clobbering_adjacent_slice() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut pfm = PartFileManager::new(temp.path().to_path_buf(), [8; 20]);
+        pfm.set_file_priority(1, 0);
+        let f1 = temp.path().join("f1");
+
+        // Write slice A (offset 0, len 100) -> part offset 0..100
+        let (p0, off0, end0) = pfm.resolve_write_location(1, 0, 100, f1.clone());
+        assert_eq!((off0, end0), (0, 100));
+        // Write slice B (offset 500, len 100) -> part offset 100..200
+        let (_, off_b, end_b) = pfm.resolve_write_location(1, 500, 100, f1.clone());
+        assert_eq!((off_b, end_b), (100, 200));
+
+        // Simulate real bytes written to both slices in the part file
+        std::fs::write(&p0, vec![0xAAu8; 200]).unwrap();
+        {
+            use std::io::{Seek, SeekFrom, Write};
+            let mut f = std::fs::OpenOptions::new().write(true).open(&p0).unwrap();
+            f.seek(SeekFrom::Start(off_b)).unwrap();
+            f.write_all(&[0xBBu8; 100]).unwrap();
+        }
+
+        // Re-writing slice A with same/smaller length reuses slot 0
+        let (_, off_same, end_same) = pfm.resolve_write_location(1, 0, 80, f1.clone());
+        assert_eq!((off_same, end_same), (0, 200));
+
+        // Expanding slice A to 150 MUST relocate to >= 200 so slice B at 100..200 isn't overwritten
+        let (_, off_exp, end_exp) = pfm.resolve_write_location(1, 0, 150, f1.clone());
+        assert_eq!(off_exp, 200);
+        assert_eq!(end_exp, 350);
+
+        let ranges = pfm.resolve_read_ranges(1, 0, 600, &f1);
+        assert_eq!(
+            ranges,
+            vec![
+                (pfm.part_file_path().to_path_buf(), 200, 150),
+                (f1.clone(), 150, 350),
+                (pfm.part_file_path().to_path_buf(), 100, 100),
+            ]
+        );
+
+        // Slice B bytes remain completely intact
+        let bytes = std::fs::read(&p0).unwrap();
+        assert!(bytes[100..200].iter().all(|&b| b == 0xBB));
+
+        // Forgetting all slices resets next_part_offset back to 0
+        pfm.forget_file(1);
+        pfm.set_file_priority(2, 0);
+        let (_, off_after_forget, _) = pfm.resolve_write_location(2, 0, 50, temp.path().join("f2"));
+        assert_eq!(off_after_forget, 0);
     }
 }

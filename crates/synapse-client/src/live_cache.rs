@@ -85,38 +85,12 @@ async fn run_delta_sync_loop(
         match client.subscribe_torrents(250, 100).await {
             Ok(mut stream) => {
                 info!("Connected to Synapse live delta stream");
-                connected.store(true, Ordering::Release);
                 backoff = Duration::from_secs(1);
 
                 let mut snapshot_buffer: Vec<TorrentSummary> = Vec::new();
 
                 while let Ok(Some(event)) = stream.message().await {
-                    match event.event {
-                        Some(Event::Snapshot(chunk)) => {
-                            snapshot_buffer.extend(chunk.items);
-                            if chunk.is_last_chunk {
-                                let mut map = HashMap::with_capacity(snapshot_buffer.len());
-                                for t in snapshot_buffer.drain(..) {
-                                    map.insert(t.hash.clone(), t);
-                                }
-                                *torrents.write() = map;
-                                debug!(
-                                    "Applied full torrent snapshot ({} swarms)",
-                                    torrents.read().len()
-                                );
-                            }
-                        }
-                        Some(Event::Added(t)) => {
-                            torrents.write().insert(t.hash.clone(), t);
-                        }
-                        Some(Event::Updated(delta)) => {
-                            apply_delta(&mut torrents.write(), delta);
-                        }
-                        Some(Event::RemovedHash(hash)) => {
-                            torrents.write().remove(&hash);
-                        }
-                        None => {}
-                    }
+                    apply_stream_event(&mut snapshot_buffer, &torrents, &connected, event.event);
                 }
                 warn!("Synapse delta stream ended, will reconnect");
                 connected.store(false, Ordering::Release);
@@ -132,6 +106,45 @@ async fn run_delta_sync_loop(
 
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(max_backoff);
+    }
+}
+
+fn apply_stream_event(
+    snapshot_buffer: &mut Vec<TorrentSummary>,
+    torrents: &RwLock<HashMap<String, TorrentSummary>>,
+    connected: &AtomicBool,
+    event: Option<Event>,
+) {
+    match event {
+        Some(Event::Snapshot(chunk)) => {
+            snapshot_buffer.extend(chunk.items);
+            if chunk.is_last_chunk {
+                let mut map = HashMap::with_capacity(snapshot_buffer.len());
+                for t in snapshot_buffer.drain(..) {
+                    map.insert(t.hash.clone(), t);
+                }
+                let len = map.len();
+                *torrents.write() = map;
+                connected.store(true, Ordering::Release);
+                debug!("Applied full torrent snapshot ({len} swarms)");
+            }
+        }
+        Some(Event::Added(t)) => {
+            torrents.write().insert(t.hash.clone(), t);
+        }
+        Some(Event::Updated(delta)) => {
+            apply_delta(&mut torrents.write(), delta);
+        }
+        Some(Event::UpdatedBatch(batch)) => {
+            let mut map = torrents.write();
+            for delta in batch.deltas {
+                apply_delta(&mut map, delta);
+            }
+        }
+        Some(Event::RemovedHash(hash)) => {
+            torrents.write().remove(&hash);
+        }
+        None => {}
     }
 }
 
@@ -161,8 +174,140 @@ fn apply_delta(torrents: &mut HashMap<String, TorrentSummary>, delta: TorrentDel
         if let Some(ratio) = delta.ratio {
             t.ratio = ratio;
         }
-        if delta.error_message.is_some() {
-            t.error_message = delta.error_message;
+        if let Some(err) = delta.error_message {
+            t.error_message = if err.is_empty() { None } else { Some(err) };
         }
+        if let Some(qp) = delta.queue_position {
+            t.queue_position = qp;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use synapse_proto::v2::TorrentSnapshotChunk;
+
+    #[test]
+    fn apply_delta_updates_queue_position_and_clears_error_on_empty_string() {
+        let mut map = HashMap::new();
+        map.insert(
+            "aa".repeat(20),
+            TorrentSummary {
+                hash: "aa".repeat(20),
+                error_message: Some("tracker timeout".to_string()),
+                queue_position: 2,
+                ..Default::default()
+            },
+        );
+
+        apply_delta(
+            &mut map,
+            TorrentDelta {
+                hash: "aa".repeat(20),
+                error_message: Some(String::new()),
+                queue_position: Some(0),
+                ..Default::default()
+            },
+        );
+
+        let item = map.get(&"aa".repeat(20)).unwrap();
+        assert_eq!(item.error_message, None);
+        assert_eq!(item.queue_position, 0);
+    }
+
+    #[test]
+    fn connected_stays_false_until_last_snapshot_chunk_arrives() {
+        let torrents = RwLock::new(HashMap::new());
+        let connected = AtomicBool::new(false);
+        let mut buf = Vec::new();
+
+        apply_stream_event(
+            &mut buf,
+            &torrents,
+            &connected,
+            Some(Event::Snapshot(TorrentSnapshotChunk {
+                items: vec![TorrentSummary {
+                    hash: "bb".repeat(20),
+                    ..Default::default()
+                }],
+                chunk_index: 0,
+                total_chunks: 2,
+                is_last_chunk: false,
+            })),
+        );
+        assert!(!connected.load(Ordering::Acquire));
+        assert!(torrents.read().is_empty());
+
+        apply_stream_event(
+            &mut buf,
+            &torrents,
+            &connected,
+            Some(Event::Snapshot(TorrentSnapshotChunk {
+                items: vec![TorrentSummary {
+                    hash: "cc".repeat(20),
+                    ..Default::default()
+                }],
+                chunk_index: 1,
+                total_chunks: 2,
+                is_last_chunk: true,
+            })),
+        );
+        assert!(connected.load(Ordering::Acquire));
+        assert_eq!(torrents.read().len(), 2);
+    }
+
+    #[test]
+    fn updated_batch_applies_all_deltas_to_cached_torrents() {
+        let h1 = "dd".repeat(20);
+        let h2 = "ee".repeat(20);
+        let torrents = RwLock::new(HashMap::from([
+            (
+                h1.clone(),
+                TorrentSummary {
+                    hash: h1.clone(),
+                    progress: 0.1,
+                    ..Default::default()
+                },
+            ),
+            (
+                h2.clone(),
+                TorrentSummary {
+                    hash: h2.clone(),
+                    progress: 0.2,
+                    ..Default::default()
+                },
+            ),
+        ]));
+        let connected = AtomicBool::new(true);
+        let mut buf = Vec::new();
+
+        apply_stream_event(
+            &mut buf,
+            &torrents,
+            &connected,
+            Some(Event::UpdatedBatch(synapse_proto::v2::TorrentDeltaBatch {
+                deltas: vec![
+                    TorrentDelta {
+                        hash: h1.clone(),
+                        progress: Some(0.9),
+                        rate_download: Some(1234),
+                        ..Default::default()
+                    },
+                    TorrentDelta {
+                        hash: h2.clone(),
+                        progress: Some(1.0),
+                        rate_upload: Some(5678),
+                        ..Default::default()
+                    },
+                ],
+            })),
+        );
+
+        let guard = torrents.read();
+        assert_eq!(guard[&h1].progress, 0.9);
+        assert_eq!(guard[&h1].rate_download, 1234);
+        assert_eq!(guard[&h2].progress, 1.0);
+        assert_eq!(guard[&h2].rate_upload, 5678);
     }
 }

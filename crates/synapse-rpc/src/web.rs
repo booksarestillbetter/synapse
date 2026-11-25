@@ -230,6 +230,18 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
           </tbody>
         </table>
       </div>
+      <div class="pagination-bar" id="pagination-bar">
+        <button class="btn btn-sm" id="btn-page-prev" disabled>◀ Prev</button>
+        <span id="page-info">Page 1 / 1 (0 total)</span>
+        <button class="btn btn-sm" id="btn-page-next" disabled>Next ▶</button>
+        <select id="page-limit" title="Items per page">
+          <option value="25">25 / page</option>
+          <option value="50" selected>50 / page</option>
+          <option value="100">100 / page</option>
+          <option value="250">250 / page</option>
+          <option value="500">500 / page</option>
+        </select>
+      </div>
 
       <!-- Resizer Splitter -->
       <div class="inspector-resizer" id="inspector-resizer"></div>
@@ -403,6 +415,7 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
         <button class="tab-btn" onclick="switchSettingsTab('queue')">Queue</button>
         <button class="tab-btn" onclick="switchSettingsTab('peers')">Peers & Swarm</button>
         <button class="tab-btn" onclick="switchSettingsTab('storage')">Storage</button>
+        <button class="tab-btn" onclick="switchSettingsTab('advanced')">Advanced</button>
         <button class="tab-btn" onclick="switchSettingsTab('security')">Security</button>
       </div>
 
@@ -421,6 +434,7 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
         <h4 style="margin-top: 16px;">Alt-Speed (Turtle Mode)</h4>
         <div class="form-row">
           <label><input type="checkbox" id="cfg-alt-enabled"> Enable Turtle Mode</label>
+          <span id="cfg-alt-active-badge" class="badge-active" style="display: none;">Active now</span>
         </div>
         <div class="form-row">
           <label>Alt Download Limit:</label>
@@ -429,6 +443,28 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
         <div class="form-row">
           <label>Alt Upload Limit:</label>
           <input type="number" id="cfg-alt-up-val" min="0" step="64"> <span>KB/s</span>
+        </div>
+
+        <div class="form-row">
+          <label><input type="checkbox" id="cfg-alt-time-enabled"> Scheduled Turtle Mode</label>
+        </div>
+        <div class="form-row">
+          <label>From:</label>
+          <input type="time" id="cfg-alt-time-begin">
+          <label style="margin-left: 12px;">To:</label>
+          <input type="time" id="cfg-alt-time-end">
+        </div>
+        <div class="form-row">
+          <label>Active Days:</label>
+          <div class="day-toggle-group" id="cfg-alt-time-days">
+            <button type="button" class="day-btn" data-mask="1">Sun</button>
+            <button type="button" class="day-btn" data-mask="2">Mon</button>
+            <button type="button" class="day-btn" data-mask="4">Tue</button>
+            <button type="button" class="day-btn" data-mask="8">Wed</button>
+            <button type="button" class="day-btn" data-mask="16">Thu</button>
+            <button type="button" class="day-btn" data-mask="32">Fri</button>
+            <button type="button" class="day-btn" data-mask="64">Sat</button>
+          </div>
         </div>
       </div>
 
@@ -457,6 +493,16 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
           <label><input type="checkbox" id="cfg-stall-enabled"> Consider torrents stalled after:</label>
           <input type="number" id="cfg-stall-minutes" min="1" max="1440"> <span>minutes</span>
         </div>
+
+        <h4 style="margin-top: 16px;">Default Seeding Limits</h4>
+        <div class="form-row">
+          <label><input type="checkbox" id="cfg-ratio-limited"> Stop seeding at ratio:</label>
+          <input type="number" id="cfg-ratio-limit" min="0" step="0.1">
+        </div>
+        <div class="form-row">
+          <label><input type="checkbox" id="cfg-idle-limit-enabled"> Stop seeding when idle for:</label>
+          <input type="number" id="cfg-idle-limit-minutes" min="1" max="100000"> <span>minutes</span>
+        </div>
       </div>
 
       <!-- Peers & Swarm Settings -->
@@ -474,18 +520,34 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
           <label><input type="checkbox" id="cfg-dht-enabled"> Enable Mainline DHT (BEP 5)</label>
         </div>
         <div class="form-row">
+          <label><input type="checkbox" id="cfg-dht-read-only"> DHT Read-Only Mode (BEP 43)</label>
+        </div>
+        <div class="form-row">
           <label><input type="checkbox" id="cfg-pex-enabled"> Enable Peer Exchange (PEX, BEP 11)</label>
         </div>
         <div class="form-row">
           <label><input type="checkbox" id="cfg-lsd-enabled"> Enable Local Peer Discovery (LSD, BEP 14)</label>
         </div>
         <div class="form-row">
+          <label><input type="checkbox" id="cfg-zeroconf-enabled"> Enable Zeroconf / mDNS (BEP 26)</label>
+        </div>
+        <div class="form-row">
+          <label><input type="checkbox" id="cfg-utp-enabled"> Enable uTP Transport (BEP 29)</label>
+        </div>
+        <div class="form-row">
           <label>Encryption:</label>
           <select id="cfg-encryption">
-            <option value="preferred">Preferred</option>
-            <option value="required">Required (Encrypted Only)</option>
-            <option value="disabled">Disabled</option>
+            <option value="prefer_encrypted">Preferred</option>
+            <option value="require_encrypted">Required (Encrypted Only)</option>
+            <option value="disable_encryption">Disabled</option>
           </select>
+        </div>
+        <div class="form-group">
+          <label>Announce Address:</label>
+          <input type="text" id="cfg-announce-ip" placeholder="Leave blank to let the tracker decide">
+          <small style="display:block; margin-top: 4px; color: var(--text-muted);">
+            The address trackers are told to reach this node at (VPN / NAT setups).
+          </small>
         </div>
       </div>
 
@@ -504,6 +566,50 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
         </div>
         <div class="form-row">
           <label><input type="checkbox" id="cfg-start-added"> Automatically start newly added torrents</label>
+        </div>
+        <div class="form-row">
+          <label><input type="checkbox" id="cfg-trash-original"> Trash original .torrent files after loading</label>
+        </div>
+      </div>
+
+      <!-- Advanced Settings -->
+      <div class="tab-pane hidden" id="spane-advanced">
+        <h4>Choking &amp; Bandwidth</h4>
+        <div class="form-row">
+          <label>Global Unchoke Slots:</label>
+          <input type="number" id="cfg-unchoke-slots" min="1" max="10000">
+        </div>
+        <div class="form-row">
+          <label>Seed Choking Algorithm:</label>
+          <select id="cfg-seed-choking-algo">
+            <option value="round_robin">Round Robin</option>
+            <option value="fastest_upload">Fastest Upload</option>
+            <option value="anti_leech">Anti-Leech</option>
+          </select>
+        </div>
+        <div class="form-row">
+          <label>Bandwidth Per Unchoke Slot:</label>
+          <input type="number" id="cfg-unchoke-slot-bandwidth" min="0" step="64"> <span>KB/s</span>
+        </div>
+        <div class="form-row">
+          <label><input type="checkbox" id="cfg-limit-lan-peers"> Apply rate limits to LAN peers</label>
+        </div>
+        <div class="form-row">
+          <label><input type="checkbox" id="cfg-rate-limit-ip-overhead"> Count IP/TCP overhead against rate limits</label>
+        </div>
+
+        <h4 style="margin-top: 16px;">Announce Concurrency</h4>
+        <div class="form-row">
+          <label>Max Concurrent Tracker Announces:</label>
+          <input type="number" id="cfg-max-tracker-announces" min="1" max="10000">
+        </div>
+        <div class="form-row">
+          <label>Max Concurrent DHT Announces:</label>
+          <input type="number" id="cfg-max-dht-announces" min="1" max="10000">
+        </div>
+        <div class="form-row">
+          <label>Max Concurrent LSD Announces:</label>
+          <input type="number" id="cfg-max-lsd-announces" min="1" max="10000">
         </div>
       </div>
 
@@ -1057,6 +1163,56 @@ body {
 
 .tab-pane.hidden { display: none; }
 
+.badge-active {
+  margin-left: 8px;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background-color: rgba(245, 158, 11, 0.15);
+  border: 1px solid rgba(245, 158, 11, 0.4);
+  color: var(--warning);
+}
+
+.day-toggle-group { display: flex; flex-wrap: wrap; gap: 6px; }
+.day-btn {
+  font-size: 12px;
+  font-weight: 600;
+  padding: 4px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background-color: var(--bg-tertiary);
+  color: var(--text-muted);
+  cursor: pointer;
+}
+.day-btn.active {
+  background-color: rgba(245, 158, 11, 0.2);
+  border-color: rgba(245, 158, 11, 0.4);
+  color: var(--warning);
+}
+
+.pagination-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 12px;
+  background-color: var(--bg-secondary);
+  border-top: 1px solid var(--border);
+  font-size: 12px;
+}
+.pagination-bar #page-info {
+  color: var(--text-muted);
+  margin-right: auto;
+}
+.pagination-bar select {
+  background-color: var(--bg-primary);
+  color: var(--text-main);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 3px 6px;
+  font-size: 12px;
+}
+
 /* Toast Notifications */
 .toast-container {
   position: fixed;
@@ -1091,7 +1247,13 @@ let activeFilter = 'all';
 let sortField = 'name';
 let sortAsc = true;
 let sessionSettings = null;
-let pollTimer = null;
+let currentPage = 1;
+let pageLimit = 50;
+let totalTorrents = 0;
+let streamAbortController = null;
+let streamReconnectTimer = null;
+let streamBackoffMs = 1500;
+let latestStats = null;
 let activeInspectorTab = 'general';
 let selectedFile = null;
 
@@ -1133,8 +1295,61 @@ function showToast(message, type = 'info') {
 
 // REST API Client
 let authToken = localStorage.getItem('synapse_auth_token') || '';
+let authPromptInFlight = false;
+let authPaused = false;
+let fetchInFlight = false;
 
-async function api(path, options = {}) {
+function startPolling() {
+  startTorrentStream();
+}
+
+function stopPolling() {
+  stopTorrentStream();
+}
+
+function restartTorrentStream() {
+  stopTorrentStream();
+  startTorrentStream();
+}
+
+function stopTorrentStream() {
+  if (streamReconnectTimer) {
+    clearTimeout(streamReconnectTimer);
+    streamReconnectTimer = null;
+  }
+  if (streamAbortController) {
+    streamAbortController.abort();
+    streamAbortController = null;
+  }
+}
+
+function handleUnauthorized(retried) {
+  if (retried || authPromptInFlight || authPaused) {
+    stopPolling();
+    authPaused = true;
+    return false;
+  }
+  stopPolling();
+  authPromptInFlight = true;
+  let token = null;
+  try {
+    token = prompt('Synapse requires an authorization token. Please enter your Bearer token:');
+  } finally {
+    authPromptInFlight = false;
+  }
+  if (token && token.trim()) {
+    authToken = token.trim();
+    localStorage.setItem('synapse_auth_token', authToken);
+    authPaused = false;
+    startPolling();
+    return true;
+  }
+  authPaused = true;
+  showToast('Authorization required: polling paused until a token is saved in Settings -> Security', 'error');
+  return false;
+}
+
+async function api(path, options = {}, retried = false) {
   const headers = {
     'Accept': 'application/json',
     ...(options.headers || {})
@@ -1145,12 +1360,10 @@ async function api(path, options = {}) {
   try {
     const res = await fetch(path, { ...options, headers });
     if (res.status === 401) {
-      const token = prompt('Synapse requires an authorization token. Please enter your Bearer token:');
-      if (token) {
-        authToken = token.trim();
-        localStorage.setItem('synapse_auth_token', authToken);
-        return api(path, options);
+      if (handleUnauthorized(retried)) {
+        return api(path, options, true);
       }
+      throw new Error('Unauthorized');
     }
     if (!res.ok) {
       const err = await res.json().catch(() => ({ message: res.statusText }));
@@ -1163,32 +1376,170 @@ async function api(path, options = {}) {
   }
 }
 
-// Fetch session stats & torrent list
-async function fetchUpdate() {
+function applySessionStats(stats) {
+  if (!stats) return;
+  latestStats = stats;
+  document.getElementById('stat-dl-rate').innerText = formatSpeed(stats.download_rate);
+  document.getElementById('stat-ul-rate').innerText = formatSpeed(stats.upload_rate);
+  document.getElementById('stat-free-disk').innerText = formatBytes(stats.free_disk_space_bytes);
+
+  const dhtEl = document.getElementById('stat-dht-nodes');
+  if (dhtEl) {
+    if (stats.dht_enabled === false) {
+      dhtEl.innerText = 'Disabled';
+    } else {
+      dhtEl.innerText = `${stats.dht_nodes || 0}`;
+    }
+  }
+}
+
+function applyTorrentDelta(payload) {
+  if (payload.total !== undefined && payload.total !== null) {
+    totalTorrents = payload.total;
+  }
+  if (Array.isArray(payload.removed) && payload.removed.length > 0) {
+    const gone = new Set(payload.removed);
+    torrents = torrents.filter(t => !gone.has(t.info_hash));
+  }
+  const byHash = new Map(torrents.map(t => [t.info_hash, t]));
+  if (Array.isArray(payload.updated)) {
+    for (const patch of payload.updated) {
+      const existing = byHash.get(patch.info_hash);
+      if (existing) Object.assign(existing, patch);
+    }
+  }
+  if (Array.isArray(payload.added)) {
+    for (const item of payload.added) {
+      const existing = byHash.get(item.info_hash);
+      if (existing) Object.assign(existing, item);
+      else torrents.push(item);
+    }
+  }
+}
+
+function renderPagination() {
+  const totalPages = Math.max(1, Math.ceil(totalTorrents / pageLimit));
+  if (currentPage > totalPages) currentPage = totalPages;
+  const infoEl = document.getElementById('page-info');
+  if (infoEl) infoEl.innerText = `Page ${currentPage} / ${totalPages} (${totalTorrents} total)`;
+  const prevBtn = document.getElementById('btn-page-prev');
+  const nextBtn = document.getElementById('btn-page-next');
+  if (prevBtn) prevBtn.disabled = currentPage <= 1;
+  if (nextBtn) nextBtn.disabled = currentPage >= totalPages;
+}
+
+function handleSseFrame(rawFrame) {
+  let eventName = 'message';
+  const dataLines = [];
+  for (const line of rawFrame.split('\n')) {
+    if (!line || line.startsWith(':')) continue;
+    if (line.startsWith('event:')) {
+      eventName = line.slice(6).trim();
+    } else if (line.startsWith('data:')) {
+      dataLines.push(line.slice(5).trimStart());
+    }
+  }
+  if (dataLines.length === 0) return;
+  let payload = null;
   try {
+    payload = JSON.parse(dataLines.join('\n'));
+  } catch (_) {
+    return;
+  }
+  if (eventName === 'snapshot') {
+    torrents = payload.torrents || [];
+    totalTorrents = payload.total ?? torrents.length;
+    applySessionStats(payload.stats);
+    updateCategoryCounts();
+    renderPagination();
+    renderTorrentTable();
+    if (selectedHashes.size === 1) updateInspector([...selectedHashes][0]);
+  } else if (eventName === 'delta') {
+    applyTorrentDelta(payload);
+    updateCategoryCounts();
+    renderPagination();
+    renderTorrentTable();
+    if (selectedHashes.size === 1) updateInspector([...selectedHashes][0]);
+  } else if (eventName === 'stats') {
+    applySessionStats(payload);
+    updateCategoryCounts();
+  }
+}
+
+async function startTorrentStream() {
+  if (streamAbortController || authPaused) return;
+  if (streamReconnectTimer) {
+    clearTimeout(streamReconnectTimer);
+    streamReconnectTimer = null;
+  }
+  const ctrl = new AbortController();
+  streamAbortController = ctrl;
+  const stateQ = activeFilter !== 'all' ? `&state=${encodeURIComponent(activeFilter)}` : '';
+  const url = `/api/v1/torrents/stream?page=${currentPage}&limit=${pageLimit}&interval_ms=1000${stateQ}`;
+  const headers = { 'Accept': 'text/event-stream' };
+  if (authToken) {
+    headers['Authorization'] = `Bearer ${authToken}`;
+  }
+  try {
+    const res = await fetch(url, { headers, signal: ctrl.signal });
+    if (res.status === 401) {
+      streamAbortController = null;
+      handleUnauthorized(false);
+      return;
+    }
+    if (!res.ok || !res.body) {
+      throw new Error(`HTTP ${res.status}`);
+    }
+    document.getElementById('conn-status').classList.remove('offline');
+    streamBackoffMs = 1500;
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    while (!ctrl.signal.aborted) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n');
+      let sepIdx;
+      while ((sepIdx = buffer.indexOf('\n\n')) !== -1) {
+        const frame = buffer.slice(0, sepIdx);
+        buffer = buffer.slice(sepIdx + 2);
+        handleSseFrame(frame);
+      }
+    }
+  } catch (e) {
+    if (!ctrl.signal.aborted) {
+      console.warn('Torrent stream error:', e);
+    }
+  } finally {
+    if (streamAbortController === ctrl) {
+      streamAbortController = null;
+    }
+    if (!ctrl.signal.aborted && !authPaused) {
+      document.getElementById('conn-status').classList.add('offline');
+      const delay = streamBackoffMs;
+      streamBackoffMs = Math.min(5000, Math.round(streamBackoffMs * 1.5));
+      streamReconnectTimer = setTimeout(startTorrentStream, delay);
+    }
+  }
+}
+
+// Fetch session stats & paginated torrent list (on-demand refresh fallback)
+async function fetchUpdate() {
+  if (fetchInFlight || authPaused) return;
+  fetchInFlight = true;
+  try {
+    const stateQ = activeFilter !== 'all' ? `&state=${encodeURIComponent(activeFilter)}` : '';
     const [stats, torrentData] = await Promise.all([
       api('/api/v1/session/stats'),
-      api('/api/v1/torrents?limit=10000')
+      api(`/api/v1/torrents?page=${currentPage}&limit=${pageLimit}${stateQ}`)
     ]);
 
     document.getElementById('conn-status').classList.remove('offline');
     torrents = torrentData.torrents || [];
-
-    // Update global toolbar metrics and DHT nodes
-    document.getElementById('stat-dl-rate').innerText = formatSpeed(stats.download_rate);
-    document.getElementById('stat-ul-rate').innerText = formatSpeed(stats.upload_rate);
-    document.getElementById('stat-free-disk').innerText = formatBytes(stats.free_disk_space_bytes);
-
-    const dhtEl = document.getElementById('stat-dht-nodes');
-    if (dhtEl) {
-      if (stats.dht_enabled === false) {
-        dhtEl.innerText = 'Disabled';
-      } else {
-        dhtEl.innerText = `${stats.dht_nodes || 0}`;
-      }
-    }
-
+    totalTorrents = torrentData.total ?? torrents.length;
+    applySessionStats(stats);
     updateCategoryCounts();
+    renderPagination();
     renderTorrentTable();
 
     if (selectedHashes.size === 1) {
@@ -1196,18 +1547,30 @@ async function fetchUpdate() {
     }
   } catch (e) {
     console.warn('Poll update error:', e);
+  } finally {
+    fetchInFlight = false;
   }
 }
 
 function updateCategoryCounts() {
-  const counts = { all: torrents.length, downloading: 0, seeding: 0, paused: 0, queued: 0, checking: 0, error: 0 };
+  const counts = {
+    all: latestStats ? (latestStats.total_torrents || 0) : totalTorrents,
+    downloading: latestStats ? (latestStats.downloading_torrents || 0) : 0,
+    seeding: latestStats ? (latestStats.seeding_torrents || 0) : 0,
+    paused: latestStats ? (latestStats.paused_torrents || 0) : 0,
+    queued: latestStats ? (latestStats.queued_torrents || 0) : 0,
+    checking: 0,
+    error: 0
+  };
   for (const t of torrents) {
     const st = (t.state || '').toLowerCase();
-    if (st.includes('downloading')) counts.downloading++;
-    else if (st.includes('seeding')) counts.seeding++;
-    else if (st.includes('paused') || st.includes('stopped')) counts.paused++;
-    else if (st.includes('queued')) counts.queued++;
-    else if (st.includes('checking')) counts.checking++;
+    if (!latestStats) {
+      if (st.includes('downloading')) counts.downloading++;
+      else if (st.includes('seeding')) counts.seeding++;
+      else if (st.includes('paused') || st.includes('stopped')) counts.paused++;
+      else if (st.includes('queued')) counts.queued++;
+    }
+    if (st.includes('checking')) counts.checking++;
     else if (st.includes('error')) counts.error++;
   }
   for (const [k, v] of Object.entries(counts)) {
@@ -1216,32 +1579,59 @@ function updateCategoryCounts() {
   }
 }
 
+function getSortValue(t, field, origIdx) {
+  switch (field) {
+    case 'num': return origIdx;
+    case 'name': return t.name || '';
+    case 'size': return t.total_bytes || 0;
+    case 'progress': return t.progress || 0;
+    case 'status': return cleanState(t.state);
+    case 'seeds': return t.peers_sending || 0;
+    case 'peers': return t.peers_connected || 0;
+    case 'down_speed': return t.download_rate || 0;
+    case 'up_speed': return t.upload_rate || 0;
+    case 'eta':
+      return (t.eta_seconds !== undefined && t.eta_seconds !== null && t.eta_seconds >= 0 && t.eta_seconds < 8640000)
+        ? t.eta_seconds
+        : Number.MAX_SAFE_INTEGER;
+    case 'ratio':
+      if (t.ratio !== undefined && t.ratio !== null) return t.ratio;
+      return (t.uploaded_bytes && t.downloaded_bytes && t.downloaded_bytes > 0)
+        ? (t.uploaded_bytes / t.downloaded_bytes)
+        : 0;
+    default: return t[field] ?? '';
+  }
+}
+
 function renderTorrentTable() {
   const tbody = document.getElementById('torrent-tbody');
   const search = document.getElementById('search-input').value.toLowerCase().trim();
 
-  let filtered = torrents.filter(t => {
-    if (activeFilter !== 'all') {
-      const st = (t.state || '').toLowerCase();
-      if (activeFilter === 'downloading' && !st.includes('downloading')) return false;
-      if (activeFilter === 'seeding' && !st.includes('seeding')) return false;
-      if (activeFilter === 'paused' && !(st.includes('paused') || st.includes('stopped'))) return false;
-      if (activeFilter === 'queued' && !st.includes('queued')) return false;
-      if (activeFilter === 'checking' && !st.includes('checking')) return false;
-      if (activeFilter === 'error' && !st.includes('error')) return false;
-    }
-    if (search && !t.name.toLowerCase().includes(search) && !t.info_hash.toLowerCase().includes(search)) {
-      return false;
-    }
-    return true;
-  });
+  let filtered = torrents
+    .map((t, origIdx) => ({ t, origIdx }))
+    .filter(({ t }) => {
+      if (activeFilter !== 'all') {
+        const st = (t.state || '').toLowerCase();
+        if (activeFilter === 'downloading' && !st.includes('downloading')) return false;
+        if (activeFilter === 'seeding' && !st.includes('seeding')) return false;
+        if (activeFilter === 'paused' && !(st.includes('paused') || st.includes('stopped'))) return false;
+        if (activeFilter === 'queued' && !st.includes('queued')) return false;
+        if (activeFilter === 'checking' && !st.includes('checking')) return false;
+        if (activeFilter === 'error' && !st.includes('error')) return false;
+      }
+      if (search && !t.name.toLowerCase().includes(search) && !t.info_hash.toLowerCase().includes(search)) {
+        return false;
+      }
+      return true;
+    });
 
   filtered.sort((a, b) => {
-    let vA = a[sortField];
-    let vB = b[sortField];
-    if (sortField === 'progress') { vA = a.progress; vB = b.progress; }
-    if (typeof vA === 'string') return sortAsc ? vA.localeCompare(vB) : vB.localeCompare(vA);
-    return sortAsc ? (vA - vB) : (vB - vA);
+    const vA = getSortValue(a.t, sortField, a.origIdx);
+    const vB = getSortValue(b.t, sortField, b.origIdx);
+    if (typeof vA === 'string' && typeof vB === 'string') {
+      return sortAsc ? vA.localeCompare(vB) : vB.localeCompare(vA);
+    }
+    return sortAsc ? (Number(vA) - Number(vB)) : (Number(vB) - Number(vA));
   });
 
   if (filtered.length === 0) {
@@ -1251,7 +1641,7 @@ function renderTorrentTable() {
   }
 
   tbody.innerHTML = '';
-  filtered.forEach((t, idx) => {
+  filtered.forEach(({ t }, idx) => {
     const tr = document.createElement('tr');
     tr.dataset.hash = t.info_hash;
     if (selectedHashes.has(t.info_hash)) tr.classList.add('selected');
@@ -1274,7 +1664,7 @@ function renderTorrentTable() {
         </div>
       </td>
       <td><span class="badge ${badgeClass}">${escapeHtml(stClean)}</span></td>
-      <td>${t.peers_connected || 0}</td>
+      <td>${t.peers_sending || 0}</td>
       <td>${t.peers_connected || 0}</td>
       <td style="color: var(--dl-color);">${formatSpeed(t.download_rate)}</td>
       <td style="color: var(--ul-color);">${formatSpeed(t.upload_rate)}</td>
@@ -1546,17 +1936,23 @@ function renderPieceMap(pieceCount, bitfieldHex) {
 
 // Actions
 async function resumeSelected() {
-  for (const h of selectedHashes) {
-    await api(`/api/v1/torrents/${h}/resume`, { method: 'POST' });
-  }
+  if (selectedHashes.size === 0) return;
+  await api('/api/v1/torrents/batch/resume', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ hashes: [...selectedHashes] })
+  });
   showToast('Resumed selected torrent(s)', 'success');
   fetchUpdate();
 }
 
 async function pauseSelected() {
-  for (const h of selectedHashes) {
-    await api(`/api/v1/torrents/${h}/pause`, { method: 'POST' });
-  }
+  if (selectedHashes.size === 0) return;
+  await api('/api/v1/torrents/batch/pause', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ hashes: [...selectedHashes] })
+  });
   showToast('Paused selected torrent(s)', 'info');
   fetchUpdate();
 }
@@ -1570,10 +1966,13 @@ function openDeleteModal() {
 }
 
 async function submitDelete() {
+  if (selectedHashes.size === 0) return;
   const deleteData = document.getElementById('check-delete-data').checked;
-  for (const h of selectedHashes) {
-    await api(`/api/v1/torrents/${h}?delete_data=${deleteData}`, { method: 'DELETE' });
-  }
+  await api('/api/v1/torrents/batch/remove', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ hashes: [...selectedHashes], delete_data: deleteData })
+  });
   document.getElementById('modal-delete-torrent').close();
   selectedHashes.clear();
   showToast('Torrent(s) deleted successfully', 'success');
@@ -1581,9 +1980,12 @@ async function submitDelete() {
 }
 
 async function forceRecheck() {
-  if (selectedHashes.size !== 1) return;
-  const h = [...selectedHashes][0];
-  await api(`/api/v1/torrents/${h}/recheck`, { method: 'POST' });
+  if (selectedHashes.size === 0) return;
+  await api('/api/v1/torrents/batch/recheck', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ hashes: [...selectedHashes] })
+  });
   showToast('Piece verification recheck dispatched', 'info');
   fetchUpdate();
 }
@@ -1707,6 +2109,44 @@ async function submitAddTorrent() {
   fetchUpdate();
 }
 
+function normalizeEncryptionMode(raw) {
+  const mode = (raw || '').trim().toLowerCase();
+  if (mode === 'require_encrypted' || mode === 'forced' || mode === 'forced_encrypted' || mode === 'required' || mode === 'strict') {
+    return 'require_encrypted';
+  }
+  if (mode === 'disable_encryption' || mode === 'disabled' || mode === 'plaintext' || mode === 'plaintext_only' || mode === 'none') {
+    return 'disable_encryption';
+  }
+  return 'prefer_encrypted';
+}
+
+function minutesToTimeInput(mins) {
+  const m = Math.max(0, Math.min(1439, Math.round(Number(mins) || 0)));
+  const hh = String(Math.floor(m / 60)).padStart(2, '0');
+  const mm = String(m % 60).padStart(2, '0');
+  return `${hh}:${mm}`;
+}
+
+function timeInputToMinutes(val) {
+  const [hh, mm] = (val || '').split(':').map((n) => parseInt(n, 10));
+  if (!Number.isFinite(hh) || !Number.isFinite(mm)) return 0;
+  return Math.max(0, Math.min(1439, hh * 60 + mm));
+}
+
+function setScheduleDays(mask) {
+  document.querySelectorAll('#cfg-alt-time-days .day-btn').forEach((btn) => {
+    btn.classList.toggle('active', (mask & parseInt(btn.dataset.mask, 10)) !== 0);
+  });
+}
+
+function getScheduleDays() {
+  let mask = 0;
+  document.querySelectorAll('#cfg-alt-time-days .day-btn.active').forEach((btn) => {
+    mask |= parseInt(btn.dataset.mask, 10);
+  });
+  return mask;
+}
+
 // Settings modal
 async function openSettings() {
   try {
@@ -1721,6 +2161,12 @@ async function openSettings() {
     document.getElementById('cfg-alt-enabled').checked = sessionSettings.alt_speed_enabled;
     document.getElementById('cfg-alt-down-val').value = Math.round(sessionSettings.alt_speed_down_bytes / 1024);
     document.getElementById('cfg-alt-up-val').value = Math.round(sessionSettings.alt_speed_up_bytes / 1024);
+    document.getElementById('cfg-alt-active-badge').style.display = sessionSettings.is_alt_speed_active ? '' : 'none';
+
+    document.getElementById('cfg-alt-time-enabled').checked = sessionSettings.alt_speed_time_enabled;
+    document.getElementById('cfg-alt-time-begin').value = minutesToTimeInput(sessionSettings.alt_speed_time_begin);
+    document.getElementById('cfg-alt-time-end').value = minutesToTimeInput(sessionSettings.alt_speed_time_end);
+    setScheduleDays(sessionSettings.alt_speed_time_days || 0);
 
     // Queue
     document.getElementById('cfg-dl-queue-enabled').checked = sessionSettings.download_queue_enabled;
@@ -1730,20 +2176,39 @@ async function openSettings() {
     document.getElementById('cfg-max-total-torrents').value = sessionSettings.max_active_torrents;
     document.getElementById('cfg-stall-enabled').checked = sessionSettings.queue_stalled_enabled;
     document.getElementById('cfg-stall-minutes').value = sessionSettings.queue_stalled_minutes;
+    document.getElementById('cfg-ratio-limited').checked = sessionSettings.seed_ratio_limited;
+    document.getElementById('cfg-ratio-limit').value = sessionSettings.seed_ratio_limit;
+    document.getElementById('cfg-idle-limit-enabled').checked = sessionSettings.idle_seeding_limit_enabled;
+    document.getElementById('cfg-idle-limit-minutes').value = sessionSettings.idle_seeding_limit_minutes;
 
     // Peers
     document.getElementById('cfg-max-peers-torrent').value = sessionSettings.max_peers_per_torrent;
     document.getElementById('cfg-max-peers-global').value = sessionSettings.max_global_peers;
     document.getElementById('cfg-dht-enabled').checked = sessionSettings.dht_enabled;
+    document.getElementById('cfg-dht-read-only').checked = sessionSettings.dht_read_only;
     document.getElementById('cfg-pex-enabled').checked = sessionSettings.pex_enabled;
     document.getElementById('cfg-lsd-enabled').checked = sessionSettings.lsd_enabled;
-    document.getElementById('cfg-encryption').value = sessionSettings.encryption || 'preferred';
+    document.getElementById('cfg-zeroconf-enabled').checked = sessionSettings.zeroconf_enabled;
+    document.getElementById('cfg-utp-enabled').checked = sessionSettings.enable_utp;
+    document.getElementById('cfg-encryption').value = normalizeEncryptionMode(sessionSettings.encryption);
+    document.getElementById('cfg-announce-ip').value = sessionSettings.announce_ip || '';
 
     // Storage
     document.getElementById('cfg-download-dir').value = sessionSettings.download_dir;
     document.getElementById('cfg-incomplete-enabled').checked = sessionSettings.incomplete_dir_enabled;
     document.getElementById('cfg-incomplete-dir').value = sessionSettings.incomplete_dir || '';
     document.getElementById('cfg-start-added').checked = sessionSettings.start_added_torrents;
+    document.getElementById('cfg-trash-original').checked = sessionSettings.trash_original_torrent_files;
+
+    // Advanced
+    document.getElementById('cfg-unchoke-slots').value = sessionSettings.unchoke_slots_global;
+    document.getElementById('cfg-seed-choking-algo').value = sessionSettings.seed_choking_algorithm;
+    document.getElementById('cfg-unchoke-slot-bandwidth').value = Math.round(sessionSettings.unchoke_slot_bandwidth / 1024);
+    document.getElementById('cfg-limit-lan-peers').checked = sessionSettings.limit_lan_peers;
+    document.getElementById('cfg-rate-limit-ip-overhead').checked = sessionSettings.rate_limit_ip_overhead;
+    document.getElementById('cfg-max-tracker-announces').value = sessionSettings.max_concurrent_tracker_announces;
+    document.getElementById('cfg-max-dht-announces').value = sessionSettings.max_concurrent_dht_announces;
+    document.getElementById('cfg-max-lsd-announces').value = sessionSettings.max_concurrent_lsd_announces;
 
     // Security
     const tokenInput = document.getElementById('cfg-auth-token');
@@ -1769,6 +2234,8 @@ async function saveSettings() {
       } else {
         localStorage.removeItem('synapse_auth_token');
       }
+      authPaused = false;
+      startPolling();
       fetchUpdate();
     }
   }
@@ -1782,6 +2249,10 @@ async function saveSettings() {
     alt_speed_enabled: document.getElementById('cfg-alt-enabled').checked,
     alt_speed_down_bytes: parseInt(document.getElementById('cfg-alt-down-val').value, 10) * 1024,
     alt_speed_up_bytes: parseInt(document.getElementById('cfg-alt-up-val').value, 10) * 1024,
+    alt_speed_time_enabled: document.getElementById('cfg-alt-time-enabled').checked,
+    alt_speed_time_begin: timeInputToMinutes(document.getElementById('cfg-alt-time-begin').value),
+    alt_speed_time_end: timeInputToMinutes(document.getElementById('cfg-alt-time-end').value),
+    alt_speed_time_days: getScheduleDays(),
 
     download_queue_enabled: document.getElementById('cfg-dl-queue-enabled').checked,
     download_queue_size: parseInt(document.getElementById('cfg-max-downloads').value, 10),
@@ -1790,18 +2261,36 @@ async function saveSettings() {
     max_active_torrents: parseInt(document.getElementById('cfg-max-total-torrents').value, 10),
     queue_stalled_enabled: document.getElementById('cfg-stall-enabled').checked,
     queue_stalled_minutes: parseInt(document.getElementById('cfg-stall-minutes').value, 10),
+    seed_ratio_limited: document.getElementById('cfg-ratio-limited').checked,
+    seed_ratio_limit: parseFloat(document.getElementById('cfg-ratio-limit').value),
+    idle_seeding_limit_enabled: document.getElementById('cfg-idle-limit-enabled').checked,
+    idle_seeding_limit_minutes: parseInt(document.getElementById('cfg-idle-limit-minutes').value, 10),
 
     max_peers_per_torrent: parseInt(document.getElementById('cfg-max-peers-torrent').value, 10),
     max_global_peers: parseInt(document.getElementById('cfg-max-peers-global').value, 10),
     dht_enabled: document.getElementById('cfg-dht-enabled').checked,
+    dht_read_only: document.getElementById('cfg-dht-read-only').checked,
     pex_enabled: document.getElementById('cfg-pex-enabled').checked,
     lsd_enabled: document.getElementById('cfg-lsd-enabled').checked,
+    zeroconf_enabled: document.getElementById('cfg-zeroconf-enabled').checked,
+    enable_utp: document.getElementById('cfg-utp-enabled').checked,
     encryption: document.getElementById('cfg-encryption').value,
+    announce_ip: document.getElementById('cfg-announce-ip').value.trim(),
 
     download_dir: document.getElementById('cfg-download-dir').value.trim() || undefined,
     incomplete_dir: document.getElementById('cfg-incomplete-dir').value.trim() || undefined,
     incomplete_dir_enabled: document.getElementById('cfg-incomplete-enabled').checked,
-    start_added_torrents: document.getElementById('cfg-start-added').checked
+    start_added_torrents: document.getElementById('cfg-start-added').checked,
+    trash_original_torrent_files: document.getElementById('cfg-trash-original').checked,
+
+    unchoke_slots_global: parseInt(document.getElementById('cfg-unchoke-slots').value, 10),
+    seed_choking_algorithm: document.getElementById('cfg-seed-choking-algo').value,
+    unchoke_slot_bandwidth: parseInt(document.getElementById('cfg-unchoke-slot-bandwidth').value, 10) * 1024,
+    limit_lan_peers: document.getElementById('cfg-limit-lan-peers').checked,
+    rate_limit_ip_overhead: document.getElementById('cfg-rate-limit-ip-overhead').checked,
+    max_concurrent_tracker_announces: parseInt(document.getElementById('cfg-max-tracker-announces').value, 10),
+    max_concurrent_dht_announces: parseInt(document.getElementById('cfg-max-dht-announces').value, 10),
+    max_concurrent_lsd_announces: parseInt(document.getElementById('cfg-max-lsd-announces').value, 10)
   };
 
   try {
@@ -1847,7 +2336,7 @@ async function updateTurtleButtonState(explicitState) {
 }
 
 function switchSettingsTab(tab) {
-  const tabs = ['bandwidth', 'queue', 'peers', 'storage', 'security'];
+  const tabs = ['bandwidth', 'queue', 'peers', 'storage', 'advanced', 'security'];
   tabs.forEach((t, i) => {
     const btns = document.querySelectorAll('#modal-settings .modal-tabs .tab-btn');
     if (btns[i]) btns[i].classList.toggle('active', t === tab);
@@ -1874,8 +2363,32 @@ window.addEventListener('DOMContentLoaded', () => {
       document.querySelectorAll('.category-item').forEach(c => c.classList.remove('active'));
       el.classList.add('active');
       activeFilter = el.dataset.state;
-      renderTorrentTable();
+      currentPage = 1;
+      restartTorrentStream();
     });
+  });
+
+  // Server-side pagination controls
+  document.getElementById('btn-page-prev').addEventListener('click', () => {
+    if (currentPage > 1) {
+      currentPage -= 1;
+      restartTorrentStream();
+    }
+  });
+  document.getElementById('btn-page-next').addEventListener('click', () => {
+    const totalPages = Math.max(1, Math.ceil(totalTorrents / pageLimit));
+    if (currentPage < totalPages) {
+      currentPage += 1;
+      restartTorrentStream();
+    }
+  });
+  document.getElementById('page-limit').addEventListener('change', (e) => {
+    const parsed = parseInt(e.target.value, 10);
+    if (parsed > 0) {
+      pageLimit = parsed;
+      currentPage = 1;
+      restartTorrentStream();
+    }
   });
 
   // Table header sorting
@@ -1910,6 +2423,9 @@ window.addEventListener('DOMContentLoaded', () => {
   document.getElementById('btn-turtle').addEventListener('click', toggleTurtleMode);
   document.getElementById('btn-settings').addEventListener('click', openSettings);
   document.getElementById('btn-save-settings').addEventListener('click', saveSettings);
+  document.querySelectorAll('#cfg-alt-time-days .day-btn').forEach((btn) => {
+    btn.addEventListener('click', () => btn.classList.toggle('active'));
+  });
   document.getElementById('btn-submit-add').addEventListener('click', submitAddTorrent);
   document.getElementById('btn-recheck-torrent').addEventListener('click', forceRecheck);
   document.getElementById('btn-reannounce-torrent').addEventListener('click', reannounceTorrent);
@@ -1927,6 +2443,8 @@ window.addEventListener('DOMContentLoaded', () => {
       if (tokenInput) tokenInput.value = '';
       showToast('Authentication token cleared', 'info');
       document.getElementById('modal-settings').close();
+      authPaused = false;
+      startPolling();
       fetchUpdate();
     });
   }
@@ -1989,9 +2507,8 @@ window.addEventListener('DOMContentLoaded', () => {
     }
   });
 
-  // Poll loop
-  fetchUpdate();
-  pollTimer = setInterval(fetchUpdate, 1500);
+  // Live SSE delta stream
+  startPolling();
   updateTurtleButtonState();
 });
 "#;
@@ -2013,5 +2530,118 @@ mod tests {
         assert!(APP_JS.contains("<td>${escapeHtml(tr.status || 'Active')}</td>"));
         assert!(APP_JS.contains("setFilePriority('${escapeHtml(hash)}'"));
         assert!(APP_JS.contains(".replace(/'/g, '&#39;')"));
+    }
+
+    #[test]
+    fn web_ui_maps_sort_keys_seeds_encryption_and_401_guards() {
+        for key in [
+            "case 'num':",
+            "case 'name':",
+            "case 'size': return t.total_bytes || 0;",
+            "case 'progress':",
+            "case 'status': return cleanState(t.state);",
+            "case 'seeds': return t.peers_sending || 0;",
+            "case 'peers': return t.peers_connected || 0;",
+            "case 'down_speed': return t.download_rate || 0;",
+            "case 'up_speed': return t.upload_rate || 0;",
+            "case 'eta':",
+            "case 'ratio':",
+        ] {
+            assert!(APP_JS.contains(key), "missing sort mapping {key}");
+        }
+
+        // Seeds column must render peers_sending, followed by Peers column rendering peers_connected.
+        assert!(APP_JS.contains(
+            "<td>${t.peers_sending || 0}</td>\n      <td>${t.peers_connected || 0}</td>"
+        ));
+
+        // Canonical encryption options & normalizer.
+        assert!(INDEX_HTML.contains(r#"<option value="prefer_encrypted">"#));
+        assert!(INDEX_HTML.contains(r#"<option value="require_encrypted">"#));
+        assert!(INDEX_HTML.contains(r#"<option value="disable_encryption">"#));
+        assert!(APP_JS.contains("function normalizeEncryptionMode(raw)"));
+        assert!(APP_JS.contains("normalizeEncryptionMode(sessionSettings.encryption)"));
+
+        // 401 prompt storm guards.
+        assert!(APP_JS.contains("let authPromptInFlight = false;"));
+        assert!(APP_JS.contains("let authPaused = false;"));
+        assert!(APP_JS.contains("let fetchInFlight = false;"));
+        assert!(APP_JS.contains("if (retried || authPromptInFlight || authPaused)"));
+
+        // SSE delta stream, server-side pagination, and bulk batch endpoints replace 10k polling.
+        assert!(!APP_JS.contains("limit=10000"));
+        assert!(!APP_JS.contains("setInterval(fetchUpdate, 1500)"));
+        assert!(APP_JS.contains("/api/v1/torrents/stream"));
+        assert!(APP_JS.contains("/api/v1/torrents/batch/"));
+        assert!(INDEX_HTML.contains("btn-page-prev"));
+        assert!(INDEX_HTML.contains("btn-page-next"));
+        assert!(INDEX_HTML.contains("page-limit"));
+    }
+
+    #[test]
+    fn settings_dialog_covers_the_full_session_settings_surface() {
+        // Fields the daemon's own GetSessionSettings/UpdateSessionSettings REST API supports
+        // (crates/synapse-rpc/src/http_api.rs SessionSettingsApiResponse / SessionSettingsUpdate)
+        // but that were missing from this dialog until compared against Conduit's generic
+        // daemon-settings page, which already surfaced them for Synapse nodes.
+        for id in [
+            "cfg-alt-time-enabled",
+            "cfg-alt-time-begin",
+            "cfg-alt-time-end",
+            "cfg-alt-time-days",
+            "cfg-ratio-limited",
+            "cfg-ratio-limit",
+            "cfg-idle-limit-enabled",
+            "cfg-idle-limit-minutes",
+            "cfg-dht-read-only",
+            "cfg-zeroconf-enabled",
+            "cfg-utp-enabled",
+            "cfg-announce-ip",
+            "cfg-trash-original",
+            "cfg-unchoke-slots",
+            "cfg-seed-choking-algo",
+            "cfg-unchoke-slot-bandwidth",
+            "cfg-limit-lan-peers",
+            "cfg-rate-limit-ip-overhead",
+            "cfg-max-tracker-announces",
+            "cfg-max-dht-announces",
+            "cfg-max-lsd-announces",
+        ] {
+            assert!(INDEX_HTML.contains(id), "settings dialog missing field {id}");
+            assert!(APP_JS.contains(id), "settings JS missing field {id}");
+        }
+
+        for field in [
+            "alt_speed_time_enabled",
+            "alt_speed_time_begin",
+            "alt_speed_time_end",
+            "alt_speed_time_days",
+            "seed_ratio_limited",
+            "seed_ratio_limit",
+            "idle_seeding_limit_enabled",
+            "idle_seeding_limit_minutes",
+            "dht_read_only",
+            "zeroconf_enabled",
+            "enable_utp",
+            "announce_ip",
+            "trash_original_torrent_files",
+            "unchoke_slots_global",
+            "seed_choking_algorithm",
+            "unchoke_slot_bandwidth",
+            "limit_lan_peers",
+            "rate_limit_ip_overhead",
+            "max_concurrent_tracker_announces",
+            "max_concurrent_dht_announces",
+            "max_concurrent_lsd_announces",
+        ] {
+            assert!(
+                APP_JS.contains(&format!("sessionSettings.{field}")),
+                "openSettings() doesn't load {field}"
+            );
+            assert!(
+                APP_JS.contains(&format!("{field}:")),
+                "saveSettings() doesn't send {field}"
+            );
+        }
     }
 }

@@ -60,6 +60,14 @@ pub struct File {
     /// their configured download directory, this crate never does I/O itself.
     pub path: PathBuf,
     pub length: u64,
+    /// True if BEP 47 marked this entry with `attr` containing `'p'` or via `.pad`/padding path.
+    pub is_padding: bool,
+}
+
+impl File {
+    pub fn is_padding_entry(&self) -> bool {
+        self.is_padding || is_padding_file(&self.path, None)
+    }
 }
 
 #[derive(Debug)]
@@ -205,6 +213,8 @@ pub const MAX_PATH_COMPONENTS: usize = 128;
 /// (`piece_len()`, block offsets, hash lookups) relies on these invariants holding.
 /// Most `so=` terms of a magnet link that are looked at.
 const MAX_SELECT_TERMS: usize = 1024;
+/// Most total `so=` file indices materialized across all `so=` query parameters.
+const MAX_SELECT_INDICES: usize = 65_536;
 
 fn validate_layout(
     piece_len: i64,
@@ -220,7 +230,11 @@ fn validate_layout(
         return Err(MetaError::TooManyFiles);
     }
     let mut seen = std::collections::HashSet::with_capacity(files.len());
-    if !files.iter().all(|f| seen.insert(&f.path)) {
+    if !files
+        .iter()
+        .filter(|f| !f.is_padding_entry())
+        .all(|f| seen.insert(&f.path))
+    {
         return Err(MetaError::DuplicatePath);
     }
     let mut total_len = 0u64;
@@ -339,6 +353,7 @@ pub fn bencode_to_string_lossy(b: BEncode) -> Option<String> {
 impl File {
     fn from_bencode(data: BEncode) -> Result<File> {
         let mut d = data.into_dict().ok_or(MetaError::InvalidFileDict)?;
+        let attr = d.remove(b"attr".as_ref()).and_then(bencode_to_string_lossy);
         let name_val = d
             .remove(b"name.utf-8".as_ref())
             .or_else(|| d.remove(b"name".as_ref()));
@@ -351,16 +366,18 @@ impl File {
         match (name_val, path_val, length_val) {
             (Some(v), None, Some(l)) => {
                 let path_str = bencode_to_string_lossy(v).ok_or(MetaError::InvalidFilePath)?;
-                let path = PathBuf::from(path_str);
-                if !path_is_safe(&path) {
+                if !validate_single_name(&path_str) {
                     return Err(MetaError::UnsafeFilePath);
                 }
+                let path = PathBuf::from(path_str);
+                let is_padding = is_padding_file(&path, attr.as_deref());
                 Ok(File {
                     path,
                     length: l
                         .into_int()
                         .and_then(|n| u64::try_from(n).ok())
                         .ok_or(MetaError::InvalidFileLength)?,
+                    is_padding,
                 })
             }
             (None, Some(path), Some(l)) => {
@@ -371,17 +388,22 @@ impl File {
                 }
                 for dir in segments {
                     let seg = bencode_to_string_lossy(dir).ok_or(MetaError::InvalidFilePath)?;
+                    if !component_is_safe(std::ffi::OsStr::new(&seg)) {
+                        return Err(MetaError::UnsafeFilePath);
+                    }
                     p.push(seg);
                 }
                 if !path_is_safe(&p) {
                     return Err(MetaError::UnsafeFilePath);
                 }
+                let is_padding = is_padding_file(&p, attr.as_deref());
                 Ok(File {
                     path: p,
                     length: l
                         .into_int()
                         .and_then(|n| u64::try_from(n).ok())
                         .ok_or(MetaError::InvalidFileLength)?,
+                    is_padding,
                 })
             }
             _ => Err(MetaError::InvalidFileDict),
@@ -392,20 +414,20 @@ impl File {
 fn parse_bencode_files(mut data: BTreeMap<Vec<u8>, BEncode>) -> Result<Vec<File>> {
     match data.remove(b"files".as_ref()).and_then(|l| l.into_list()) {
         Some(fs) => {
-            let mut path = PathBuf::new();
             let name_str = data
                 .remove(b"name.utf-8".as_ref())
                 .or_else(|| data.remove(b"name".as_ref()))
                 .and_then(bencode_to_string_lossy)
                 .ok_or(MetaError::InvalidFileDict)?;
-            path.push(name_str);
-            if !path_is_safe(&path) {
+            if !validate_single_name(&name_str) {
                 return Err(MetaError::UnsafeFilePath);
             }
+            let path = PathBuf::from(&name_str);
             let mut files = Vec::with_capacity(fs.len());
             for f in fs {
                 let mut file = File::from_bencode(f)?;
                 file.path = path.join(file.path);
+                file.is_padding = file.is_padding || is_padding_file(&file.path, None);
                 files.push(file);
             }
             Ok(files)
@@ -436,6 +458,7 @@ fn align_v2_files(
             out_files.push(File {
                 path: PathBuf::from(name).join(".pad").join(format!("{i}_{pad}")),
                 length: pad,
+                is_padding: true,
             });
             out_roots.push(None);
         }
@@ -464,7 +487,7 @@ fn hybrid_layout(
     let mut file_roots = Vec::with_capacity(files.len());
     let mut matched = 0usize;
     for f in &files {
-        if is_padding_file(&f.path, None) {
+        if f.is_padding_entry() {
             file_roots.push(None);
             continue;
         }
@@ -577,7 +600,7 @@ impl Info {
         let mut real = 0usize;
         let mut file_len = 0u64;
         for loc in &locs {
-            if !is_padding_file(&self.files[loc.file].path, None) {
+            if !self.files[loc.file].is_padding_entry() {
                 real = real.max(loc.piece_range.end);
                 file_len = self.files[loc.file].length;
             }
@@ -720,42 +743,361 @@ impl Info {
         }
         files
     }
+}
 
+struct ParsedInfoCore {
+    hash: [u8; 20],
+    files: Vec<File>,
+    file_roots: Vec<Option<[u8; 32]>>,
+    name: String,
+    piece_len: u32,
+    total_len: u64,
+    pieces: u32,
+    hashes: Vec<[u8; 20]>,
+    private: bool,
+    meta_version: u8,
+    info_hash_v2: Option<[u8; 32]>,
+    has_v1_hashes: bool,
+    root_hash_v1: Option<[u8; 20]>,
+    update_url: Option<String>,
+    originator: Option<Vec<u8>>,
+}
+
+fn parse_info_core(
+    mut i: BTreeMap<Vec<u8>, BEncode>,
+    info_bytes: &[u8],
+    allow_evicted: bool,
+) -> Result<ParsedInfoCore> {
+    let sha1_hash: [u8; 20] = Sha1::digest(info_bytes).into();
+
+    let file_tree_opt = i
+        .remove(b"file tree".as_ref())
+        .and_then(|ft| ft.into_dict());
+    let meta_version_opt = i
+        .remove(b"meta version".as_ref())
+        .and_then(BEncode::into_int);
+
+    let piece_len = i
+        .remove(b"piece length".as_ref())
+        .and_then(|i| i.into_int())
+        .ok_or(MetaError::InvalidPieceLength)?;
+
+    let root_hash_v1: Option<[u8; 20]> = i
+        .remove(b"root hash".as_ref())
+        .and_then(|h| h.into_bytes())
+        .and_then(|b| {
+            if b.len() == 20 {
+                let mut arr = [0u8; 20];
+                arr.copy_from_slice(&b);
+                Some(arr)
+            } else {
+                None
+            }
+        });
+
+    let update_url = i
+        .remove(b"update-url".as_ref())
+        .and_then(BEncode::into_string)
+        .filter(|u| u.len() <= 2048 && (u.starts_with("http://") || u.starts_with("https://")));
+    let originator = i
+        .remove(b"originator".as_ref())
+        .and_then(BEncode::into_bytes)
+        .filter(|c| !c.is_empty() && c.len() <= 16 * 1024);
+
+    let hashes_opt: Option<Vec<[u8; 20]>> = i
+        .remove(b"pieces".as_ref())
+        .and_then(|p| p.into_bytes())
+        .and_then(|p| {
+            if p.len() % 20 != 0 {
+                return None;
+            }
+            Some(p.as_chunks::<20>().0.to_vec())
+        });
+
+    let private = match i.remove(b"private".as_ref()) {
+        Some(BEncode::Int(0)) => false,
+        Some(BEncode::Int(n)) if n > 0 => true,
+        Some(BEncode::String(ref s)) if s == b"0" => false,
+        Some(BEncode::String(ref s)) if s == b"1" => true,
+        Some(v) => match v.into_int() {
+            Some(0) => false,
+            Some(1) => true,
+            _ => return Err(MetaError::InvalidPrivateFlag),
+        },
+        None => false,
+    };
+
+    let has_v1_hashes = hashes_opt.as_ref().is_some_and(|h| !h.is_empty());
+
+    let (files, file_roots, name, piece_len, total_len, pieces, hashes, info_hash_v2, meta_version) =
+        if let Some(file_tree) = file_tree_opt {
+            if meta_version_opt != Some(2) {
+                return Err(MetaError::InvalidInfo);
+            }
+            let plen32 = u32::try_from(piece_len)
+                .ok()
+                .filter(|&p| p >= 16_384 && u64::from(p) <= MAX_PIECE_LEN && p.is_power_of_two())
+                .ok_or(MetaError::InvalidPieceLength)?;
+
+            let mut v2_files = Vec::new();
+            let name_str = i
+                .remove(b"name.utf-8".as_ref())
+                .or_else(|| i.remove(b"name".as_ref()))
+                .and_then(BEncode::into_string)
+                .ok_or(MetaError::InvalidName)?;
+            if name_str.is_empty() {
+                return Err(MetaError::InvalidName);
+            }
+            if !validate_single_name(&name_str) {
+                return Err(MetaError::UnsafeFilePath);
+            }
+
+            // BEP 52 single-file torrents place the sole file entry directly under
+            // `file tree[<name>]` with an empty-string leaf dict, so prepending `name_str`
+            // would produce `foo/foo` instead of `foo`.
+            let is_single_file_v2 = !i.contains_key(b"files".as_ref())
+                && file_tree.len() == 1
+                && file_tree
+                    .get(name_str.as_bytes())
+                    .and_then(|v| match v {
+                        BEncode::Dict(d) => Some(d),
+                        _ => None,
+                    })
+                    .is_some_and(|d| d.contains_key(b"".as_ref()));
+            let root_dir = if is_single_file_v2 {
+                PathBuf::new()
+            } else {
+                PathBuf::from(&name_str)
+            };
+
+            v2::parse_file_tree(&file_tree, root_dir, &mut v2_files)?;
+            if v2_files.is_empty() {
+                return Err(MetaError::NoFiles);
+            }
+            for f in &v2_files {
+                if !path_is_safe(&f.path) {
+                    return Err(MetaError::UnsafeFilePath);
+                }
+            }
+            let mut files: Vec<File> = v2_files
+                .iter()
+                .map(|f| File {
+                    path: f.path.clone(),
+                    length: f.length,
+                    is_padding: false,
+                })
+                .collect();
+            let mut file_roots: Vec<Option<[u8; 32]>> =
+                v2_files.iter().map(|f| f.pieces_root).collect();
+            let v2_hash: [u8; 32] = sha2::Sha256::digest(info_bytes).into();
+
+            // A hybrid torrent's v1 `files` list carries the padding that makes v1 pieces line up
+            // with the piece-aligned v2 files (BEP 47); the file tree does not. For single-file
+            // hybrids, verify v1 `length` matches the v2 file length.
+            if has_v1_hashes {
+                if i.contains_key(b"files".as_ref()) {
+                    let (f, r) = hybrid_layout(&i, &name_str, &v2_files)?;
+                    files = f;
+                    file_roots = r;
+                } else if let Some(len_val) = i
+                    .remove(b"length".as_ref())
+                    .or_else(|| i.remove(b"length.utf-8".as_ref()))
+                {
+                    let v1_len = len_val
+                        .into_int()
+                        .and_then(|n| u64::try_from(n).ok())
+                        .ok_or(MetaError::InvalidFileLength)?;
+                    if v2_files.len() != 1 || v2_files[0].length != v1_len {
+                        return Err(MetaError::InvalidFileLength);
+                    }
+                }
+            }
+
+            let (piece_len, total_len, pieces, hashes) = if let Some(h) = hashes_opt {
+                let (plen, tlen) = validate_layout(piece_len, h.len(), &files, allow_evicted)?;
+                let count = h.len() as u32;
+                (plen, tlen, count, h)
+            } else {
+                // BEP 52 aligns every file to a piece boundary, so a pure-v2 torrent's piece
+                // numbering is per file. Padding entries are synthesized between files so the
+                // concatenated layout used everywhere else gives the same numbering.
+                align_v2_files(&mut files, &mut file_roots, plen32, &name_str);
+                let plen = u64::from(plen32);
+                let mut tlen = 0u64;
+                for f in &files {
+                    tlen = tlen
+                        .checked_add(f.length)
+                        .ok_or(MetaError::InvalidFileLength)?;
+                }
+                let count_u64 = tlen.div_ceil(plen);
+                if count_u64 > MAX_PIECES {
+                    return Err(MetaError::TooManyPieces);
+                }
+                let (plen, tlen) = validate_layout(piece_len, count_u64 as usize, &files, false)?;
+                let count = count_u64 as u32;
+                (plen, tlen, count, Vec::new())
+            };
+            (
+                files,
+                file_roots,
+                name_str,
+                piece_len,
+                total_len,
+                pieces,
+                hashes,
+                Some(v2_hash),
+                2,
+            )
+        } else if hashes_opt.is_none() && root_hash_v1.is_some() {
+            let files = parse_bencode_files(i)?;
+            if files.is_empty() {
+                return Err(MetaError::NoFiles);
+            }
+            let name = first_path_component_name(&files[0].path)?;
+            // Same bounds as any v1 layout: the piece count is derived (a Merkle torrent has no
+            // `pieces` string), then checked like one, including overflow and duplicate paths.
+            let mut total = 0u64;
+            for f in &files {
+                total = total
+                    .checked_add(f.length)
+                    .ok_or(MetaError::InvalidFileLength)?;
+            }
+            let plen = u64::try_from(piece_len)
+                .ok()
+                .filter(|&p| p > 0 && p <= MAX_PIECE_LEN)
+                .ok_or(MetaError::InvalidPieceLength)?;
+            let count =
+                usize::try_from(total.div_ceil(plen)).map_err(|_| MetaError::TooManyPieces)?;
+            let (piece_len_u32, total_len) = validate_layout(piece_len, count, &files, false)?;
+            let pieces = count as u32;
+            let file_roots = vec![None; files.len()];
+            (
+                files,
+                file_roots,
+                name,
+                piece_len_u32,
+                total_len,
+                pieces,
+                Vec::new(),
+                None,
+                1,
+            )
+        } else {
+            let hashes = hashes_opt.ok_or(MetaError::InvalidHashes)?;
+            let files = parse_bencode_files(i)?;
+            if files.is_empty() {
+                return Err(MetaError::NoFiles);
+            }
+            let name = first_path_component_name(&files[0].path)?;
+            let (piece_len, total_len) =
+                validate_layout(piece_len, hashes.len(), &files, allow_evicted)?;
+            let pieces = hashes.len() as u32;
+            let file_roots = vec![None; files.len()];
+            (
+                files, file_roots, name, piece_len, total_len, pieces, hashes, None, 1,
+            )
+        };
+
+    // A pure v2 torrent is identified by the SHA-256 of its info dict truncated to 20 bytes
+    // (BEP 52), in handshakes, tracker announces and the DHT. Only v1 and hybrid torrents
+    // are keyed by the SHA-1.
+    let hash = match (meta_version, !has_v1_hashes, info_hash_v2) {
+        (2, true, Some(v2)) => {
+            let mut truncated = [0u8; 20];
+            truncated.copy_from_slice(&v2[..20]);
+            truncated
+        }
+        _ => sha1_hash,
+    };
+
+    Ok(ParsedInfoCore {
+        hash,
+        files,
+        file_roots,
+        name,
+        piece_len,
+        total_len,
+        pieces,
+        hashes,
+        private,
+        meta_version,
+        info_hash_v2,
+        has_v1_hashes,
+        root_hash_v1,
+        update_url,
+        originator,
+    })
+}
+
+fn first_path_component_name(path: &Path) -> Result<String> {
+    if !path.has_root() {
+        path.components()
+            .next()
+            .expect("non-empty path has at least one component")
+            .as_os_str()
+            .to_os_string()
+            .into_string()
+            .map_err(|_| MetaError::InvalidName)
+    } else {
+        unreachable!("path_is_safe should have rejected any rooted path already")
+    }
+}
+
+impl Info {
     /// Decodes and parses the raw bytes of an untrusted `.torrent` file, rejecting anything
     /// over [`MAX_TORRENT_FILE_BYTES`] before it is decoded.
     pub fn from_torrent_bytes(bytes: &[u8]) -> Result<Info> {
         if bytes.len() > MAX_TORRENT_FILE_BYTES {
             return Err(MetaError::TooLarge);
         }
+        let raw_info_slice = synapse_bencode::extract_raw_dict_value(bytes, b"info")
+            .map_err(|_| MetaError::InvalidInfo)?;
         let bencode = synapse_bencode::decode_buf(bytes).map_err(|_| MetaError::InvalidInfo)?;
-        Self::from_bencode(bencode)
+        Self::parse_bencode_with_raw(bencode, false, raw_info_slice)
     }
 
     /// Parses an untrusted metainfo: the piece hash count must match the declared length.
     pub fn from_bencode(data: BEncode) -> Result<Info> {
-        Self::parse_bencode(data, false)
+        Self::parse_bencode_with_raw(data, false, None)
     }
 
     /// Parses a metainfo this daemon persisted to its own session store. Identical to
     /// [`Info::from_bencode`] except that a record saved after piece-hash eviction (empty
     /// `pieces`) is accepted; the caller restores the hashes from elsewhere.
-    pub fn from_persisted_bencode(data: BEncode) -> Result<Info> {
-        Self::parse_bencode(data, true)
+    ///
+    /// Takes the raw persisted bytes (not a decoded [`BEncode`]) so the `info` dict's exact
+    /// wire bytes can be recovered the same way [`Info::from_torrent_bytes`] does: otherwise
+    /// a torrent added with a non-canonically-ordered `info` dict would hash differently here
+    /// than it did at add time, since [`Info::to_torrent_bytes`] preserves those bytes
+    /// verbatim but decoding-then-re-encoding a [`BEncode::Dict`] always sorts keys.
+    pub fn from_persisted_bencode(bytes: &[u8]) -> Result<Info> {
+        let raw_info_slice = synapse_bencode::extract_raw_dict_value(bytes, b"info")
+            .map_err(|_| MetaError::InvalidInfo)?;
+        let data = synapse_bencode::decode_buf(bytes).map_err(|_| MetaError::InvalidInfo)?;
+        Self::parse_bencode_with_raw(data, true, raw_info_slice)
     }
 
-    fn parse_bencode(data: BEncode, allow_evicted: bool) -> Result<Info> {
+    fn parse_bencode_with_raw(
+        data: BEncode,
+        allow_evicted: bool,
+        raw_info_slice: Option<&[u8]>,
+    ) -> Result<Info> {
         let mut d = data.into_dict().ok_or(MetaError::InvalidInfo)?;
         let signatures = parse_signatures(&d);
-        let mut i = d
+        let i = d
             .remove(b"info".as_ref())
             .and_then(|i| i.into_dict())
             .ok_or(MetaError::InvalidInfo)?;
 
-        let mut info_bytes = Vec::new();
-        BEncode::Dict(i.clone())
-            .encode(&mut info_bytes)
-            .expect("encoding an in-memory BEncode value cannot fail");
-        let hash: [u8; 20] = Sha1::digest(&info_bytes).into();
+        let info_bytes = if let Some(raw) = raw_info_slice {
+            raw.to_vec()
+        } else {
+            let mut buf = Vec::new();
+            BEncode::Dict(i.clone())
+                .encode(&mut buf)
+                .expect("encoding an in-memory BEncode value cannot fail");
+            buf
+        };
 
         let mut piece_layers: BTreeMap<[u8; 32], Vec<u8>> = BTreeMap::new();
         if let Some(layers_dict) = d
@@ -786,238 +1128,44 @@ impl Info {
             .or_else(|| d.remove(b"created by".as_ref()))
             .and_then(bencode_to_string_lossy);
 
-        let file_tree_opt = i
-            .remove(b"file tree".as_ref())
-            .and_then(|ft| ft.into_dict());
+        let core = parse_info_core(i, &info_bytes, allow_evicted)?;
 
-        let piece_len = i
-            .remove(b"piece length".as_ref())
-            .and_then(|i| i.into_int())
-            .ok_or(MetaError::InvalidPieceLength)?;
-
-        let root_hash_v1: Option<[u8; 20]> = i
-            .remove(b"root hash".as_ref())
-            .and_then(|h| h.into_bytes())
-            .and_then(|b| {
-                if b.len() == 20 {
-                    let mut arr = [0u8; 20];
-                    arr.copy_from_slice(&b);
-                    Some(arr)
-                } else {
-                    None
-                }
-            });
-
-        let update_url = i
-            .remove(b"update-url".as_ref())
-            .and_then(BEncode::into_string)
-            .filter(|u| u.len() <= 2048 && (u.starts_with("http://") || u.starts_with("https://")));
-        let originator = i
-            .remove(b"originator".as_ref())
-            .and_then(BEncode::into_bytes)
-            .filter(|c| !c.is_empty() && c.len() <= 16 * 1024);
-
-        let hashes_opt: Option<Vec<[u8; 20]>> = i
-            .remove(b"pieces".as_ref())
-            .and_then(|p| p.into_bytes())
-            .and_then(|p| {
-                if p.len() % 20 != 0 {
-                    return None;
-                }
-                Some(p.as_chunks::<20>().0.to_vec())
-            });
-
-        let private = match i.remove(b"private".as_ref()) {
-            Some(BEncode::Int(0)) => false,
-            Some(BEncode::Int(n)) if n > 0 => true,
-            Some(BEncode::String(ref s)) if s == b"0" => false,
-            Some(BEncode::String(ref s)) if s == b"1" => true,
-            Some(v) => match v.into_int() {
-                Some(0) => false,
-                Some(1) => true,
-                _ => return Err(MetaError::InvalidPrivateFlag),
-            },
-            None => false,
-        };
-
-        let (
-            files,
-            file_roots,
-            name,
-            piece_len,
-            total_len,
-            pieces,
-            hashes,
-            info_hash_v2,
-            meta_version,
-        ) = if let Some(file_tree) = file_tree_opt {
-            let mut v2_files = Vec::new();
-            let name_str = i
-                .remove(b"name.utf-8".as_ref())
-                .or_else(|| i.remove(b"name".as_ref()))
-                .and_then(BEncode::into_string)
-                .ok_or(MetaError::InvalidName)?;
-            if name_str.is_empty() {
-                return Err(MetaError::InvalidName);
+        // Verify every BEP 52 piece layer cryptographically against its file's `pieces root`
+        // and declared file length so forged piece layers cannot poison `.torrent` verification.
+        if !piece_layers.is_empty() {
+            if core.meta_version != 2 {
+                return Err(MetaError::InvalidHashes);
             }
-            if !validate_single_name(&name_str) {
-                return Err(MetaError::UnsafeFilePath);
-            }
-            let root_dir = PathBuf::from(&name_str);
-            v2::parse_file_tree(&file_tree, root_dir, &mut v2_files)?;
-            if v2_files.is_empty() {
-                return Err(MetaError::NoFiles);
-            }
-            for f in &v2_files {
-                if !path_is_safe(&f.path) {
-                    return Err(MetaError::UnsafeFilePath);
+            let piece_len_usize =
+                usize::try_from(core.piece_len).map_err(|_| MetaError::InvalidPieceLength)?;
+            let mut root_lengths: std::collections::HashMap<[u8; 32], u64> =
+                std::collections::HashMap::new();
+            for (f, root_opt) in core.files.iter().zip(core.file_roots.iter()) {
+                if let Some(root) = root_opt {
+                    if let Some(&prev) = root_lengths.get(root) {
+                        if prev != f.length {
+                            return Err(MetaError::InvalidHashes);
+                        }
+                    } else {
+                        root_lengths.insert(*root, f.length);
+                    }
                 }
             }
-            let mut files: Vec<File> = v2_files
-                .iter()
-                .map(|f| File {
-                    path: f.path.clone(),
-                    length: f.length,
-                })
-                .collect();
-            let mut file_roots: Vec<Option<[u8; 32]>> =
-                v2_files.iter().map(|f| f.pieces_root).collect();
-            let v2_hash: [u8; 32] = sha2::Sha256::digest(&info_bytes).into();
+            for (root, layer_bytes) in &piece_layers {
+                let Some(&file_len) = root_lengths.get(root) else {
+                    return Err(MetaError::InvalidHashes);
+                };
+                let expected_pieces = file_len.div_ceil(u64::from(core.piece_len));
+                if layer_bytes.len() as u64 != expected_pieces.saturating_mul(32) {
+                    return Err(MetaError::InvalidHashes);
+                }
+                if merkle::root_from_piece_layer(layer_bytes, piece_len_usize) != Some(*root) {
+                    return Err(MetaError::InvalidHashes);
+                }
+            }
+        }
 
-            // A hybrid torrent's v1 `files` list carries the padding that makes v1 pieces line up
-            // with the piece-aligned v2 files (BEP 47); the file tree does not. The v1 list is the
-            // layout, and the tree supplies each real file's Merkle root.
-            if hashes_opt.is_some() && i.contains_key(b"files".as_ref()) {
-                let (f, r) = hybrid_layout(&i, &name_str, &v2_files)?;
-                files = f;
-                file_roots = r;
-            }
-            let (piece_len, total_len, pieces, hashes) = if let Some(h) = hashes_opt {
-                let (plen, tlen) = validate_layout(piece_len, h.len(), &files, allow_evicted)?;
-                let count = h.len() as u32;
-                (plen, tlen, count, h)
-            } else {
-                // BEP 52 aligns every file to a piece boundary, so a pure-v2 torrent's piece
-                // numbering is per file. Padding entries are synthesized between files so the
-                // concatenated layout used everywhere else gives the same numbering.
-                let plen32 = u32::try_from(piece_len)
-                    .ok()
-                    .filter(|&p| p > 0 && u64::from(p) <= MAX_PIECE_LEN)
-                    .ok_or(MetaError::InvalidPieceLength)?;
-                align_v2_files(&mut files, &mut file_roots, plen32, &name_str);
-                let plen = u64::from(plen32);
-                let mut tlen = 0u64;
-                for f in &files {
-                    tlen = tlen
-                        .checked_add(f.length)
-                        .ok_or(MetaError::InvalidFileLength)?;
-                }
-                let count_u64 = tlen.div_ceil(plen);
-                if count_u64 > MAX_PIECES {
-                    return Err(MetaError::TooManyPieces);
-                }
-                let (plen, tlen) = validate_layout(piece_len, count_u64 as usize, &files, false)?;
-                let count = count_u64 as u32;
-                (plen, tlen, count, Vec::new())
-            };
-            (
-                files,
-                file_roots,
-                name_str,
-                piece_len,
-                total_len,
-                pieces,
-                hashes,
-                Some(v2_hash),
-                2,
-            )
-        } else if let Some(_root_v1) = root_hash_v1 {
-            let files = parse_bencode_files(i)?;
-            if files.is_empty() {
-                return Err(MetaError::NoFiles);
-            }
-            let name = if !files[0].path.has_root() {
-                files[0]
-                    .path
-                    .components()
-                    .next()
-                    .expect("non-empty path has at least one component")
-                    .as_os_str()
-                    .to_os_string()
-                    .into_string()
-                    .map_err(|_| MetaError::InvalidName)?
-            } else {
-                unreachable!("path_is_safe should have rejected any rooted path already")
-            };
-            // Same bounds as any v1 layout: the piece count is derived (a Merkle torrent has no
-            // `pieces` string), then checked like one, including overflow and duplicate paths.
-            let mut total = 0u64;
-            for f in &files {
-                total = total
-                    .checked_add(f.length)
-                    .ok_or(MetaError::InvalidFileLength)?;
-            }
-            let plen = u64::try_from(piece_len)
-                .ok()
-                .filter(|&p| p > 0 && p <= MAX_PIECE_LEN)
-                .ok_or(MetaError::InvalidPieceLength)?;
-            let count =
-                usize::try_from(total.div_ceil(plen)).map_err(|_| MetaError::TooManyPieces)?;
-            let (piece_len_u64, total_len) = validate_layout(piece_len, count, &files, false)?;
-            let piece_len_u64 = u64::from(piece_len_u64);
-            let pieces = count as u32;
-            let file_roots = vec![None; files.len()];
-            (
-                files,
-                file_roots,
-                name,
-                piece_len_u64 as u32,
-                total_len,
-                pieces,
-                Vec::new(),
-                None,
-                1,
-            )
-        } else {
-            let hashes = hashes_opt.ok_or(MetaError::InvalidHashes)?;
-            let files = parse_bencode_files(i)?;
-            if files.is_empty() {
-                return Err(MetaError::NoFiles);
-            }
-            let name = if !files[0].path.has_root() {
-                files[0]
-                    .path
-                    .components()
-                    .next()
-                    .expect("non-empty path has at least one component")
-                    .as_os_str()
-                    .to_os_string()
-                    .into_string()
-                    .map_err(|_| MetaError::InvalidName)?
-            } else {
-                unreachable!("path_is_safe should have rejected any rooted path already")
-            };
-            let (piece_len, total_len) =
-                validate_layout(piece_len, hashes.len(), &files, allow_evicted)?;
-            let pieces = hashes.len() as u32;
-            let file_roots = vec![None; files.len()];
-            (
-                files, file_roots, name, piece_len, total_len, pieces, hashes, None, 1,
-            )
-        };
-        // A pure v2 torrent is identified by the SHA-256 of its info dict truncated to 20 bytes
-        // (BEP 52), in handshakes, tracker announces and the DHT. Only v1 and hybrid torrents
-        // are keyed by the SHA-1.
-        let has_v1_hashes = !hashes.is_empty();
-        let hash = match (meta_version, hashes.is_empty(), info_hash_v2) {
-            (2, true, Some(v2)) => {
-                let mut truncated = [0u8; 20];
-                truncated.copy_from_slice(&v2[..20]);
-                truncated
-            }
-            _ => hash,
-        };
-        let file_offsets = generate_file_offsets(&files);
+        let file_offsets = generate_file_offsets(&core.files);
 
         let url_list: Vec<_> = d
             .remove(b"announce-list".as_ref())
@@ -1070,36 +1218,39 @@ impl Info {
         }
 
         let mut info = Info {
-            name,
+            name: core.name,
             comment,
             creator,
             announce,
-            piece_len,
-            total_len,
-            pieces,
-            hashes: parking_lot::RwLock::new(if hashes.is_empty() {
+            piece_len: core.piece_len,
+            total_len: core.total_len,
+            pieces: core.pieces,
+            hashes: parking_lot::RwLock::new(if core.hashes.is_empty() {
                 None
             } else {
-                Some(Arc::new(hashes))
+                Some(Arc::new(core.hashes))
             }),
-            hash,
-            files,
-            private,
+            hash: core.hash,
+            files: core.files,
+            private: core.private,
             file_offsets,
             url_list,
             web_seeds,
-            meta_version,
-            info_hash_v2,
+            meta_version: core.meta_version,
+            info_hash_v2: core.info_hash_v2,
             piece_layers,
-            file_roots,
-            raw_info: (meta_version == 2 || !signatures.is_empty() || root_hash_v1.is_some())
-                .then(|| Arc::new(info_bytes.clone())),
-            v2_aligned: meta_version == 2 && !has_v1_hashes,
+            file_roots: core.file_roots,
+            raw_info: (core.meta_version == 2
+                || !signatures.is_empty()
+                || core.root_hash_v1.is_some()
+                || raw_info_slice.is_some())
+            .then(|| Arc::new(info_bytes.clone())),
+            v2_aligned: core.meta_version == 2 && !core.has_v1_hashes,
             select_only: None,
             signatures,
-            root_hash_v1,
-            update_url,
-            originator,
+            root_hash_v1: core.root_hash_v1,
+            update_url: core.update_url,
+            originator: core.originator,
         };
         // A record persisted after its piece hashes were evicted cannot be compared.
         if !(allow_evicted && info.pieces > 0 && !info.has_piece_hashes()) {
@@ -1127,218 +1278,48 @@ impl Info {
     pub fn from_info_dict_bytes(info_bytes: &[u8]) -> Result<Info> {
         let bencode =
             synapse_bencode::decode_buf(info_bytes).map_err(|_| MetaError::InvalidInfo)?;
-        let mut i = bencode.into_dict().ok_or(MetaError::InvalidInfo)?;
-        let hash: [u8; 20] = Sha1::digest(info_bytes).into();
-
-        let file_tree_opt = i
-            .remove(b"file tree".as_ref())
-            .and_then(|ft| ft.into_dict());
-
-        let piece_len = i
-            .remove(b"piece length".as_ref())
-            .and_then(|i| i.into_int())
-            .ok_or(MetaError::InvalidPieceLength)?;
-        let update_url = i
-            .remove(b"update-url".as_ref())
-            .and_then(BEncode::into_string)
-            .filter(|u| u.len() <= 2048 && (u.starts_with("http://") || u.starts_with("https://")));
-        let originator = i
-            .remove(b"originator".as_ref())
-            .and_then(BEncode::into_bytes)
-            .filter(|c| !c.is_empty() && c.len() <= 16 * 1024);
-
-        let hashes_opt: Option<Vec<[u8; 20]>> = i
-            .remove(b"pieces".as_ref())
-            .and_then(|p| p.into_bytes())
-            .and_then(|p| {
-                if p.len() % 20 != 0 {
-                    return None;
-                }
-                Some(p.as_chunks::<20>().0.to_vec())
-            });
-
-        let private = match i.remove(b"private".as_ref()) {
-            Some(BEncode::Int(0)) => false,
-            Some(BEncode::Int(n)) if n > 0 => true,
-            Some(BEncode::String(ref s)) if s == b"0" => false,
-            Some(BEncode::String(ref s)) if s == b"1" => true,
-            Some(v) => match v.into_int() {
-                Some(0) => false,
-                Some(1) => true,
-                _ => return Err(MetaError::InvalidPrivateFlag),
-            },
-            None => false,
-        };
-
-        let (
-            files,
-            file_roots,
-            name,
-            piece_len,
-            total_len,
-            pieces,
-            hashes,
-            info_hash_v2,
-            meta_version,
-        ) = if let Some(file_tree) = file_tree_opt {
-            let mut v2_files = Vec::new();
-            let name_str = i
-                .remove(b"name.utf-8".as_ref())
-                .or_else(|| i.remove(b"name".as_ref()))
-                .and_then(BEncode::into_string)
-                .ok_or(MetaError::InvalidName)?;
-            if name_str.is_empty() {
-                return Err(MetaError::InvalidName);
-            }
-            if !validate_single_name(&name_str) {
-                return Err(MetaError::UnsafeFilePath);
-            }
-            let root_dir = PathBuf::from(&name_str);
-            v2::parse_file_tree(&file_tree, root_dir, &mut v2_files)?;
-            if v2_files.is_empty() {
-                return Err(MetaError::NoFiles);
-            }
-            for f in &v2_files {
-                if !path_is_safe(&f.path) {
-                    return Err(MetaError::UnsafeFilePath);
-                }
-            }
-            let mut files: Vec<File> = v2_files
-                .iter()
-                .map(|f| File {
-                    path: f.path.clone(),
-                    length: f.length,
-                })
-                .collect();
-            let mut file_roots: Vec<Option<[u8; 32]>> =
-                v2_files.iter().map(|f| f.pieces_root).collect();
-            let v2_hash: [u8; 32] = sha2::Sha256::digest(info_bytes).into();
-
-            // A hybrid torrent's v1 `files` list carries the padding that makes v1 pieces line up
-            // with the piece-aligned v2 files (BEP 47); the file tree does not. The v1 list is the
-            // layout, and the tree supplies each real file's Merkle root.
-            if hashes_opt.is_some() && i.contains_key(b"files".as_ref()) {
-                let (f, r) = hybrid_layout(&i, &name_str, &v2_files)?;
-                files = f;
-                file_roots = r;
-            }
-            let (piece_len, total_len, pieces, hashes) = if let Some(h) = hashes_opt {
-                let (plen, tlen) = validate_layout(piece_len, h.len(), &files, false)?;
-                let count = h.len() as u32;
-                (plen, tlen, count, h)
-            } else {
-                // BEP 52 aligns every file to a piece boundary, so a pure-v2 torrent's piece
-                // numbering is per file. Padding entries are synthesized between files so the
-                // concatenated layout used everywhere else gives the same numbering.
-                let plen32 = u32::try_from(piece_len)
-                    .ok()
-                    .filter(|&p| p > 0 && u64::from(p) <= MAX_PIECE_LEN)
-                    .ok_or(MetaError::InvalidPieceLength)?;
-                align_v2_files(&mut files, &mut file_roots, plen32, &name_str);
-                let plen = u64::from(plen32);
-                let mut tlen = 0u64;
-                for f in &files {
-                    tlen = tlen
-                        .checked_add(f.length)
-                        .ok_or(MetaError::InvalidFileLength)?;
-                }
-                let count_u64 = tlen.div_ceil(plen);
-                if count_u64 > MAX_PIECES {
-                    return Err(MetaError::TooManyPieces);
-                }
-                let (plen, tlen) = validate_layout(piece_len, count_u64 as usize, &files, false)?;
-                let count = count_u64 as u32;
-                (plen, tlen, count, Vec::new())
-            };
-            (
-                files,
-                file_roots,
-                name_str,
-                piece_len,
-                total_len,
-                pieces,
-                hashes,
-                Some(v2_hash),
-                2,
-            )
-        } else {
-            let hashes = hashes_opt.ok_or(MetaError::InvalidHashes)?;
-            let files = parse_bencode_files(i)?;
-            if files.is_empty() {
-                return Err(MetaError::NoFiles);
-            }
-            let name = if !files[0].path.has_root() {
-                files[0]
-                    .path
-                    .components()
-                    .next()
-                    .expect("non-empty path has at least one component")
-                    .as_os_str()
-                    .to_os_string()
-                    .into_string()
-                    .map_err(|_| MetaError::InvalidName)?
-            } else {
-                unreachable!("path_is_safe should have rejected any rooted path already")
-            };
-            let (piece_len, total_len) = validate_layout(piece_len, hashes.len(), &files, false)?;
-            let pieces = hashes.len() as u32;
-            let file_roots = vec![None; files.len()];
-            (
-                files, file_roots, name, piece_len, total_len, pieces, hashes, None, 1,
-            )
-        };
-
-        // A pure v2 torrent is identified by the SHA-256 of its info dict truncated to 20 bytes
-        // (BEP 52), in handshakes, tracker announces and the DHT. Only v1 and hybrid torrents
-        // are keyed by the SHA-1.
-        let has_v1_hashes = !hashes.is_empty();
-        let hash = match (meta_version, hashes.is_empty(), info_hash_v2) {
-            (2, true, Some(v2)) => {
-                let mut truncated = [0u8; 20];
-                truncated.copy_from_slice(&v2[..20]);
-                truncated
-            }
-            _ => hash,
-        };
-        let file_offsets = generate_file_offsets(&files);
+        let i = bencode.into_dict().ok_or(MetaError::InvalidInfo)?;
+        let core = parse_info_core(i, info_bytes, false)?;
+        let file_offsets = generate_file_offsets(&core.files);
 
         let mut info = Info {
-            name,
+            name: core.name,
             comment: None,
             creator: None,
             announce: None,
-            piece_len,
-            total_len,
-            pieces,
-            hashes: parking_lot::RwLock::new(if hashes.is_empty() {
+            piece_len: core.piece_len,
+            total_len: core.total_len,
+            pieces: core.pieces,
+            hashes: parking_lot::RwLock::new(if core.hashes.is_empty() {
                 None
             } else {
-                Some(Arc::new(hashes))
+                Some(Arc::new(core.hashes))
             }),
-            hash,
-            files,
-            private,
+            hash: core.hash,
+            files: core.files,
+            private: core.private,
             file_offsets,
             url_list: Vec::new(),
             web_seeds: Vec::new(),
-            meta_version,
-            info_hash_v2,
+            meta_version: core.meta_version,
+            info_hash_v2: core.info_hash_v2,
             piece_layers: BTreeMap::new(),
-            file_roots,
-            raw_info: (meta_version == 2).then(|| Arc::new(info_bytes.to_vec())),
-            v2_aligned: meta_version == 2 && !has_v1_hashes,
+            file_roots: core.file_roots,
+            raw_info: (core.meta_version == 2 || core.root_hash_v1.is_some())
+                .then(|| Arc::new(info_bytes.to_vec())),
+            v2_aligned: core.meta_version == 2 && !core.has_v1_hashes,
             select_only: None,
             signatures: Vec::new(),
-            root_hash_v1: None,
-            update_url,
-            originator,
+            root_hash_v1: core.root_hash_v1,
+            update_url: core.update_url,
+            originator: core.originator,
         };
         info.keep_raw_info_if_lossy(info_bytes);
         Ok(info)
     }
 
-    /// Serializes this `Info` struct back into a canonical BEncode dictionary.
-    pub fn to_bencode(&self) -> BEncode {
+    /// Builds every top-level `.torrent` dict entry except `info`.
+    fn to_bencode_dict_sans_info(&self) -> BTreeMap<Vec<u8>, BEncode> {
         let mut d = BTreeMap::new();
         if let Some(ref a) = self.announce {
             d.insert(
@@ -1357,6 +1338,17 @@ impl Info {
             }
             d.insert(b"announce-list".to_vec(), BEncode::List(list));
         }
+        if !self.web_seeds.is_empty() {
+            d.insert(
+                b"url-list".to_vec(),
+                BEncode::List(
+                    self.web_seeds
+                        .iter()
+                        .map(|u| BEncode::String(u.to_string().into_bytes()))
+                        .collect(),
+                ),
+            );
+        }
         if let Some(ref c) = self.comment {
             d.insert(b"comment".to_vec(), BEncode::String(c.clone().into_bytes()));
         }
@@ -1366,14 +1358,6 @@ impl Info {
                 BEncode::String(cr.clone().into_bytes()),
             );
         }
-
-        let info_dict = self
-            .raw_info
-            .as_deref()
-            .and_then(|raw| synapse_bencode::decode_buf(raw).ok())
-            .and_then(BEncode::into_dict)
-            .unwrap_or_else(|| self.build_info_dict());
-        d.insert(b"info".to_vec(), BEncode::Dict(info_dict));
         if let Some(sigs) = signature::encode_signatures(&self.signatures) {
             d.insert(b"signatures".to_vec(), sigs);
         }
@@ -1385,6 +1369,24 @@ impl Info {
                 .collect();
             d.insert(b"piece layers".to_vec(), BEncode::Dict(layers));
         }
+        d
+    }
+
+    /// Serializes this `Info` struct back into a canonical BEncode dictionary.
+    ///
+    /// Note: unlike [`Info::to_torrent_bytes`], this decodes `raw_info` (when present) into a
+    /// [`BEncode::Dict`] and so loses any non-canonical key ordering it had -- re-encoding the
+    /// result does not reproduce the original `info` bytes. Prefer `to_torrent_bytes` wherever
+    /// the exact bytes (and therefore the exact `info_hash`) matter.
+    pub fn to_bencode(&self) -> BEncode {
+        let mut d = self.to_bencode_dict_sans_info();
+        let info_dict = self
+            .raw_info
+            .as_deref()
+            .and_then(|raw| synapse_bencode::decode_buf(raw).ok())
+            .and_then(BEncode::into_dict)
+            .unwrap_or_else(|| self.build_info_dict());
+        d.insert(b"info".to_vec(), BEncode::Dict(info_dict));
         BEncode::Dict(d)
     }
 
@@ -1422,6 +1424,9 @@ impl Info {
             for f in &self.files {
                 let mut fd = BTreeMap::new();
                 fd.insert(b"length".to_vec(), BEncode::Int(f.length as i64));
+                if f.is_padding {
+                    fd.insert(b"attr".to_vec(), BEncode::String(b"p".to_vec()));
+                }
                 let rel_path = f.path.strip_prefix(&self.name).unwrap_or(&f.path);
                 let path_components: Vec<BEncode> = rel_path
                     .iter()
@@ -1459,12 +1464,45 @@ impl Info {
     }
 
     /// Encodes this `Info` struct into raw `.torrent` bencoded bytes.
+    /// Encodes this `Info` struct into raw `.torrent` bencoded bytes.
+    ///
+    /// When `raw_info` is set, splices those bytes into the `info` position verbatim rather
+    /// than going through `to_bencode()`'s decode-then-re-encode (which always sorts dict
+    /// keys): session persistence round-trips through this, and a torrent whose source
+    /// `info` dict used non-canonical key ordering must keep hashing the same way it did at
+    /// add time ([`Info::from_torrent_bytes`]) or [`Info::from_persisted_bencode`] will see a
+    /// hash mismatch on restore.
     pub fn to_torrent_bytes(&self) -> Vec<u8> {
-        let mut buf = Vec::new();
-        self.to_bencode()
-            .encode(&mut buf)
-            .expect("in-memory encoding cannot fail");
-        buf
+        let Some(raw_info) = self.raw_info.as_deref() else {
+            let mut buf = Vec::new();
+            self.to_bencode()
+                .encode(&mut buf)
+                .expect("in-memory encoding cannot fail");
+            return buf;
+        };
+
+        let mut entries: Vec<(Vec<u8>, Vec<u8>)> = self
+            .to_bencode_dict_sans_info()
+            .into_iter()
+            .map(|(k, v)| {
+                let mut buf = Vec::new();
+                v.encode(&mut buf).expect("in-memory encoding cannot fail");
+                (k, buf)
+            })
+            .collect();
+        entries.push((b"info".to_vec(), raw_info.to_vec()));
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let mut out = Vec::new();
+        out.push(b'd');
+        for (k, v) in entries {
+            out.extend_from_slice(k.len().to_string().as_bytes());
+            out.push(b':');
+            out.extend_from_slice(&k);
+            out.extend_from_slice(&v);
+        }
+        out.push(b'e');
+        out
     }
 
     /// Returns true if this is a BEP 52 v2 or hybrid torrent.
@@ -1472,9 +1510,9 @@ impl Info {
         self.meta_version == 2
     }
 
-    /// Returns true if this is a BEP 52 hybrid torrent (has both v1 piece hashes and v2 Merkle roots).
+    /// Returns true if this is a BEP 52 hybrid torrent (has both v1 layout/hashes and v2 Merkle roots).
     pub fn is_hybrid(&self) -> bool {
-        self.meta_version == 2 && self.hashes.read().as_ref().is_some_and(|h| !h.is_empty())
+        self.meta_version == 2 && !self.v2_aligned
     }
 
     /// Checks every BEP 35 signature against `trust`. Empty when the torrent is unsigned. A
@@ -1548,21 +1586,30 @@ impl Info {
             .map(|(_, v)| v.into_owned());
         let name = sanitize_magnet_display_name(raw_dn.as_deref(), &hash);
 
-        // BEP 53. A magnet is untrusted input: bound both the number of terms and the size of
-        // the indices they can name, so `so=0-4294967295` cannot allocate without limit.
+        // BEP 53. A magnet is untrusted input: bound both the total terms and the total
+        // indices expanded across ALL `so=` parameters so repeated `so=0-4294967295` params
+        // cannot trigger unbounded memory allocation.
         let mut select_indices = Vec::new();
-        for (k, v) in url.query_pairs() {
+        let mut terms_seen = 0usize;
+        'so_params: for (k, v) in url.query_pairs() {
             if k != "so" {
                 continue;
             }
-            for part in v.split(',').take(MAX_SELECT_TERMS) {
+            for part in v.split(',') {
+                if terms_seen >= MAX_SELECT_TERMS || select_indices.len() >= MAX_SELECT_INDICES {
+                    break 'so_params;
+                }
+                terms_seen += 1;
                 let part = part.trim();
                 if let Some((start_str, end_str)) = part.split_once('-') {
                     if let (Ok(start), Ok(end)) =
                         (start_str.parse::<usize>(), end_str.parse::<usize>())
                     {
                         if start <= end && start < MAX_FILES {
-                            select_indices.extend(start..=end.min(MAX_FILES - 1));
+                            let cap_end = end.min(MAX_FILES - 1);
+                            let budget = MAX_SELECT_INDICES - select_indices.len();
+                            let count = (cap_end - start + 1).min(budget);
+                            select_indices.extend(start..start + count);
                         }
                     }
                 } else if let Ok(idx) = part.parse::<usize>() {
@@ -1600,7 +1647,7 @@ impl Info {
             piece_layers: BTreeMap::new(),
             file_roots: Vec::new(),
             raw_info: None,
-            v2_aligned: false,
+            v2_aligned: meta_version == 2 && btih_hash.is_none(),
             select_only,
             signatures: Vec::new(),
             root_hash_v1: None,
@@ -1745,6 +1792,7 @@ mod tests {
         let files = vec![File {
             path: PathBuf::from("a"),
             length: 100,
+            is_padding: false,
         }];
         let file_offsets = generate_file_offsets(&files);
         let info = Info {
@@ -1791,10 +1839,12 @@ mod tests {
             File {
                 path: PathBuf::from("a"),
                 length: 40_000,
+                is_padding: false,
             },
             File {
                 path: PathBuf::from("b"),
                 length: 10_000,
+                is_padding: false,
             },
         ];
         let file_offsets = generate_file_offsets(&files);
@@ -2077,12 +2127,17 @@ mod tests {
             Info::from_bencode(single_file(16_384, 32_768, 0)).unwrap_err(),
             MetaError::PieceCountMismatch
         );
-        let evicted = Info::from_persisted_bencode(single_file(16_384, 32_768, 0)).unwrap();
+        let evicted =
+            Info::from_persisted_bencode(&single_file(16_384, 32_768, 0).encode_to_buf())
+                .unwrap();
         assert_eq!(evicted.pieces(), 0);
         assert_eq!(evicted.total_len, 32_768);
         // A wrong non-zero count is still rejected, and size bounds still apply.
-        assert!(Info::from_persisted_bencode(single_file(16_384, 32_768, 1)).is_err());
-        assert!(Info::from_persisted_bencode(single_file(0, 32_768, 0)).is_err());
+        assert!(
+            Info::from_persisted_bencode(&single_file(16_384, 32_768, 1).encode_to_buf())
+                .is_err()
+        );
+        assert!(Info::from_persisted_bencode(&single_file(0, 32_768, 0).encode_to_buf()).is_err());
     }
 
     #[test]
@@ -2200,41 +2255,55 @@ mod tests {
     }
 
     #[test]
-    fn test_piece_hash_v2_lookup() {
-        let root_hash = [0x55u8; 32];
+    fn test_piece_hash_v2_lookup_and_rejects_forged_piece_layers() {
         let p0_hash = [0x11u8; 32];
         let p1_hash = [0x22u8; 32];
-
-        let mut leaf = BTreeMap::new();
-        leaf.insert(b"length".to_vec(), BEncode::Int(32_768));
-        leaf.insert(b"pieces root".to_vec(), BEncode::String(root_hash.to_vec()));
-
-        let mut file_dict = BTreeMap::new();
-        file_dict.insert(b"".to_vec(), BEncode::Dict(leaf));
-
-        let mut file_tree = BTreeMap::new();
-        file_tree.insert(b"test.bin".to_vec(), BEncode::Dict(file_dict));
-
-        let mut info_dict = BTreeMap::new();
-        info_dict.insert(b"meta version".to_vec(), BEncode::Int(2));
-        info_dict.insert(b"name".to_vec(), BEncode::String(b"test_v2".to_vec()));
-        info_dict.insert(b"piece length".to_vec(), BEncode::Int(16_384));
-        info_dict.insert(b"file tree".to_vec(), BEncode::Dict(file_tree));
-
-        let mut layers_dict = BTreeMap::new();
         let mut layers_bytes = Vec::new();
         layers_bytes.extend_from_slice(&p0_hash);
         layers_bytes.extend_from_slice(&p1_hash);
-        layers_dict.insert(root_hash.to_vec(), BEncode::String(layers_bytes));
+        let root_hash = merkle::root_from_piece_layer(&layers_bytes, 16_384).unwrap();
 
-        let mut top_dict = BTreeMap::new();
-        top_dict.insert(b"info".to_vec(), BEncode::Dict(info_dict));
-        top_dict.insert(b"piece layers".to_vec(), BEncode::Dict(layers_dict));
+        let make_top = |root: [u8; 32], layer: Vec<u8>| {
+            let mut leaf = BTreeMap::new();
+            leaf.insert(b"length".to_vec(), BEncode::Int(32_768));
+            leaf.insert(b"pieces root".to_vec(), BEncode::String(root.to_vec()));
 
-        let parsed = Info::from_bencode(BEncode::Dict(top_dict)).unwrap();
+            let mut file_dict = BTreeMap::new();
+            file_dict.insert(b"".to_vec(), BEncode::Dict(leaf));
+
+            let mut file_tree = BTreeMap::new();
+            file_tree.insert(b"test.bin".to_vec(), BEncode::Dict(file_dict));
+
+            let mut info_dict = BTreeMap::new();
+            info_dict.insert(b"meta version".to_vec(), BEncode::Int(2));
+            info_dict.insert(b"name".to_vec(), BEncode::String(b"test_v2".to_vec()));
+            info_dict.insert(b"piece length".to_vec(), BEncode::Int(16_384));
+            info_dict.insert(b"file tree".to_vec(), BEncode::Dict(file_tree));
+
+            let mut layers_dict = BTreeMap::new();
+            layers_dict.insert(root.to_vec(), BEncode::String(layer));
+
+            let mut top_dict = BTreeMap::new();
+            top_dict.insert(b"info".to_vec(), BEncode::Dict(info_dict));
+            top_dict.insert(b"piece layers".to_vec(), BEncode::Dict(layers_dict));
+            BEncode::Dict(top_dict)
+        };
+
+        let parsed = Info::from_bencode(make_top(root_hash, layers_bytes.clone())).unwrap();
         assert_eq!(parsed.piece_hash_v2(0), Some(p0_hash));
         assert_eq!(parsed.piece_hash_v2(1), Some(p1_hash));
         assert_eq!(parsed.piece_hash_v2(2), None);
+
+        // Forged piece layer (mismatched root) must be rejected at parse time.
+        assert!(Info::from_bencode(make_top([0x55u8; 32], layers_bytes)).is_err());
+
+        // Oversized `so=` ranges across repeated params must stay strictly bounded.
+        let mut mag = format!("magnet:?xt=urn:btih:{}", "ab".repeat(20));
+        for _ in 0..8 {
+            mag.push_str("&so=0-1000000");
+        }
+        let mag_info = Info::from_magnet(&mag).unwrap();
+        assert!(mag_info.select_only.as_ref().unwrap().len() <= super::MAX_SELECT_INDICES);
     }
 
     fn v2_torrent(files: &[(&str, i64)]) -> BEncode {
@@ -2362,7 +2431,7 @@ mod tests {
         let torrent = v2_torrent(&[("a", 100_000)]);
         let info = Info::from_bencode(torrent).unwrap();
         let bytes = info.to_torrent_bytes();
-        let back = Info::from_persisted_bencode(synapse_bencode::decode_buf(&bytes).unwrap())
+        let back = Info::from_persisted_bencode(&bytes)
             .expect("a persisted v2 torrent must load again");
         assert_eq!(back.hash, info.hash);
         assert_eq!(back.info_hash_v2, info.info_hash_v2);
@@ -2455,10 +2524,7 @@ mod tests {
         // The exact info bytes are kept so the signature can be checked, and the signatures
         // survive being persisted and loaded again.
         assert!(info.raw_info.is_some());
-        let back = Info::from_persisted_bencode(
-            synapse_bencode::decode_buf(&info.to_torrent_bytes()).unwrap(),
-        )
-        .unwrap();
+        let back = Info::from_persisted_bencode(&info.to_torrent_bytes()).unwrap();
         assert_eq!(back.signatures, info.signatures);
         assert_eq!(back.hash, info.hash);
         // Junk signature bytes never verify as trusted.
@@ -2501,10 +2567,7 @@ mod tests {
         info_dict.insert(b"private".to_vec(), BEncode::Int(1));
         let root = BTreeMap::from([(b"info".to_vec(), BEncode::Dict(info_dict))]);
         let info = Info::from_bencode(BEncode::Dict(root)).unwrap();
-        let back = Info::from_persisted_bencode(
-            synapse_bencode::decode_buf(&info.to_torrent_bytes()).unwrap(),
-        )
-        .unwrap();
+        let back = Info::from_persisted_bencode(&info.to_torrent_bytes()).unwrap();
         assert_eq!(
             back.hash, info.hash,
             "the info hash must survive persistence"
@@ -2584,5 +2647,108 @@ mod tests {
             Info::from_bencode(wrap(traversal_name_info)).unwrap_err(),
             MetaError::UnsafeFilePath
         );
+    }
+
+    #[test]
+    fn bep47_attr_p_single_file_v2_hybrid_and_unsorted_raw_info_roundtrip() {
+        // 1. BEP 47 `attr: "p"` sets `is_padding` even without `.pad` component, and `.pad*` is not falsely padded.
+        let mut pad_file = BTreeMap::new();
+        pad_file.insert(b"length".to_vec(), BEncode::Int(1000));
+        pad_file.insert(b"attr".to_vec(), BEncode::String(b"p".to_vec()));
+        pad_file.insert(
+            b"path".to_vec(),
+            BEncode::List(vec![BEncode::String(b"custom_align.bin".to_vec())]),
+        );
+        let mut real_file = BTreeMap::new();
+        real_file.insert(b"length".to_vec(), BEncode::Int(15_384));
+        real_file.insert(
+            b"path".to_vec(),
+            BEncode::List(vec![BEncode::String(b".paddle.png".to_vec())]),
+        );
+        let mut info = base_info_fields();
+        info.insert(b"name".to_vec(), BEncode::String(b"mix".to_vec()));
+        info.insert(
+            b"files".to_vec(),
+            BEncode::List(vec![BEncode::Dict(pad_file), BEncode::Dict(real_file)]),
+        );
+        let parsed = Info::from_bencode(wrap(info)).unwrap();
+        assert!(parsed.files[0].is_padding_entry());
+        assert!(!parsed.files[1].is_padding_entry());
+
+        // 2. Single-file pure-v2 must NOT double `foo/foo` and must reject bad meta version / non-pow2 piece len.
+        let root_v2 = [0x33u8; 32];
+        let leaf = BTreeMap::from([
+            (b"length".to_vec(), BEncode::Int(16_384)),
+            (b"pieces root".to_vec(), BEncode::String(root_v2.to_vec())),
+        ]);
+        let tree = BTreeMap::from([(
+            b"movie.mkv".to_vec(),
+            BEncode::Dict(BTreeMap::from([(b"".to_vec(), BEncode::Dict(leaf))])),
+        )]);
+        let sf_v2 = BTreeMap::from([
+            (b"meta version".to_vec(), BEncode::Int(2)),
+            (b"name".to_vec(), BEncode::String(b"movie.mkv".to_vec())),
+            (b"piece length".to_vec(), BEncode::Int(16_384)),
+            (b"file tree".to_vec(), BEncode::Dict(tree.clone())),
+        ]);
+        let sf_parsed = Info::from_bencode(wrap(sf_v2)).unwrap();
+        assert_eq!(sf_parsed.files[0].path, PathBuf::from("movie.mkv"));
+        assert!(!sf_parsed.is_hybrid());
+
+        let bad_ver = BTreeMap::from([
+            (b"meta version".to_vec(), BEncode::Int(99)),
+            (b"name".to_vec(), BEncode::String(b"movie.mkv".to_vec())),
+            (b"piece length".to_vec(), BEncode::Int(16_384)),
+            (b"file tree".to_vec(), BEncode::Dict(tree.clone())),
+        ]);
+        assert!(Info::from_bencode(wrap(bad_ver)).is_err());
+
+        let non_pow2 = BTreeMap::from([
+            (b"meta version".to_vec(), BEncode::Int(2)),
+            (b"name".to_vec(), BEncode::String(b"movie.mkv".to_vec())),
+            (b"piece length".to_vec(), BEncode::Int(24_576)),
+            (b"file tree".to_vec(), BEncode::Dict(tree.clone())),
+        ]);
+        assert_eq!(
+            Info::from_bencode(wrap(non_pow2)).unwrap_err(),
+            MetaError::InvalidPieceLength
+        );
+
+        // 3. Single-file hybrid survives `evict_piece_hashes()` and `from_torrent_bytes` hashes unsorted `info`.
+        let sf_hyb = BTreeMap::from([
+            (b"meta version".to_vec(), BEncode::Int(2)),
+            (b"name".to_vec(), BEncode::String(b"movie.mkv".to_vec())),
+            (b"piece length".to_vec(), BEncode::Int(16_384)),
+            (b"length".to_vec(), BEncode::Int(16_384)),
+            (b"pieces".to_vec(), BEncode::String(vec![0x77; 20])),
+            (b"file tree".to_vec(), BEncode::Dict(tree)),
+        ]);
+        let hyb_parsed = Info::from_bencode(wrap(sf_hyb)).unwrap();
+        assert_eq!(hyb_parsed.files[0].path, PathBuf::from("movie.mkv"));
+        assert!(hyb_parsed.is_hybrid());
+        hyb_parsed.evict_piece_hashes();
+        assert!(hyb_parsed.is_hybrid());
+
+        // Unsorted keys in `info` within `.torrent` wire bytes keep the exact wire hash.
+        let mut raw_info = Vec::new();
+        raw_info.extend_from_slice(b"d");
+        raw_info.extend_from_slice(b"12:piece lengthi16384e");
+        raw_info.extend_from_slice(b"4:name5:a.bin");
+        raw_info.extend_from_slice(b"6:lengthi16384e");
+        raw_info.extend_from_slice(b"6:pieces20:01234567890123456789");
+        raw_info.push(b'e');
+        let expected_hash: [u8; 20] = Sha1::digest(&raw_info).into();
+        let mut torrent_bytes = b"d4:info".to_vec();
+        torrent_bytes.extend_from_slice(&raw_info);
+        torrent_bytes.push(b'e');
+        let unsorted_parsed = Info::from_torrent_bytes(&torrent_bytes).unwrap();
+        assert_eq!(unsorted_parsed.hash, expected_hash);
+        assert_eq!(unsorted_parsed.to_info_dict_bytes(), raw_info);
+
+        // A session-store round-trip must hash identically to the original add, even though
+        // the source `info` dict was not key-sorted.
+        let persisted_bytes = unsorted_parsed.to_torrent_bytes();
+        let restored = Info::from_persisted_bencode(&persisted_bytes).unwrap();
+        assert_eq!(restored.hash, expected_hash);
     }
 }

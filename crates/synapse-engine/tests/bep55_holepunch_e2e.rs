@@ -244,7 +244,13 @@ async fn test_bep55_holepunch_rendezvous_relay_and_discovery() {
     })
     .await
     .expect("Peer A received fail response");
-    assert_eq!(fail_msg, HolepunchMessage::Failed { err_code: 1 });
+    assert_eq!(
+        fail_msg,
+        HolepunchMessage::Failed {
+            target: unknown_target,
+            err_code: 1,
+        }
+    );
 
     // 3. Peer A sends Connect { peer: target } directly to relay -> Relay notifies on_peers_discovered
     let target_to_discover: SocketAddr = "127.0.0.1:54321".parse().unwrap();

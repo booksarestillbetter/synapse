@@ -43,6 +43,10 @@ impl PeerStream {
         }
     }
 
+    pub fn is_utp(&self) -> bool {
+        matches!(self, PeerStream::Utp(_))
+    }
+
     pub fn set_nodelay(&self, nodelay: bool) -> std::io::Result<()> {
         match self {
             PeerStream::Tcp(s) => s.set_nodelay(nodelay),
@@ -129,6 +133,11 @@ const PEER_RECEIVE_TIMEOUT: Duration = Duration::from_secs(180);
 #[cfg(test)]
 const PEER_RECEIVE_TIMEOUT: Duration = Duration::from_millis(600);
 
+#[cfg(not(test))]
+const PEER_SEND_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const PEER_SEND_TIMEOUT: Duration = Duration::from_millis(600);
+
 static NEXT_PEER_ID: AtomicU64 = AtomicU64::new(1);
 
 fn next_peer_id() -> PeerId {
@@ -167,6 +176,22 @@ pub struct PeerInfo {
     pub local_addr: Option<SocketAddr>,
     pub is_outbound: bool,
     pub is_encrypted: bool,
+    pub reserved: [u8; 8],
+    pub is_utp: bool,
+}
+
+impl PeerInfo {
+    pub fn supports_extensions(&self) -> bool {
+        (self.reserved[5] & 0x10) != 0
+    }
+
+    pub fn supports_fast(&self) -> bool {
+        (self.reserved[7] & 0x04) != 0
+    }
+
+    pub fn supports_dht(&self) -> bool {
+        (self.reserved[7] & 0x01) != 0
+    }
 }
 
 /// What the owner of a peer connection uses to send it outbound messages. Dropping
@@ -329,8 +354,17 @@ async fn connect_stream(
         EncryptionMode::PlaintextOnly => {
             let mut framed = Framed::new(EncryptedStream::new_plain(stream), PeerCodec::new());
             framed.send(our_handshake).await?;
-            let their_id = read_and_verify_handshake(&mut framed, info_hash).await?;
-            spawn(framed, addr, info_hash, their_id, events, true);
+            let (their_id, their_reserved) =
+                read_and_verify_handshake(&mut framed, info_hash).await?;
+            spawn(
+                framed,
+                addr,
+                info_hash,
+                their_id,
+                their_reserved,
+                events,
+                true,
+            );
             return Ok(());
         }
         EncryptionMode::PreferEncrypted => {
@@ -350,8 +384,17 @@ async fn connect_stream(
                         PeerCodec::new(),
                     );
                     framed.send(our_handshake).await?;
-                    let their_id = read_and_verify_handshake(&mut framed, info_hash).await?;
-                    spawn(framed, addr, info_hash, their_id, events, true);
+                    let (their_id, their_reserved) =
+                        read_and_verify_handshake(&mut framed, info_hash).await?;
+                    spawn(
+                        framed,
+                        addr,
+                        info_hash,
+                        their_id,
+                        their_reserved,
+                        events,
+                        true,
+                    );
                     return Ok(());
                 }
             }
@@ -366,8 +409,16 @@ async fn connect_stream(
     };
 
     let mut framed = Framed::new(enc_stream, PeerCodec::new());
-    let their_id = read_and_verify_handshake(&mut framed, info_hash).await?;
-    spawn(framed, addr, info_hash, their_id, events, true);
+    let (their_id, their_reserved) = read_and_verify_handshake(&mut framed, info_hash).await?;
+    spawn(
+        framed,
+        addr,
+        info_hash,
+        their_id,
+        their_reserved,
+        events,
+        true,
+    );
     Ok(())
 }
 
@@ -447,9 +498,11 @@ where
     .map_err(|_| PeerError::HandshakeTimeout)?
     .map_err(PeerError::Io)?;
 
-    let enc_stream = match rx_res {
-        synapse_wire::ReceiverHandshakeResult::Plaintext { stream } => stream,
-        synapse_wire::ReceiverHandshakeResult::Encrypted { stream, .. } => stream,
+    let (enc_stream, mse_info_hash) = match rx_res {
+        synapse_wire::ReceiverHandshakeResult::Plaintext { stream } => (stream, None),
+        synapse_wire::ReceiverHandshakeResult::Encrypted {
+            stream, info_hash, ..
+        } => (stream, Some(info_hash)),
     };
 
     let mut framed = Framed::new(enc_stream, PeerCodec::new());
@@ -457,12 +510,17 @@ where
         .await
         .map_err(|_| PeerError::HandshakeTimeout)?
         .ok_or(PeerError::HandshakeClosed)??;
-    let (info_hash, their_id) = match msg {
+    let (their_reserved, info_hash, their_id) = match msg {
         Message::Handshake {
-            info_hash, peer_id, ..
-        } => (info_hash, peer_id),
+            reserved,
+            info_hash,
+            peer_id,
+        } => (reserved, info_hash, peer_id),
         _ => return Err(PeerError::NotAHandshake),
     };
+    if mse_info_hash.is_some_and(|mse_hash| mse_hash != info_hash) {
+        return Err(PeerError::InfoHashMismatch);
+    }
     let Some((events, is_private)) = lookup_events(info_hash) else {
         return Err(PeerError::InfoHashMismatch);
     };
@@ -481,7 +539,15 @@ where
             peer_id: our_peer_id,
         })
         .await?;
-    spawn(framed, addr, info_hash, their_id, events, false);
+    spawn(
+        framed,
+        addr,
+        info_hash,
+        their_id,
+        their_reserved,
+        events,
+        false,
+    );
     Ok(())
 }
 
@@ -530,9 +596,11 @@ pub async fn accept_with_mode(
     .map_err(|_| PeerError::HandshakeTimeout)?
     .map_err(PeerError::Io)?;
 
-    let enc_stream = match rx_res {
-        synapse_wire::ReceiverHandshakeResult::Plaintext { stream } => stream,
-        synapse_wire::ReceiverHandshakeResult::Encrypted { stream, .. } => stream,
+    let (enc_stream, mse_info_hash) = match rx_res {
+        synapse_wire::ReceiverHandshakeResult::Plaintext { stream } => (stream, None),
+        synapse_wire::ReceiverHandshakeResult::Encrypted {
+            stream, info_hash, ..
+        } => (stream, Some(info_hash)),
     };
 
     let mut framed = Framed::new(enc_stream, PeerCodec::new());
@@ -540,13 +608,15 @@ pub async fn accept_with_mode(
         .await
         .map_err(|_| PeerError::HandshakeTimeout)?
         .ok_or(PeerError::HandshakeClosed)??;
-    let (info_hash, their_id) = match msg {
+    let (their_reserved, info_hash, their_id) = match msg {
         Message::Handshake {
-            info_hash, peer_id, ..
-        } => (info_hash, peer_id),
+            reserved,
+            info_hash,
+            peer_id,
+        } => (reserved, info_hash, peer_id),
         _ => return Err(PeerError::NotAHandshake),
     };
-    if info_hash != expected_hash {
+    if info_hash != expected_hash || mse_info_hash.is_some_and(|mse_hash| mse_hash != info_hash) {
         return Err(PeerError::InfoHashMismatch);
     }
 
@@ -564,24 +634,64 @@ pub async fn accept_with_mode(
             peer_id: our_peer_id,
         })
         .await?;
-    spawn(framed, addr, info_hash, their_id, events, false);
+    spawn(
+        framed,
+        addr,
+        info_hash,
+        their_id,
+        their_reserved,
+        events,
+        false,
+    );
     Ok(())
 }
 
 async fn read_and_verify_handshake(
     framed: &mut Framed<EncryptedStream<PeerStream>, PeerCodec>,
     expected_hash: [u8; 20],
-) -> Result<[u8; 20], PeerError> {
+) -> Result<([u8; 20], [u8; 8]), PeerError> {
     let msg = tokio::time::timeout(HANDSHAKE_TIMEOUT, framed.next())
         .await
         .map_err(|_| PeerError::HandshakeTimeout)?
         .ok_or(PeerError::HandshakeClosed)??;
     match msg {
         Message::Handshake {
-            info_hash, peer_id, ..
-        } if info_hash == expected_hash => Ok(peer_id),
+            reserved,
+            info_hash,
+            peer_id,
+        } if info_hash == expected_hash => Ok((peer_id, reserved)),
         Message::Handshake { .. } => Err(PeerError::InfoHashMismatch),
         _ => Err(PeerError::NotAHandshake),
+    }
+}
+
+async fn send_messages_bounded<S>(
+    framed: &mut Framed<S, PeerCodec>,
+    first: Message,
+    out_rx: Option<&mut mpsc::Receiver<Message>>,
+    receive_deadline: &mut std::pin::Pin<&mut tokio::time::Sleep>,
+) -> bool
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let send_fut = async {
+        framed.feed(first).await.map_err(|_| ())?;
+        if let Some(rx) = out_rx {
+            for _ in 0..31 {
+                match rx.try_recv() {
+                    Ok(next_msg) => framed.feed(next_msg).await.map_err(|_| ())?,
+                    Err(_) => break,
+                }
+            }
+        }
+        framed.flush().await.map_err(|_| ())
+    };
+    let send_timeout = tokio::time::sleep(PEER_SEND_TIMEOUT);
+    tokio::pin!(send_timeout);
+    tokio::select! {
+        res = send_fut => res.is_ok(),
+        _ = &mut send_timeout => false,
+        _ = &mut *receive_deadline => false,
     }
 }
 
@@ -590,6 +700,7 @@ fn spawn(
     addr: SocketAddr,
     info_hash: [u8; 20],
     peer_id: [u8; 20],
+    reserved: [u8; 8],
     events: mpsc::Sender<PeerEvent>,
     is_outbound: bool,
 ) {
@@ -603,6 +714,7 @@ fn spawn(
 
     let local_addr = framed.get_ref().get_ref().local_addr();
     let is_encrypted = framed.get_ref().is_encrypted();
+    let is_utp = framed.get_ref().get_ref().is_utp();
     tokio::spawn(async move {
         if events
             .send(PeerEvent::Connected(
@@ -614,6 +726,8 @@ fn spawn(
                     local_addr,
                     is_outbound,
                     is_encrypted,
+                    reserved,
+                    is_utp,
                 },
             ))
             .await
@@ -635,7 +749,7 @@ fn spawn(
                     break;
                 }
                 _ = keepalive.tick() => {
-                    if framed.send(Message::KeepAlive).await.is_err() {
+                    if !send_messages_bounded(&mut framed, Message::KeepAlive, None, &mut receive_deadline).await {
                         break;
                     }
                 }
@@ -657,8 +771,8 @@ fn spawn(
                 outgoing = out_rx.recv() => {
                     match outgoing {
                         Some(msg) => {
-                            if let Err(e) = framed.send(msg).await {
-                                tracing::debug!(peer = id, "write error, closing: {e}");
+                            if !send_messages_bounded(&mut framed, msg, Some(&mut out_rx), &mut receive_deadline).await {
+                                tracing::debug!(peer = id, "write error or slow-reader timeout, closing");
                                 break;
                             }
                             keepalive.reset();
@@ -668,7 +782,12 @@ fn spawn(
                 }
             }
         }
-        let _ = framed.close().await;
+        let close_budget = if cfg!(test) {
+            Duration::from_millis(200)
+        } else {
+            Duration::from_secs(2)
+        };
+        let _ = tokio::time::timeout(close_budget, framed.close()).await;
         drop(framed);
         let _ = tokio::time::timeout(
             std::time::Duration::from_millis(500),
@@ -976,6 +1095,49 @@ mod liveness_tests {
         assert!(
             rx.recv().await.is_some(),
             "fallback connection never reached the accept() side"
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_info_exposes_reserved_bits_and_slow_reader_times_out_promptly() {
+        let info = PeerInfo {
+            info_hash: [0; 20],
+            peer_id: [1; 20],
+            addr: "127.0.0.1:6881".parse().unwrap(),
+            local_addr: None,
+            is_outbound: false,
+            is_encrypted: false,
+            reserved: [0, 0, 0, 0, 0, 0x10, 0, 0x05],
+            is_utp: false,
+        };
+        assert!(info.supports_extensions());
+        assert!(info.supports_fast());
+        assert!(info.supports_dht());
+
+        let (them, mut rx, handle) = spawn_pair().await;
+        // Drop or stop draining `them`'s read side while flooding large Piece messages;
+        // even if writes stall on a full socket buffer, the task must disconnect within ~2x PEER_RECEIVE_TIMEOUT.
+        let chunk = bytes::Bytes::from(vec![0xAA; 16_384]);
+        let _keep_them_open = them;
+        let disconnected = tokio::time::timeout(PEER_RECEIVE_TIMEOUT * 3, async move {
+            loop {
+                let _ = handle.try_send(Message::Piece {
+                    index: 0,
+                    begin: 0,
+                    data: chunk.clone(),
+                });
+                match tokio::time::timeout(Duration::from_millis(20), rx.recv()).await {
+                    Ok(Some(PeerEvent::Disconnected(_))) => break true,
+                    Ok(None) => break true,
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap_or(false);
+        assert!(
+            disconnected,
+            "stalled slow-reading peer must still be timed out within PEER_RECEIVE_TIMEOUT"
         );
     }
 }

@@ -25,8 +25,15 @@ pub struct IpVoter {
     winner: Option<IpAddr>,
 }
 
+fn canonical_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(ip),
+        v4 => v4,
+    }
+}
+
 fn voter_key(voter: IpAddr) -> Vec<u8> {
-    match voter {
+    match canonical_ip(voter) {
         IpAddr::V4(v4) => v4.octets()[..2].to_vec(),
         IpAddr::V6(v6) => v6.octets()[..4].to_vec(),
     }
@@ -34,6 +41,7 @@ fn voter_key(voter: IpAddr) -> Vec<u8> {
 
 /// Reported addresses that can never be our public internet address.
 fn plausible(reported: IpAddr) -> bool {
+    let reported = canonical_ip(reported);
     if reported.is_unspecified() || reported.is_loopback() || reported.is_multicast() {
         return false;
     }
@@ -56,10 +64,19 @@ fn plausible(reported: IpAddr) -> bool {
                 return plausible(IpAddr::V4(v4));
             }
             let s = v6.segments();
-            // Reject ULA (fc00::/7), link-local (fe80::/10), and documentation (2001:db8::/32)
-            !((s[0] & 0xfe00) == 0xfc00
-                || (s[0] & 0xffc0) == 0xfe80
-                || (s[0] == 0x2001 && s[1] == 0x0db8))
+            // Keep this in sync with `synapse_tracker::safe_http::is_public_ip`'s IPv6 range
+            // list: a range accepted as "plausible" here but rejected there would let a peer
+            // spoof BEP 42 external-IP consensus with an address the tracker-side SSRF guard
+            // would otherwise block.
+            !((s[0] & 0xfe00) == 0xfc00 // unique local fc00::/7
+                || (s[0] & 0xffc0) == 0xfe80 // link local fe80::/10
+                || (s[0] & 0xffc0) == 0xfec0 // deprecated site-local fec0::/10
+                || (s[0] == 0x2001 && s[1] == 0x0db8) // documentation 2001:db8::/32
+                || (s[0] == 0x2001 && s[1] < 0x0200) // IETF protocol assignments 2001::/23 (incl. Teredo)
+                || (s[0] == 0x0064 && s[1] == 0xff9b && s[2..6] == [0, 0, 0, 0]) // RFC 6052 NAT64 64:ff9b::/96
+                || (s[0] == 0x0064 && s[1] == 0xff9b && s[2] == 0x0001) // RFC 8215 Local-Use NAT64 64:ff9b:1::/48
+                || s[0..6] == [0, 0, 0, 0, 0, 0] // Deprecated IPv4-compatible ::/96
+                || (s[0] == 0x0100 && s[1..4] == [0, 0, 0])) // RFC 6666 Discard-Only 100::/64
         }
     }
 }
@@ -77,8 +94,11 @@ impl IpVoter {
     /// Records that `voter` reported our address as `reported`. Returns the new consensus
     /// address if this vote *changed* it (first agreement, or a switch after a network change).
     pub fn vote(&mut self, voter: IpAddr, reported: IpAddr) -> Option<IpAddr> {
-        // Only public reporters count: a LAN neighbour reports our private address.
-        if !plausible(reported) || voter.is_loopback() {
+        let voter = canonical_ip(voter);
+        let reported = canonical_ip(reported);
+        // Only public reporters and public reported addresses count: a LAN neighbour
+        // reports our private address and cannot be used to spoof external consensus.
+        if !plausible(reported) || !plausible(voter) {
             return None;
         }
         if self.votes.len() >= MAX_VOTERS && !self.votes.contains_key(&voter_key(voter)) {
@@ -179,5 +199,41 @@ mod tests {
             v.vote("127.0.0.1".parse().unwrap(), "203.0.113.7".parse().unwrap()),
             None
         );
+        // Non-public voters (RFC1918, ULA, IPv4-mapped private) cannot cast votes either.
+        for n in 0..20u8 {
+            assert_eq!(
+                v.vote(
+                    IpAddr::from([192, 168, n, 1]),
+                    "203.0.113.7".parse().unwrap()
+                ),
+                None
+            );
+            assert_eq!(
+                v.vote(
+                    "::ffff:10.0.0.1".parse().unwrap(),
+                    "203.0.113.7".parse().unwrap()
+                ),
+                None
+            );
+        }
+        assert_eq!(v.consensus(), None);
+    }
+
+    #[test]
+    fn ipv4_mapped_votes_share_canonical_v4_bucket_and_identity() {
+        let mut v = IpVoter::new();
+        let me_v4: IpAddr = "203.0.113.7".parse().unwrap();
+        let me_mapped: IpAddr = "::ffff:203.0.113.7".parse().unwrap();
+        // Same /16 across v4 and ::ffff:v4 counts as only ONE independent voter.
+        assert_eq!(v.vote("20.1.0.1".parse().unwrap(), me_v4), None);
+        assert_eq!(v.vote("::ffff:20.1.0.2".parse().unwrap(), me_mapped), None);
+        for n in 2..9u8 {
+            let voted = v.vote(voter(n), me_mapped);
+            if n < 8 {
+                assert_eq!(voted, None);
+            } else {
+                assert_eq!(voted, Some(me_v4));
+            }
+        }
     }
 }

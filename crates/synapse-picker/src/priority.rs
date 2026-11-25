@@ -37,15 +37,40 @@ impl PriorityMap {
     where
         F: Fn(usize) -> Option<(u32, u32)>,
     {
-        if file_idx >= self.file_priorities.len() {
+        if file_idx >= self.file_priorities.len() || self.total_pieces == 0 {
             return;
         }
         self.file_priorities[file_idx] = priority;
 
         if let Some((start, end)) = piece_mapper(file_idx) {
+            let max_piece = self.total_pieces - 1;
+            let end = end.min(max_piece);
+            if start > end {
+                return;
+            }
             for p in start..=end {
                 if (p as usize) < self.piece_priorities.len() {
                     self.piece_priorities[p as usize] = priority;
+                }
+            }
+            // Boundary pieces shared with another file keep the highest priority among overlapping files.
+            for (other_idx, &other_prio) in self.file_priorities.iter().enumerate() {
+                if other_idx == file_idx || other_prio == FilePriority::DoNotDownload {
+                    continue;
+                }
+                if let Some((o_start, o_end)) = piece_mapper(other_idx) {
+                    let o_end = o_end.min(max_piece);
+                    let overlap_start = start.max(o_start);
+                    let overlap_end = end.min(o_end);
+                    if overlap_start <= overlap_end {
+                        for p in overlap_start..=overlap_end {
+                            if let Some(slot) = self.piece_priorities.get_mut(p as usize) {
+                                if other_prio > *slot {
+                                    *slot = other_prio;
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -110,5 +135,29 @@ mod tests {
         // Mark file 1 as High
         pmap.set_file_priority(1, FilePriority::High, mapper);
         assert_eq!(pmap.piece_priority(5), FilePriority::High);
+    }
+
+    #[test]
+    fn boundary_piece_keeps_max_priority_across_overlapping_files() {
+        let mut pmap = PriorityMap::new(5, 2);
+        // File 0 overlaps File 1 at piece 2.
+        let mapper = |f| match f {
+            0 => Some((0, 2)),
+            1 => Some((2, 4)),
+            _ => None,
+        };
+
+        pmap.set_file_priority(0, FilePriority::DoNotDownload, mapper);
+        assert!(!pmap.is_piece_wanted(0));
+        assert!(!pmap.is_piece_wanted(1));
+        assert!(pmap.is_piece_wanted(2));
+        assert_eq!(pmap.piece_priority(2), FilePriority::Normal);
+
+        pmap.set_file_priority(1, FilePriority::High, mapper);
+        assert_eq!(pmap.piece_priority(2), FilePriority::High);
+
+        pmap.set_file_priority(0, FilePriority::Low, mapper);
+        assert_eq!(pmap.piece_priority(1), FilePriority::Low);
+        assert_eq!(pmap.piece_priority(2), FilePriority::High);
     }
 }

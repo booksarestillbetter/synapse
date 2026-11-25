@@ -83,7 +83,14 @@ impl WebSeedManager {
     ) -> Result<(Url, String), url::ParseError> {
         let target_url = if let Some(path) = file_path_rel {
             if base_url.as_str().ends_with('/') {
-                base_url.join(path)?
+                let mut url = base_url.clone();
+                if let Ok(mut segs) = url.path_segments_mut() {
+                    segs.pop_if_empty();
+                    for seg in path.split('/').filter(|s| !s.is_empty()) {
+                        segs.push(seg);
+                    }
+                }
+                url
             } else {
                 base_url.clone()
             }
@@ -166,6 +173,16 @@ mod tests {
             .unwrap();
         assert_eq!(url2.as_str(), "https://cdn.example.org/torrents/ubuntu.iso");
         assert_eq!(range2, "bytes=0-16383");
+
+        // Filenames containing '?', '#', '%', and spaces must be percent-encoded as path segments,
+        // never interpreted as query/fragment components.
+        let (url3, _) = mgr
+            .format_range_request(&base_url, Some("dir/file ?#100%.bin"), 0, 10)
+            .unwrap();
+        assert_eq!(
+            url3.as_str(),
+            "https://cdn.example.org/torrents/dir/file%20%3F%23100%25.bin"
+        );
     }
 
     #[test]

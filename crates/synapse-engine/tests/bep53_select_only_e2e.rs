@@ -16,22 +16,27 @@ async fn test_bep53_select_only_file_priorities() {
         File {
             path: PathBuf::from("multifile/file0.txt"),
             length: 1024,
+            is_padding: false,
         },
         File {
             path: PathBuf::from("multifile/file1.txt"),
             length: 1024,
+            is_padding: false,
         },
         File {
             path: PathBuf::from("multifile/file2.txt"),
             length: 1024,
+            is_padding: false,
         },
         File {
             path: PathBuf::from("multifile/file3.txt"),
             length: 1024,
+            is_padding: false,
         },
         File {
             path: PathBuf::from("multifile/file4.txt"),
             length: 1024,
+            is_padding: false,
         },
     ];
 

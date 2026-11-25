@@ -10,9 +10,29 @@
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
+use bytes::Bytes;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Mutex};
+
+fn is_transient_udp_recv_error(err: &io::Error) -> bool {
+    matches!(
+        err.kind(),
+        io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::Interrupted
+            | io::ErrorKind::WouldBlock
+    )
+}
+
+fn is_fatal_udp_recv_error(err: &io::Error) -> bool {
+    matches!(
+        err.kind(),
+        io::ErrorKind::BrokenPipe | io::ErrorKind::NotConnected
+    )
+}
 
 /// Datagrams buffered per protocol before further ones for that protocol are dropped. UDP is
 /// lossy anyway, and dropping keeps a slow consumer from stalling the other protocol.
@@ -27,7 +47,7 @@ pub enum UdpTransport {
 /// One protocol's channel-backed view of a shared socket.
 pub struct SharedUdp {
     real: Arc<UdpSocket>,
-    rx: Mutex<mpsc::Receiver<(Vec<u8>, SocketAddr)>>,
+    rx: Mutex<mpsc::Receiver<(Bytes, SocketAddr)>>,
 }
 
 impl From<UdpSocket> for UdpTransport {
@@ -48,6 +68,23 @@ impl UdpTransport {
         match self {
             UdpTransport::Plain(s) => s.send_to(buf, target).await,
             UdpTransport::Shared(s) => s.real.send_to(buf, target).await,
+        }
+    }
+
+    /// Receives one datagram as a `Bytes` buffer.
+    ///
+    /// On shared muxed endpoints this delivers the demultiplexer's `Bytes` directly without an
+    /// extra copy or touching `scratch`. On plain sockets it reads into `scratch` and copies the
+    /// received slice into `Bytes`.
+    pub async fn recv_bytes(&self, scratch: &mut [u8]) -> io::Result<(Bytes, SocketAddr)> {
+        match self {
+            UdpTransport::Plain(s) => {
+                let (n, from) = s.recv_from(scratch).await?;
+                Ok((Bytes::copy_from_slice(&scratch[..n]), from))
+            }
+            UdpTransport::Shared(s) => s.rx.lock().await.recv().await.ok_or_else(|| {
+                io::Error::new(io::ErrorKind::BrokenPipe, "UDP demultiplexer stopped")
+            }),
         }
     }
 
@@ -102,22 +139,38 @@ impl UdpMux {
         let reader = real.clone();
         tokio::spawn(async move {
             let mut buf = vec![0u8; 65_535];
+            let both_closed = async {
+                tokio::join!(dht_tx.closed(), utp_tx.closed());
+            };
+            tokio::pin!(both_closed);
+
             loop {
-                let (n, from) = match reader.recv_from(&mut buf).await {
-                    Ok(v) => v,
-                    // ICMP "port unreachable" from an earlier send surfaces as a recv error on
-                    // some platforms; it says nothing about the socket's health.
-                    Err(e) if e.kind() == io::ErrorKind::ConnectionReset => continue,
-                    Err(_) => break,
+                let (n, from) = tokio::select! {
+                    biased;
+                    _ = &mut both_closed => break,
+                    res = reader.recv_from(&mut buf) => match res {
+                        Ok(v) => v,
+                        // ICMP "port unreachable" and transient signals say nothing about socket health.
+                        Err(e) if is_transient_udp_recv_error(&e) => continue,
+                        Err(e) if is_fatal_udp_recv_error(&e) => break,
+                        Err(_) => {
+                            tokio::select! {
+                                _ = &mut both_closed => break,
+                                _ = tokio::time::sleep(Duration::from_millis(25)) => continue,
+                            }
+                        }
+                    },
                 };
                 let target = match classify(&buf[..n]) {
                     UdpProtocol::Dht => &dht_tx,
                     UdpProtocol::Utp => &utp_tx,
                 };
-                if target.is_closed() && dht_tx.is_closed() && utp_tx.is_closed() {
+                if dht_tx.is_closed() && utp_tx.is_closed() {
                     break;
                 }
-                let _ = target.try_send((buf[..n].to_vec(), from));
+                if let Ok(permit) = target.try_reserve() {
+                    permit.send((Bytes::copy_from_slice(&buf[..n]), from));
+                }
             }
         });
         Ok(UdpMux {
@@ -170,5 +223,53 @@ mod tests {
         mux.dht.send_to(b"reply", from).await.unwrap();
         let (n, src) = client.recv_from(&mut buf).await.unwrap();
         assert_eq!((&buf[..n], src), (&b"reply"[..], addr));
+    }
+
+    #[tokio::test]
+    async fn mux_stops_and_releases_socket_when_both_endpoints_drop() {
+        let mux = UdpMux::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let addr = mux.local_addr;
+        drop(mux);
+
+        let mut rebound = false;
+        for _ in 0..50 {
+            if UdpSocket::bind(addr).await.is_ok() {
+                rebound = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            rebound,
+            "mux demultiplexer task must exit and release socket when both endpoints drop"
+        );
+    }
+
+    #[tokio::test]
+    async fn recv_bytes_works_for_shared_mux_and_plain_transport() {
+        let mux = UdpMux::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let plain_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let plain_addr = plain_sock.local_addr().unwrap();
+        let plain = UdpTransport::Plain(plain_sock);
+
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sender.send_to(b"d1:y1:qe", mux.local_addr).await.unwrap();
+        sender
+            .send_to(&[0x41, 0x00, 0x01, 0x02], mux.local_addr)
+            .await
+            .unwrap();
+        sender.send_to(b"plain-datagram", plain_addr).await.unwrap();
+
+        let mut scratch = [0u8; 64];
+        let (dht_bytes, from_dht) = mux.dht.recv_bytes(&mut scratch).await.unwrap();
+        assert_eq!(&dht_bytes[..], b"d1:y1:qe");
+        assert_eq!(from_dht, sender.local_addr().unwrap());
+
+        let (utp_bytes, _) = mux.utp.recv_bytes(&mut scratch).await.unwrap();
+        assert_eq!(&utp_bytes[..], &[0x41, 0x00, 0x01, 0x02]);
+
+        let (plain_bytes, from_plain) = plain.recv_bytes(&mut scratch).await.unwrap();
+        assert_eq!(&plain_bytes[..], b"plain-datagram");
+        assert_eq!(from_plain, sender.local_addr().unwrap());
     }
 }

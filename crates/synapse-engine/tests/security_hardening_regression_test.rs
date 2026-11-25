@@ -35,6 +35,7 @@ fn test_verify_no_symlinks_and_staging_single_file_path() {
         &[MetaFile {
             path: PathBuf::from("evil.txt"),
             length: 10,
+            is_padding: false,
         }],
     );
     assert!(
@@ -55,6 +56,7 @@ fn test_verify_no_symlinks_and_staging_single_file_path() {
             &[MetaFile {
                 path: PathBuf::from("nested/movie.mkv"),
                 length: 11,
+                is_padding: false,
             }],
         )
         .unwrap()

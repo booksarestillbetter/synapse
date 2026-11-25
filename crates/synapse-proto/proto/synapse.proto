@@ -40,6 +40,12 @@ service SynapseControl {
   rpc SetFirstLastPiecePriority(FirstLastPiecePriorityRequest) returns (CommandResponse);
   rpc UpdateTorrentMetadata(UpdateTorrentMetadataRequest) returns (TorrentMetadataResponse);
   rpc ExportTorrent(ExportTorrentRequest) returns (ExportTorrentResponse);
+
+  // Bulk torrent lifecycle actions
+  rpc PauseTorrents(TorrentHashesRequest) returns (BatchCommandResponse);
+  rpc ResumeTorrents(TorrentHashesRequest) returns (BatchCommandResponse);
+  rpc RemoveTorrents(RemoveTorrentsRequest) returns (BatchCommandResponse);
+  rpc RecheckTorrents(TorrentHashesRequest) returns (BatchCommandResponse);
 }
 
 message Empty {}
@@ -164,6 +170,18 @@ message ExportTorrentResponse {
   bytes torrent_bytes = 4;
 }
 
+message RemoveTorrentsRequest {
+  repeated string hashes = 1;
+  bool delete_data = 2;
+}
+
+message BatchCommandResponse {
+  bool success = 1;
+  uint32 succeeded = 2;
+  repeated string failed_hashes = 3;
+  optional string error = 4;
+}
+
 enum TorrentState {
   STATE_STOPPED = 0;
   STATE_CHECKING = 1;
@@ -250,6 +268,10 @@ message TorrentSnapshotChunk {
   bool is_last_chunk = 4;
 }
 
+message TorrentDeltaBatch {
+  repeated TorrentDelta deltas = 1;
+}
+
 message TorrentListEvent {
   uint64 sequence_id = 1;
   int64 timestamp_ms = 2;
@@ -258,6 +280,7 @@ message TorrentListEvent {
     TorrentSummary added = 4;
     TorrentDelta updated = 5;
     string removed_hash = 6;
+    TorrentDeltaBatch updated_batch = 7;
   }
 }
 
@@ -289,6 +312,7 @@ message TrackerStatus {
   bool is_circuit_broken = 7;
   optional CircuitBreakerState cb_state = 8;
   optional float recovery_progress_pct = 9;
+  optional int64 last_announce_time = 10;
 }
 
 message FileProgress {
@@ -360,7 +384,9 @@ message FilePriorityRequest {
 message SetLocationRequest {
   string hash = 1;
   string new_download_dir = 2;
-  bool move_existing_files = 3;
+  // Unset means "move the existing files", matching the REST endpoint's default and this
+  // RPC's behavior before this field existed; explicit presence lets a client opt out.
+  optional bool move_existing_files = 3;
 }
 
 message RateLimitsRequest {

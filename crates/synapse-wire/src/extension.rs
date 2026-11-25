@@ -132,12 +132,12 @@ impl ExtensionHandshake {
         let metadata_size = root
             .remove(b"metadata_size".as_ref())
             .and_then(|e| e.into_int())
-            .map(|s| s as u32);
+            .and_then(|s| u32::try_from(s).ok());
         let v = root.remove(b"v".as_ref()).and_then(|e| e.into_string());
         let reqq = root
             .remove(b"reqq".as_ref())
             .and_then(|e| e.into_int())
-            .map(|r| r as u32);
+            .and_then(|r| u32::try_from(r).ok());
         let upload_only = root
             .remove(b"upload_only".as_ref())
             .and_then(|e| e.into_int())
@@ -213,10 +213,8 @@ impl UtMetadataMessage {
 
     pub fn decode(payload: &[u8]) -> Result<Self, WireError> {
         const MAX_METADATA_TOTAL_SIZE: u32 = 16 * 1024 * 1024;
-        let mut cursor = std::io::Cursor::new(payload);
-        let bencode = synapse_bencode::decode_first(&mut cursor)
+        let (bencode, header_len) = synapse_bencode::decode_buf_prefix(payload)
             .map_err(|_| WireError::Protocol("malformed ut_metadata message bencode"))?;
-        let header_len = cursor.position() as usize;
 
         let mut dict = bencode.into_dict().ok_or(WireError::Protocol(
             "ut_metadata header must be a bencode dict",
@@ -609,5 +607,17 @@ mod tests {
         let mut oversized = b"d8:msg_typei1e5:piecei0e10:total_sizei32768ee".to_vec();
         oversized.extend(vec![b'a'; 16385]);
         assert!(UtMetadataMessage::decode(&oversized).is_err());
+    }
+
+    #[test]
+    fn extension_handshake_ignores_out_of_range_metadata_size_and_reqq() {
+        let neg = ExtensionHandshake::decode(b"d13:metadata_sizei-5e4:reqqi-1ee").unwrap();
+        assert_eq!(neg.metadata_size, None);
+        assert_eq!(neg.reqq, None);
+
+        let huge = ExtensionHandshake::decode(b"d13:metadata_sizei4294967296e4:reqqi5000000000ee")
+            .unwrap();
+        assert_eq!(huge.metadata_size, None);
+        assert_eq!(huge.reqq, None);
     }
 }

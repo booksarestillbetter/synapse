@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use sha1::{Digest as _, Sha1};
 use synapse_bencode::BEncode;
 
-use crate::merkle::{hash_block, root_and_piece_layer, BLOCK_SIZE};
+use crate::merkle::{MerkleFileHasher, BLOCK_SIZE};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TorrentVersion {
@@ -72,11 +72,23 @@ pub fn auto_piece_length(total: u64) -> u32 {
 fn collect_files(root: &Path) -> Result<(String, bool, Vec<SourceFile>), CreateError> {
     let io = |p: &Path, e| CreateError::Io(p.to_path_buf(), e);
     let meta = std::fs::symlink_metadata(root).map_err(|e| io(root, e))?;
+    if !meta.file_type().is_file() && !meta.file_type().is_dir() {
+        return Err(io(
+            root,
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "refusing symlink or special file as torrent root",
+            ),
+        ));
+    }
     let name = root
         .file_name()
         .and_then(|n| n.to_str())
         .ok_or_else(|| CreateError::BadName(root.to_path_buf()))?
         .to_string();
+    if !crate::validate_single_name(&name) {
+        return Err(CreateError::BadName(root.to_path_buf()));
+    }
     if meta.is_file() {
         return Ok((
             name.clone(),
@@ -95,10 +107,16 @@ fn collect_files(root: &Path) -> Result<(String, bool, Vec<SourceFile>), CreateE
         for entry in entries {
             let entry = entry.map_err(|e| io(&dir, e))?;
             let file_type = entry.file_type().map_err(|e| io(&dir, e))?;
+            if file_type.is_symlink() {
+                continue;
+            }
             let file_name = entry
                 .file_name()
                 .into_string()
                 .map_err(|_| CreateError::BadName(entry.path()))?;
+            if !crate::component_is_safe(std::ffi::OsStr::new(&file_name)) {
+                return Err(CreateError::BadName(entry.path()));
+            }
             let mut components = prefix.clone();
             components.push(file_name);
             if file_type.is_dir() {
@@ -117,27 +135,55 @@ fn collect_files(root: &Path) -> Result<(String, bool, Vec<SourceFile>), CreateE
     Ok((name, true, files))
 }
 
-/// Streams a file in 16 KiB blocks, calling `on_block` for each.
-fn for_each_block(path: &Path, mut on_block: impl FnMut(&[u8])) -> Result<(), CreateError> {
+/// Streams a regular file in 16 KiB blocks with `EINTR` retry and symlink/special-file checks,
+/// returning total bytes read.
+fn for_each_block(path: &Path, mut on_block: impl FnMut(&[u8])) -> Result<u64, CreateError> {
+    let link_meta =
+        std::fs::symlink_metadata(path).map_err(|e| CreateError::Io(path.to_path_buf(), e))?;
+    if !link_meta.file_type().is_file() {
+        return Err(CreateError::Io(
+            path.to_path_buf(),
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "source path is no longer a regular file",
+            ),
+        ));
+    }
     let mut file = std::fs::File::open(path).map_err(|e| CreateError::Io(path.to_path_buf(), e))?;
+    let opened_meta = file
+        .metadata()
+        .map_err(|e| CreateError::Io(path.to_path_buf(), e))?;
+    if !opened_meta.file_type().is_file() {
+        return Err(CreateError::Io(
+            path.to_path_buf(),
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "opened path is not a regular file",
+            ),
+        ));
+    }
     let mut buf = vec![0u8; BLOCK_SIZE];
+    let mut total_read = 0u64;
     loop {
         let mut filled = 0;
         while filled < BLOCK_SIZE {
-            let n = file
-                .read(&mut buf[filled..])
-                .map_err(|e| CreateError::Io(path.to_path_buf(), e))?;
+            let n = match file.read(&mut buf[filled..]) {
+                Ok(n) => n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(CreateError::Io(path.to_path_buf(), e)),
+            };
             if n == 0 {
                 break;
             }
             filled += n;
         }
         if filled == 0 {
-            return Ok(());
+            return Ok(total_read);
         }
         on_block(&buf[..filled]);
+        total_read += filled as u64;
         if filled < BLOCK_SIZE {
-            return Ok(());
+            return Ok(total_read);
         }
     }
 }
@@ -231,6 +277,9 @@ pub fn create_torrent(
     }
     let plen = piece_len as usize;
     let name = opts.name.clone().unwrap_or(root_name);
+    if !crate::validate_single_name(&name) {
+        return Err(CreateError::BadName(PathBuf::from(name)));
+    }
     let want_v1 = opts.version != TorrentVersion::V2;
     let want_v2 = opts.version != TorrentVersion::V1;
     let hybrid = opts.version == TorrentVersion::Hybrid;
@@ -242,16 +291,25 @@ pub fn create_torrent(
     let mut done = 0u64;
 
     for (idx, file) in files.iter().enumerate() {
-        let mut leaves: Vec<[u8; 32]> = Vec::new();
-        for_each_block(&file.path, |block| {
+        let mut merkle = want_v2.then(|| MerkleFileHasher::new(plen));
+        let bytes_read = for_each_block(&file.path, |block| {
             if want_v1 {
                 v1.update(block);
             }
-            if want_v2 {
-                leaves.push(hash_block(block));
+            if let Some(ref mut m) = merkle {
+                m.push_block(block);
             }
             done += block.len() as u64;
         })?;
+        if bytes_read != file.length {
+            return Err(CreateError::Io(
+                file.path.clone(),
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "file size changed while hashing",
+                ),
+            ));
+        }
         progress(done, total);
 
         if want_v1 {
@@ -279,7 +337,7 @@ pub fn create_torrent(
             let mut leaf = BTreeMap::new();
             leaf.insert(b"length".to_vec(), BEncode::Int(file.length as i64));
             if file.length > 0 {
-                let (root, layer) = root_and_piece_layer(&leaves, plen);
+                let (root, layer) = merkle.expect("want_v2").finish();
                 leaf.insert(b"pieces root".to_vec(), BEncode::String(root.to_vec()));
                 if !layer.is_empty() {
                     layers.insert(root.to_vec(), BEncode::String(layer.concat()));

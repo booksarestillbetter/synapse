@@ -102,16 +102,25 @@ pub fn default_transmission_dir() -> Option<PathBuf> {
     None
 }
 
-/// Automatically discovers Synapse session torrents directory.
+/// Automatically discovers Synapse session directory from default config.
 pub fn default_synapse_session_dir() -> PathBuf {
-    if let Ok(home) = std::env::var("HOME") {
-        let home_path = PathBuf::from(home);
-        #[cfg(target_os = "macos")]
-        return home_path.join("Library/Application Support/synapse/torrents");
-        #[cfg(not(target_os = "macos"))]
-        return home_path.join(".local/share/synapse/torrents");
+    synapse_config::Config::default().disk.session_dir
+}
+
+fn decode_bitfield_bytes(bytes: &[u8], total_pieces: usize) -> Bitfield {
+    if let Some(bf) = Bitfield::from_bytes(bytes, total_pieces) {
+        return bf;
     }
-    PathBuf::from("./torrents")
+    let mut bitfield = Bitfield::new(total_pieces);
+    for (byte_idx, &b) in bytes.iter().enumerate() {
+        for bit in 0..8 {
+            let piece_idx = byte_idx * 8 + bit;
+            if piece_idx < total_pieces && (b & (0x80 >> bit)) != 0 {
+                bitfield.set(piece_idx);
+            }
+        }
+    }
+    bitfield
 }
 
 /// Parses a Transmission `.resume` file and extracts download path, bitfield, and stats.
@@ -158,22 +167,28 @@ pub fn parse_transmission_resume(
     });
 
     let mut bitfield = Bitfield::new(total_pieces);
-    if let Some(BEncode::String(bytes)) = dict
-        .get(b"pieces".as_slice())
-        .or_else(|| dict.get(b"bitfield".as_slice()))
-    {
-        if let Some(bf) = Bitfield::from_bytes(bytes, total_pieces) {
-            bitfield = bf;
-        } else {
-            // If byte length doesn't exactly match total_pieces div_ceil(8), set valid bits up to available len
-            for (byte_idx, &b) in bytes.iter().enumerate() {
-                for bit in 0..8 {
-                    let piece_idx = byte_idx * 8 + bit;
-                    if piece_idx < total_pieces && (b & (0x80 >> bit)) != 0 {
-                        bitfield.set(piece_idx);
-                    }
+    let mut decoded_progress = false;
+    if let Some(BEncode::Dict(progress_dict)) = dict.get(b"progress".as_slice()) {
+        if let Some(BEncode::String(have)) = progress_dict
+            .get(b"have".as_slice())
+            .or_else(|| progress_dict.get(b"bitfield".as_slice()))
+        {
+            decoded_progress = true;
+            if have.as_slice() == b"all" {
+                for i in 0..total_pieces {
+                    bitfield.set(i);
                 }
+            } else if have.as_slice() != b"none" {
+                bitfield = decode_bitfield_bytes(have, total_pieces);
             }
+        }
+    }
+    if !decoded_progress {
+        if let Some(BEncode::String(bytes)) = dict
+            .get(b"pieces".as_slice())
+            .or_else(|| dict.get(b"bitfield".as_slice()))
+        {
+            bitfield = decode_bitfield_bytes(bytes, total_pieces);
         }
     }
 
@@ -226,20 +241,18 @@ pub fn migrate_transmission(
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) == Some("torrent") {
                 if let Ok(bytes) = std::fs::read(&path) {
-                    if let Ok(bencode) = synapse_bencode::decode_buf(&bytes) {
-                        if let Ok(info) = Info::from_persisted_bencode(bencode) {
-                            let hash_hex = hex::encode(info.hash);
-                            let stem = path
-                                .file_stem()
-                                .unwrap_or_default()
-                                .to_string_lossy()
-                                .to_string();
-                            torrent_files.insert(
-                                hash_hex.clone(),
-                                (path.clone(), info.clone(), bytes.clone()),
-                            );
-                            torrent_files.insert(stem, (path, info, bytes));
-                        }
+                    if let Ok(info) = Info::from_persisted_bencode(&bytes) {
+                        let hash_hex = hex::encode(info.hash);
+                        let stem = path
+                            .file_stem()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .to_string();
+                        torrent_files.insert(
+                            hash_hex.clone(),
+                            (path.clone(), info.clone(), bytes.clone()),
+                        );
+                        torrent_files.insert(stem, (path, info, bytes));
                     }
                 }
             }
@@ -604,20 +617,18 @@ pub fn migrate_libtorrent_client(
             match path.extension().and_then(|e| e.to_str()) {
                 Some("torrent") => {
                     if let Ok(bytes) = std::fs::read(&path) {
-                        if let Ok(bencode) = synapse_bencode::decode_buf(&bytes) {
-                            if let Ok(info) = Info::from_persisted_bencode(bencode) {
-                                let hash_hex = hex::encode(info.hash);
-                                let stem = path
-                                    .file_stem()
-                                    .unwrap_or_default()
-                                    .to_string_lossy()
-                                    .to_string();
-                                torrent_files.insert(
-                                    hash_hex.clone(),
-                                    (path.clone(), info.clone(), bytes.clone()),
-                                );
-                                torrent_files.insert(stem, (path, info, bytes));
-                            }
+                        if let Ok(info) = Info::from_persisted_bencode(&bytes) {
+                            let hash_hex = hex::encode(info.hash);
+                            let stem = path
+                                .file_stem()
+                                .unwrap_or_default()
+                                .to_string_lossy()
+                                .to_string();
+                            torrent_files.insert(
+                                hash_hex.clone(),
+                                (path.clone(), info.clone(), bytes.clone()),
+                            );
+                            torrent_files.insert(stem, (path, info, bytes));
                         }
                     }
                 }
@@ -1055,5 +1066,42 @@ mod tests {
         .unwrap_err();
         assert!(err.contains("qBittorrent"));
         assert!(err.contains("not found"));
+    }
+
+    #[test]
+    fn default_synapse_session_dir_matches_config_default() {
+        assert_eq!(
+            default_synapse_session_dir(),
+            synapse_config::Config::default().disk.session_dir
+        );
+    }
+
+    #[test]
+    fn parse_transmission_resume_handles_nested_progress_have_variants() {
+        let make_resume = |have: &[u8]| {
+            let mut progress = BTreeMap::new();
+            progress.insert(b"have".to_vec(), BEncode::String(have.to_vec()));
+            let mut root = BTreeMap::new();
+            root.insert(
+                b"destination".to_vec(),
+                BEncode::String(b"/downloads".to_vec()),
+            );
+            root.insert(b"progress".to_vec(), BEncode::Dict(progress));
+            let mut buf = Vec::new();
+            BEncode::Dict(root).encode(&mut buf).unwrap();
+            buf
+        };
+
+        let (_, bf_all, ..) = parse_transmission_resume(&make_resume(b"all"), 10).unwrap();
+        assert_eq!(bf_all.count_ones(), 10);
+
+        let (_, bf_none, ..) = parse_transmission_resume(&make_resume(b"none"), 10).unwrap();
+        assert_eq!(bf_none.count_ones(), 0);
+
+        let (_, bf_raw, ..) = parse_transmission_resume(&make_resume(&[0xA0, 0x00]), 10).unwrap();
+        assert_eq!(bf_raw.count_ones(), 2);
+        assert!(bf_raw.has(0));
+        assert!(!bf_raw.has(1));
+        assert!(bf_raw.has(2));
     }
 }

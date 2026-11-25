@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 tokio = { workspace = true }
+tokio-stream = { version = "0.1", features = ["net"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 clap = { workspace = true }
@@ -32,7 +33,7 @@ sha1 = "0.10"
 if-addrs = "0.15.0"
 
 [dev-dependencies]
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde_json = "1.0"
 tempfile = "3"
 base64 = "0.22"

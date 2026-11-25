@@ -22,9 +22,14 @@ pub enum PeerTransport {
     Utp,
 }
 
-/// Helper to determine if an IP address belongs to a local area network (LAN) or loopback.
+/// Helper to determine if an IP address belongs to a local area network (LAN) or loopback
+/// (canonicalizing IPv4-mapped IPv6 addresses like `::ffff:192.168.1.1`).
 pub fn is_lan_address(ip: IpAddr) -> bool {
-    match ip {
+    let canonical = match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(ip),
+        v4 => v4,
+    };
+    match canonical {
         IpAddr::V4(v4) => {
             v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()
         }
@@ -87,12 +92,14 @@ impl HierarchicalRateLimiter {
         if bytes == 0 {
             return true;
         }
-        let mut taken: Vec<&Arc<TokenBucket>> = Vec::with_capacity(3);
+        let mut taken: [Option<&Arc<TokenBucket>>; 3] = [None, None, None];
+        let mut taken_len = 0usize;
         for bucket in self.tiers(is_lan, limit_lan) {
             if bucket.try_consume(bytes) {
-                taken.push(bucket);
+                taken[taken_len] = Some(bucket);
+                taken_len += 1;
             } else {
-                for t in taken {
+                for t in taken[..taken_len].iter().flatten() {
                     t.refund(bytes);
                 }
                 return false;
@@ -214,5 +221,12 @@ mod tests {
         // 1 000 bytes at 20 000 B/s takes at least ~40 ms to refill.
         assert!(start.elapsed() >= std::time::Duration::from_millis(30));
         assert!(peer.available_tokens() <= 999_000);
+    }
+
+    #[test]
+    fn ipv4_mapped_lan_addresses_are_classified_as_lan() {
+        assert!(is_lan_address("::ffff:192.168.1.10".parse().unwrap()));
+        assert!(is_lan_address("::ffff:127.0.0.1".parse().unwrap()));
+        assert!(!is_lan_address("::ffff:8.8.8.8".parse().unwrap()));
     }
 }

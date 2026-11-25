@@ -10,6 +10,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
+const CANARY_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_TRACKED_PEERS: usize = 65_536;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CircuitState {
     Healthy,
@@ -25,6 +28,7 @@ pub struct EndpointCircuitInfo {
     pub last_failure: Option<Instant>,
     pub backoff_duration: Duration,
     pub canary_in_flight: bool,
+    pub canary_started_at: Option<Instant>,
     pub recovery_started_at: Option<Instant>,
     pub consecutive_successes: u32,
     pub last_dispatched: Option<Instant>,
@@ -38,6 +42,7 @@ impl Default for EndpointCircuitInfo {
             last_failure: None,
             backoff_duration: Duration::from_secs(30),
             canary_in_flight: false,
+            canary_started_at: None,
             recovery_started_at: None,
             consecutive_successes: 0,
             last_dispatched: None,
@@ -111,22 +116,68 @@ impl PeerCircuitBreaker {
         self.endpoints.write().clear();
     }
 
+    fn evict_one(map: &mut HashMap<SocketAddr, EndpointCircuitInfo>) {
+        const STALE_TRIPPED_CUTOFF: Duration = Duration::from_secs(3600);
+        let key = map
+            .iter()
+            .find(|(_, info)| info.state == CircuitState::Healthy)
+            .or_else(|| {
+                map.iter().find(|(_, info)| {
+                    info.state == CircuitState::Tripped
+                        && info.last_failure.is_some_and(|f| {
+                            f.elapsed() >= info.backoff_duration.max(STALE_TRIPPED_CUTOFF)
+                        })
+                })
+            })
+            .map(|(k, _)| *k)
+            .or_else(|| {
+                map.iter()
+                    .min_by_key(|(_, info)| info.last_failure)
+                    .map(|(k, _)| *k)
+            });
+        if let Some(k) = key {
+            map.remove(&k);
+        }
+    }
+
     /// Checks if a connection attempt is allowed to the given peer address.
     pub fn can_connect(&self, addr: &SocketAddr) -> bool {
         if !*self.enabled.read() {
             return true;
         }
 
+        {
+            let map = self.endpoints.read();
+            match map.get(addr) {
+                None => return true,
+                Some(entry) if entry.state == CircuitState::Healthy => return true,
+                Some(entry)
+                    if entry.state == CircuitState::Tripped
+                        && entry
+                            .last_failure
+                            .is_none_or(|f| f.elapsed() < entry.backoff_duration) =>
+                {
+                    return false;
+                }
+                Some(_) => {}
+            }
+        }
+
         let mut map = self.endpoints.write();
-        let entry = map.entry(*addr).or_default();
+        let Some(entry) = map.get_mut(addr) else {
+            return true;
+        };
 
         match entry.state {
             CircuitState::Healthy => true,
             CircuitState::Tripped => {
                 if let Some(last_fail) = entry.last_failure {
                     if last_fail.elapsed() >= entry.backoff_duration {
+                        let now = Instant::now();
                         entry.state = CircuitState::HalfOpenCanary;
                         entry.canary_in_flight = true;
+                        entry.canary_started_at = Some(now);
+                        entry.last_dispatched = Some(now);
                         info!(
                             "Peer circuit breaker for {} transitioned to HalfOpenCanary. Testing canary connection.",
                             addr
@@ -140,9 +191,14 @@ impl PeerCircuitBreaker {
                 }
             }
             CircuitState::HalfOpenCanary => {
-                if !entry.canary_in_flight {
+                let timed_out = entry
+                    .canary_started_at
+                    .is_some_and(|started| started.elapsed() >= CANARY_TIMEOUT);
+                if !entry.canary_in_flight || timed_out {
+                    let now = Instant::now();
                     entry.canary_in_flight = true;
-                    entry.last_dispatched = Some(Instant::now());
+                    entry.canary_started_at = Some(now);
+                    entry.last_dispatched = Some(now);
                     true
                 } else {
                     false
@@ -160,9 +216,7 @@ impl PeerCircuitBreaker {
                         "Peer {} completed recovery ramp-up with {} successes. Circuit breaker promoted to Healthy.",
                         addr, entry.consecutive_successes
                     );
-                    entry.state = CircuitState::Healthy;
-                    entry.recovery_started_at = None;
-                    entry.last_dispatched = Some(now);
+                    map.remove(addr);
                     return true;
                 }
 
@@ -190,40 +244,49 @@ impl PeerCircuitBreaker {
         if !*self.enabled.read() {
             return;
         }
+        if !self.endpoints.read().contains_key(addr) {
+            return;
+        }
 
         let initial_backoff = *self.initial_backoff.read();
         let mut map = self.endpoints.write();
-        if let Some(entry) = map.get_mut(addr) {
-            match entry.state {
-                CircuitState::HalfOpenCanary => {
-                    info!(
-                        "Canary connection succeeded for peer {}! Entering Recovering ramp-up phase.",
-                        addr
-                    );
-                    entry.consecutive_failures = 0;
-                    entry.state = CircuitState::Recovering;
-                    entry.recovery_started_at = Some(Instant::now());
-                    entry.consecutive_successes = 1;
-                    entry.last_failure = None;
-                    entry.backoff_duration = initial_backoff;
-                    entry.canary_in_flight = false;
-                    entry.last_dispatched = Some(Instant::now());
-                }
-                CircuitState::Recovering => {
-                    entry.consecutive_successes += 1;
-                    entry.consecutive_failures = 0;
-                    entry.canary_in_flight = false;
-                }
-                CircuitState::Healthy => {
-                    entry.consecutive_failures = 0;
-                    entry.last_failure = None;
-                    entry.canary_in_flight = false;
-                }
-                CircuitState::Tripped => {
-                    entry.consecutive_failures = 0;
-                    entry.canary_in_flight = false;
+        let remove_healthy = match map.get_mut(addr) {
+            Some(entry) => {
+                entry.canary_started_at = None;
+                match entry.state {
+                    CircuitState::HalfOpenCanary => {
+                        info!(
+                            "Canary connection succeeded for peer {}! Entering Recovering ramp-up phase.",
+                            addr
+                        );
+                        entry.consecutive_failures = 0;
+                        entry.state = CircuitState::Recovering;
+                        entry.recovery_started_at = Some(Instant::now());
+                        entry.consecutive_successes = 1;
+                        entry.last_failure = None;
+                        entry.backoff_duration = initial_backoff;
+                        entry.canary_in_flight = false;
+                        entry.last_dispatched = Some(Instant::now());
+                        false
+                    }
+                    CircuitState::Recovering => {
+                        entry.consecutive_successes += 1;
+                        entry.consecutive_failures = 0;
+                        entry.canary_in_flight = false;
+                        false
+                    }
+                    CircuitState::Healthy => true,
+                    CircuitState::Tripped => {
+                        entry.consecutive_failures = 0;
+                        entry.canary_in_flight = false;
+                        false
+                    }
                 }
             }
+            None => false,
+        };
+        if remove_healthy {
+            map.remove(addr);
         }
     }
 
@@ -238,11 +301,15 @@ impl PeerCircuitBreaker {
         let max_backoff = *self.max_backoff.read();
 
         let mut map = self.endpoints.write();
+        if !map.contains_key(addr) && map.len() >= MAX_TRACKED_PEERS {
+            Self::evict_one(&mut map);
+        }
         let entry = map.entry(*addr).or_default();
 
         entry.consecutive_failures += 1;
         entry.last_failure = Some(Instant::now());
         entry.canary_in_flight = false;
+        entry.canary_started_at = None;
         entry.consecutive_successes = 0;
 
         match entry.state {
@@ -357,5 +424,73 @@ mod tests {
         let status = cb.get_status(&addr);
         assert_eq!(status.state, CircuitState::Tripped);
         assert_eq!(status.backoff_duration, Duration::from_millis(100)); // 50ms * 2
+    }
+
+    #[test]
+    fn healthy_read_fast_path_stuck_canary_timeout_and_bounded_eviction() {
+        let cb = PeerCircuitBreaker::new(1, Duration::from_millis(5), Duration::from_secs(1));
+        let healthy: SocketAddr = "198.51.100.1:6881".parse().unwrap();
+        assert!(cb.can_connect(&healthy));
+        assert!(
+            cb.endpoints.read().is_empty(),
+            "healthy peer check must not allocate or insert"
+        );
+
+        let stuck: SocketAddr = "198.51.100.2:6881".parse().unwrap();
+        cb.record_failure(&stuck);
+        std::thread::sleep(Duration::from_millis(10));
+        assert!(cb.can_connect(&stuck));
+        assert!(!cb.can_connect(&stuck));
+        {
+            let mut map = cb.endpoints.write();
+            map.get_mut(&stuck).unwrap().canary_started_at =
+                Some(Instant::now() - CANARY_TIMEOUT - Duration::from_secs(1));
+        }
+        assert!(
+            cb.can_connect(&stuck),
+            "stuck canary past CANARY_TIMEOUT should allow re-probing"
+        );
+
+        for idx in 0..=MAX_TRACKED_PEERS {
+            let ip = std::net::Ipv4Addr::from((idx as u32) + 0xC633_6400);
+            let port = 1024 + (idx % 60_000) as u16;
+            cb.record_failure(&SocketAddr::from((ip, port)));
+        }
+        assert_eq!(cb.endpoints.read().len(), MAX_TRACKED_PEERS);
+    }
+
+    #[test]
+    fn healthy_record_success_and_graduation_retain_zero_entries() {
+        let cb = PeerCircuitBreaker::new(2, Duration::from_millis(5), Duration::from_secs(1));
+        cb.set_recovery_duration(Duration::from_millis(10));
+        let addr: SocketAddr = "198.51.100.77:6881".parse().unwrap();
+
+        cb.record_success(&addr);
+        assert!(cb.endpoints.read().is_empty());
+
+        cb.record_failure(&addr);
+        assert_eq!(cb.endpoints.read().len(), 1);
+        cb.record_success(&addr);
+        assert!(
+            cb.endpoints.read().is_empty(),
+            "healthy peer entry must be removed on success"
+        );
+
+        cb.record_failure(&addr);
+        cb.record_failure(&addr);
+        std::thread::sleep(Duration::from_millis(10));
+        assert!(cb.can_connect(&addr));
+        cb.record_success(&addr);
+        for _ in 0..3 {
+            std::thread::sleep(Duration::from_millis(4));
+            let _ = cb.can_connect(&addr);
+            cb.record_success(&addr);
+        }
+        std::thread::sleep(Duration::from_millis(15));
+        assert!(cb.can_connect(&addr));
+        assert!(
+            cb.endpoints.read().is_empty(),
+            "graduated peer must be removed from map"
+        );
     }
 }

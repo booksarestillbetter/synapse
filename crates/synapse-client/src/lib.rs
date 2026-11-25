@@ -12,7 +12,7 @@ pub mod client;
 pub mod error;
 pub mod live_cache;
 
-pub use client::SynapseClient;
+pub use client::{SynapseClient, SynapseClientBuilder};
 pub use error::{Result, SynapseClientError};
 pub use live_cache::SynapseLiveCache;
 pub use synapse_proto::v2 as proto;

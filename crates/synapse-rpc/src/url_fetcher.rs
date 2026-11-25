@@ -33,7 +33,11 @@ pub enum FetchTorrentError {
 /// the cap is applied to the bytes actually read rather than to `metadata().len()`).
 pub async fn read_torrent_file(path: &std::path::Path) -> Result<Vec<u8>, FetchTorrentError> {
     use tokio::io::AsyncReadExt;
-    let file = tokio::fs::File::open(path).await.map_err(|e| {
+    let mut open_opts = tokio::fs::OpenOptions::new();
+    open_opts.read(true);
+    #[cfg(unix)]
+    open_opts.custom_flags(libc::O_NOFOLLOW);
+    let file = open_opts.open(path).await.map_err(|e| {
         FetchTorrentError::Metadata(format!("Failed to read local torrent file: {e}"))
     })?;
     let mut buf = Vec::new();
@@ -229,5 +233,22 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, FetchTorrentError::InvalidUrl(_)));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_torrent_file_refuses_symlinks_with_o_nofollow() {
+        let dir =
+            std::env::temp_dir().join(format!("synapse-nofollow-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("real.torrent");
+        let link = dir.join("link.torrent");
+        std::fs::write(&target, b"d1:ai1ee").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let err = read_torrent_file(&link).await.unwrap_err();
+        assert!(matches!(err, FetchTorrentError::Metadata(_)), "{err:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

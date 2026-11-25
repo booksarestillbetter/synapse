@@ -79,7 +79,10 @@ async fn bep46_torrent_update_over_udp() {
     );
     let v1 = synapse_bencode::BEncode::Dict(dict1).encode_to_buf();
 
-    let (token, _) = client.get(server_addr, target, None).await.unwrap();
+    let (token, _) = client
+        .get_with_salt(server_addr, target, salt.as_deref(), None)
+        .await
+        .unwrap();
     let sig1 = sk
         .sign(&format_sign_payload(salt.as_deref(), 1, &v1))
         .to_bytes();
@@ -97,7 +100,7 @@ async fn bep46_torrent_update_over_udp() {
     // Poll node: should discover v1
     let updated = updater.poll_node(&client, server_addr).await.unwrap();
     assert!(updated);
-    assert_eq!(updater.latest_seq, 1);
+    assert_eq!(updater.latest_seq, Some(1));
     assert_eq!(updater.current_info_hash, Some(info_hash_v1));
 
     // Polling again without new seq returns false
@@ -113,7 +116,10 @@ async fn bep46_torrent_update_over_udp() {
     );
     let v2 = synapse_bencode::BEncode::Dict(dict2).encode_to_buf();
 
-    let (token2, _) = client.get(server_addr, target, None).await.unwrap();
+    let (token2, _) = client
+        .get_with_salt(server_addr, target, salt.as_deref(), None)
+        .await
+        .unwrap();
     let sig2 = sk
         .sign(&format_sign_payload(salt.as_deref(), 2, &v2))
         .to_bytes();
@@ -131,6 +137,6 @@ async fn bep46_torrent_update_over_udp() {
     // Poll node: should advance to v2
     let updated_v2 = updater.poll_node(&client, server_addr).await.unwrap();
     assert!(updated_v2);
-    assert_eq!(updater.latest_seq, 2);
+    assert_eq!(updater.latest_seq, Some(2));
     assert_eq!(updater.current_info_hash, Some(info_hash_v2));
 }

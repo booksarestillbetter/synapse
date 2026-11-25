@@ -79,19 +79,22 @@ impl ZeroconfManager {
             .collect()
     }
 
-    /// Our announcement of every public torrent. `None` when nothing is shared, or the port
-    /// is not known yet.
-    pub fn announcement(&self, local_addrs: &[IpAddr]) -> Option<Vec<u8>> {
+    /// Our announcement of every public torrent, chunked at `<= 8` hashes per datagram so a
+    /// large swarm never overflows the mDNS UDP MTU or record counter.
+    pub fn announcements(&self, local_addrs: &[IpAddr]) -> Vec<Vec<u8>> {
         if self.public.is_empty() || self.port == 0 || local_addrs.is_empty() {
-            return None;
+            return Vec::new();
         }
         let hashes: Vec<[u8; 20]> = self.public.iter().copied().collect();
-        Some(dns::build_response(
-            &self.peer_id,
-            &hashes,
-            self.port,
-            local_addrs,
-        ))
+        hashes
+            .chunks(NAMES_PER_QUERY)
+            .map(|chunk| dns::build_response(&self.peer_id, chunk, self.port, local_addrs))
+            .collect()
+    }
+
+    /// First announcement datagram (`None` when nothing is shared or port is unknown).
+    pub fn announcement(&self, local_addrs: &[IpAddr]) -> Option<Vec<u8>> {
+        self.announcements(local_addrs).into_iter().next()
     }
 
     fn source_allowed(&mut self, ip: IpAddr, now: Instant) -> bool {
@@ -132,12 +135,30 @@ impl ZeroconfManager {
         let mut handled = Handled::default();
 
         if !msg.is_response {
-            let asked_about_us = msg.questions.iter().any(|q| {
-                dns::info_hash_of_sub_service(q).is_some_and(|h| self.public.contains(&h))
-                    || q == dns::SERVICE
-            });
-            if asked_about_us {
-                handled.reply = self.announcement(local_addrs);
+            if self.port == 0 || local_addrs.is_empty() {
+                return handled;
+            }
+            let mut matched_hashes: Vec<[u8; 20]> = Vec::new();
+            for q in &msg.questions {
+                if let Some(h) = dns::info_hash_of_sub_service(q) {
+                    if self.public.contains(&h) && !matched_hashes.contains(&h) {
+                        matched_hashes.push(h);
+                        if matched_hashes.len() >= NAMES_PER_QUERY {
+                            break;
+                        }
+                    }
+                }
+            }
+            if matched_hashes.is_empty() && msg.questions.iter().any(|q| q == dns::SERVICE) {
+                matched_hashes.extend(self.public.iter().copied().take(NAMES_PER_QUERY));
+            }
+            if !matched_hashes.is_empty() {
+                handled.reply = Some(dns::build_response(
+                    &self.peer_id,
+                    &matched_hashes,
+                    self.port,
+                    local_addrs,
+                ));
             }
             return handled;
         }

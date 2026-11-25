@@ -66,6 +66,8 @@ pub struct InspectBatchResult {
     pub total_payload_bytes: u64,
 }
 
+const MAX_RECURSIVE_DEPTH: usize = 64;
+
 fn is_potential_torrent(path: &Path) -> bool {
     let name = path
         .file_name()
@@ -84,9 +86,15 @@ fn is_potential_torrent(path: &Path) -> bool {
     }
     if let Ok(mut file) = std::fs::File::open(path) {
         use std::io::Read;
+        let Ok(meta) = file.metadata() else {
+            return false;
+        };
+        if meta.len() == 0 || meta.len() > synapse_meta::MAX_TORRENT_FILE_BYTES as u64 {
+            return false;
+        }
         let mut magic = [0u8; 16];
         if let Ok(n) = file.read(&mut magic) {
-            if n > 0 && magic[0] == b'd' {
+            if n >= 2 && magic[0] == b'd' && magic[1].is_ascii_digit() {
                 return true;
             }
         }
@@ -98,25 +106,40 @@ fn is_potential_torrent(path: &Path) -> bool {
 pub fn collect_torrent_files(paths: &[PathBuf]) -> Vec<PathBuf> {
     let mut files = Vec::new();
     for path in paths {
-        if path.is_file() {
+        let Ok(meta) = std::fs::symlink_metadata(path) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() {
+            continue;
+        }
+        if meta.is_file() {
             if is_potential_torrent(path) || paths.len() == 1 {
                 files.push(path.clone());
             }
-        } else if path.is_dir() {
-            collect_recursive(path, &mut files);
+        } else if meta.is_dir() {
+            collect_recursive(path, 0, &mut files);
         }
     }
     files.sort();
     files
 }
 
-fn collect_recursive(dir: &Path, files: &mut Vec<PathBuf>) {
+fn collect_recursive(dir: &Path, depth: usize, files: &mut Vec<PathBuf>) {
+    if depth >= MAX_RECURSIVE_DEPTH {
+        return;
+    }
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
+            let Ok(ft) = entry.file_type() else {
+                continue;
+            };
+            if ft.is_symlink() {
+                continue;
+            }
             let path = entry.path();
-            if path.is_dir() {
-                collect_recursive(&path, files);
-            } else if path.is_file() && is_potential_torrent(&path) {
+            if ft.is_dir() {
+                collect_recursive(&path, depth + 1, files);
+            } else if ft.is_file() && is_potential_torrent(&path) {
                 files.push(path);
             }
         }
@@ -157,38 +180,65 @@ fn format_utc(seconds: i64) -> String {
     )
 }
 
+fn invalid_diagnostic(file_path: &Path, errors: Vec<String>) -> TorrentDiagnostic {
+    TorrentDiagnostic {
+        file_path: file_path.to_path_buf(),
+        name: file_path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string(),
+        info_hash_hex: String::new(),
+        format_type: TorrentFormatType::Invalid,
+        root_hash_v1_hex: None,
+        is_signed: false,
+        signatures_count: 0,
+        is_valid: false,
+        piece_length: 0,
+        total_pieces: 0,
+        total_size_bytes: 0,
+        files_count: 0,
+        is_private: false,
+        trackers: Vec::new(),
+        web_seeds: Vec::new(),
+        creator: None,
+        creation_date: None,
+        comment: None,
+        warnings: Vec::new(),
+        errors,
+    }
+}
+
 pub fn inspect_torrent_file(file_path: &Path) -> TorrentDiagnostic {
-    let raw_bytes = match std::fs::read(file_path) {
-        Ok(b) => b,
-        Err(e) => {
-            return TorrentDiagnostic {
-                file_path: file_path.to_path_buf(),
-                name: file_path
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_string(),
-                info_hash_hex: String::new(),
-                format_type: TorrentFormatType::Invalid,
-                root_hash_v1_hex: None,
-                is_signed: false,
-                signatures_count: 0,
-                is_valid: false,
-                piece_length: 0,
-                total_pieces: 0,
-                total_size_bytes: 0,
-                files_count: 0,
-                is_private: false,
-                trackers: Vec::new(),
-                web_seeds: Vec::new(),
-                creator: None,
-                creation_date: None,
-                comment: None,
-                warnings: Vec::new(),
-                errors: vec![format!("Failed to read file: {e}")],
-            };
-        }
+    use std::io::Read;
+
+    let file = match std::fs::File::open(file_path) {
+        Ok(f) => f,
+        Err(e) => return invalid_diagnostic(file_path, vec![format!("Failed to read file: {e}")]),
     };
+    let max_bytes = synapse_meta::MAX_TORRENT_FILE_BYTES as u64;
+    if let Ok(meta) = file.metadata() {
+        if meta.len() > max_bytes {
+            return invalid_diagnostic(
+                file_path,
+                vec![format!(
+                    "Torrent file exceeds maximum supported size ({max_bytes} bytes)"
+                )],
+            );
+        }
+    }
+    let mut raw_bytes = Vec::new();
+    if let Err(e) = file.take(max_bytes + 1).read_to_end(&mut raw_bytes) {
+        return invalid_diagnostic(file_path, vec![format!("Failed to read file: {e}")]);
+    }
+    if raw_bytes.len() > synapse_meta::MAX_TORRENT_FILE_BYTES {
+        return invalid_diagnostic(
+            file_path,
+            vec![format!(
+                "Torrent file exceeds maximum supported size ({max_bytes} bytes)"
+            )],
+        );
+    }
 
     inspect_torrent_bytes(file_path, &raw_bytes)
 }
@@ -281,6 +331,14 @@ pub fn inspect_torrent_bytes(file_path: &Path, bytes: &[u8]) -> TorrentDiagnosti
         })
         .is_some();
 
+    let has_v1_pieces = root_dict
+        .get(b"info".as_slice())
+        .and_then(|i| match i {
+            BEncode::Dict(d) => d.get(b"pieces".as_slice()),
+            _ => None,
+        })
+        .is_some();
+
     let meta_version = root_dict
         .get(b"info".as_slice())
         .and_then(|i| match i {
@@ -344,7 +402,7 @@ pub fn inspect_torrent_bytes(file_path: &Path, bytes: &[u8]) -> TorrentDiagnosti
     let payload_files: Vec<_> = info
         .files
         .iter()
-        .filter(|f| !synapse_meta::is_padding_file(&f.path, None))
+        .filter(|f| !(f.is_padding || synapse_meta::is_padding_file(&f.path, None)))
         .collect();
     let total_size_bytes: u64 = payload_files.iter().map(|f| f.length).sum();
     let files_count = payload_files.len();
@@ -352,9 +410,9 @@ pub fn inspect_torrent_bytes(file_path: &Path, bytes: &[u8]) -> TorrentDiagnosti
 
     let format_type = if info.is_merkle_v1() {
         TorrentFormatType::BitTorrentV1Merkle
-    } else if has_file_tree && total_pieces > 0 {
+    } else if info.is_hybrid() || (has_file_tree && has_v1_pieces) {
         TorrentFormatType::HybridV1V2
-    } else if has_file_tree || meta_version == Some(2) {
+    } else if info.is_v2() || has_file_tree || meta_version == Some(2) {
         TorrentFormatType::BitTorrentV2
     } else if files_count > 1 || (files_count == 1 && info.files[0].path != Path::new(&info.name)) {
         TorrentFormatType::BitTorrentV1MultiFile
@@ -617,5 +675,74 @@ mod tests {
         assert_eq!(format_utc(0), "1970-01-01 00:00:00 UTC");
         assert_eq!(format_utc(1_700_000_000), "2023-11-14 22:13:20 UTC");
         assert_eq!(format_utc(951_782_400), "2000-02-29 00:00:00 UTC");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_loop_does_not_hang_collect_torrent_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let real_torrent = dir.path().join("valid.torrent");
+        std::fs::write(&real_torrent, make_valid_torrent_bytes()).unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::os::unix::fs::symlink(dir.path(), sub.join("loop")).unwrap();
+
+        let collected = collect_torrent_files(&[dir.path().to_path_buf()]);
+        assert_eq!(collected, vec![real_torrent]);
+    }
+
+    #[test]
+    fn oversized_non_torrent_d_file_is_ignored_and_rejected() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let big = dir.path().join("huge.dat");
+        let mut f = std::fs::File::create(&big).unwrap();
+        f.write_all(b"d4:test").unwrap();
+        f.set_len(synapse_meta::MAX_TORRENT_FILE_BYTES as u64 + 1024)
+            .unwrap();
+        drop(f);
+
+        assert!(!is_potential_torrent(&big));
+        assert!(collect_torrent_files(&[dir.path().to_path_buf()]).is_empty());
+
+        let diag = inspect_torrent_file(&big);
+        assert!(!diag.is_valid);
+        assert!(diag
+            .errors
+            .iter()
+            .any(|e| e.contains("maximum supported size")));
+    }
+
+    #[test]
+    fn pure_v2_and_hybrid_torrents_are_classified_distinctly() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_file = dir.path().join("payload.bin");
+        std::fs::write(&data_file, vec![0x42u8; 32 * 1024]).unwrap();
+
+        let v2_opts = synapse_meta::create::CreateOptions {
+            piece_length: Some(16_384),
+            version: synapse_meta::create::TorrentVersion::V2,
+            ..Default::default()
+        };
+        let v2_bytes =
+            synapse_meta::create::create_torrent(&data_file, &v2_opts, |_, _| {}).unwrap();
+        let v2_diag = inspect_torrent_bytes(Path::new("pure-v2.torrent"), &v2_bytes);
+        assert!(v2_diag.is_valid, "v2 errors: {:?}", v2_diag.errors);
+        assert_eq!(v2_diag.format_type, TorrentFormatType::BitTorrentV2);
+
+        let hybrid_opts = synapse_meta::create::CreateOptions {
+            piece_length: Some(16_384),
+            version: synapse_meta::create::TorrentVersion::Hybrid,
+            ..Default::default()
+        };
+        let hybrid_bytes =
+            synapse_meta::create::create_torrent(&data_file, &hybrid_opts, |_, _| {}).unwrap();
+        let hybrid_diag = inspect_torrent_bytes(Path::new("hybrid.torrent"), &hybrid_bytes);
+        assert!(
+            hybrid_diag.is_valid,
+            "hybrid errors: {:?}",
+            hybrid_diag.errors
+        );
+        assert_eq!(hybrid_diag.format_type, TorrentFormatType::HybridV1V2);
     }
 }

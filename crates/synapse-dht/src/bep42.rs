@@ -43,12 +43,19 @@ pub fn verify_secure_node_id(node_id: &[u8; 20], ip: IpAddr) -> bool {
         && (node_id[2] & 0xf8) == expected_b2_masked
 }
 
+fn canonical_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(ip),
+        v4 => v4,
+    }
+}
+
 /// CRC32c of the masked IP with `r` (3 bits) folded into the top bits, exactly as BEP 42
 /// specifies: `crc32c((ip & mask) | (r << 29))` for IPv4 (big-endian 4 bytes) and
 /// `crc32c((ip[..8] & mask) | (r << 61))` for IPv6 (big-endian 8 bytes).
 fn compute_ip_crc(ip: IpAddr, r: u8) -> u32 {
     let r = u32::from(r & 7);
-    match ip {
+    match canonical_ip(ip) {
         IpAddr::V4(v4) => {
             let masked = (u32::from_be_bytes(v4.octets()) & V4_MASK) | (r << 29);
             crc32c_hash(&masked.to_be_bytes())
@@ -65,7 +72,7 @@ fn compute_ip_crc(ip: IpAddr, r: u8) -> u32 {
 /// link-local addresses cannot be forged from the outside, and LAN swarms would otherwise
 /// be unusable.
 pub fn is_exempt_from_node_id_check(ip: IpAddr) -> bool {
-    match ip {
+    match canonical_ip(ip) {
         IpAddr::V4(v4) => v4.is_private() || v4.is_loopback() || v4.is_link_local(),
         IpAddr::V6(v6) => {
             v6.is_loopback()
@@ -158,6 +165,8 @@ mod tests {
             "172.16.5.5",
             "127.0.0.1",
             "169.254.1.1",
+            "::ffff:192.168.0.9",
+            "::ffff:127.0.0.1",
             "::1",
             "fd00::1",
             "fe80::2",
@@ -167,12 +176,16 @@ mod tests {
                 "{local}"
             );
         }
-        for public in ["8.8.8.8", "124.31.75.21", "2001:4860::1"] {
+        for public in ["8.8.8.8", "::ffff:8.8.8.8", "124.31.75.21", "2001:4860::1"] {
             assert!(
                 !is_exempt_from_node_id_check(public.parse().unwrap()),
                 "{public}"
             );
         }
+        let mapped_ip: IpAddr = "::ffff:124.31.75.21".parse().unwrap();
+        let v4_ip: IpAddr = "124.31.75.21".parse().unwrap();
+        let id = generate_secure_node_id(v4_ip, 42);
+        assert!(verify_secure_node_id(&id, mapped_ip));
     }
 
     #[test]

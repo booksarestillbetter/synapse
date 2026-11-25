@@ -11,6 +11,9 @@ pub struct PrometheusSnapshot {
     pub downloading_torrents: usize,
     pub seeding_torrents: usize,
     pub paused_torrents: usize,
+    pub queued_torrents: usize,
+    pub checking_torrents: usize,
+    pub error_torrents: usize,
     pub bytes_downloaded: u64,
     pub bytes_uploaded: u64,
     pub download_rate: u64,
@@ -28,6 +31,11 @@ pub struct PrometheusSnapshot {
     pub disk_write_queue_bytes: usize,
     pub utp_packet_loss_total: u64,
     pub dht_dos_blocks_total: u64,
+    pub event_bus_lag_total: u64,
+    pub auth_failures_total: u64,
+    pub free_disk_space_bytes: u64,
+    pub session_flush_duration_ms: u64,
+    pub rpc_sync_duration_ms: u64,
 }
 
 pub fn render_prometheus_metrics(snapshot: &PrometheusSnapshot) -> String {
@@ -61,6 +69,24 @@ pub fn render_prometheus_metrics(snapshot: &PrometheusSnapshot) -> String {
         out,
         "synapse_torrents_total{{state=\"paused\"}} {}",
         snapshot.paused_torrents
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "synapse_torrents_total{{state=\"queued\"}} {}",
+        snapshot.queued_torrents
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "synapse_torrents_total{{state=\"checking\"}} {}",
+        snapshot.checking_torrents
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "synapse_torrents_total{{state=\"error\"}} {}",
+        snapshot.error_torrents
     )
     .unwrap();
 
@@ -294,6 +320,71 @@ pub fn render_prometheus_metrics(snapshot: &PrometheusSnapshot) -> String {
     )
     .unwrap();
 
+    writeln!(
+        out,
+        "# HELP synapse_event_bus_lag_total Total lagged broadcast events missed by stream subscribers"
+    )
+    .unwrap();
+    writeln!(out, "# TYPE synapse_event_bus_lag_total counter").unwrap();
+    writeln!(
+        out,
+        "synapse_event_bus_lag_total {}",
+        snapshot.event_bus_lag_total
+    )
+    .unwrap();
+
+    writeln!(
+        out,
+        "# HELP synapse_auth_failures_total Total failed HTTP and gRPC authentication attempts"
+    )
+    .unwrap();
+    writeln!(out, "# TYPE synapse_auth_failures_total counter").unwrap();
+    writeln!(
+        out,
+        "synapse_auth_failures_total {}",
+        snapshot.auth_failures_total
+    )
+    .unwrap();
+
+    writeln!(
+        out,
+        "# HELP synapse_free_disk_space_bytes Available disk space in bytes on download volume"
+    )
+    .unwrap();
+    writeln!(out, "# TYPE synapse_free_disk_space_bytes gauge").unwrap();
+    writeln!(
+        out,
+        "synapse_free_disk_space_bytes {}",
+        snapshot.free_disk_space_bytes
+    )
+    .unwrap();
+
+    writeln!(
+        out,
+        "# HELP synapse_session_flush_duration_ms Duration of the most recent session store flush in milliseconds"
+    )
+    .unwrap();
+    writeln!(out, "# TYPE synapse_session_flush_duration_ms gauge").unwrap();
+    writeln!(
+        out,
+        "synapse_session_flush_duration_ms {}",
+        snapshot.session_flush_duration_ms
+    )
+    .unwrap();
+
+    writeln!(
+        out,
+        "# HELP synapse_rpc_sync_duration_ms Duration of the most recent RPC state sync pass in milliseconds"
+    )
+    .unwrap();
+    writeln!(out, "# TYPE synapse_rpc_sync_duration_ms gauge").unwrap();
+    writeln!(
+        out,
+        "synapse_rpc_sync_duration_ms {}",
+        snapshot.rpc_sync_duration_ms
+    )
+    .unwrap();
+
     out
 }
 
@@ -308,6 +399,9 @@ mod tests {
             downloading_torrents: 10,
             seeding_torrents: 30,
             paused_torrents: 2,
+            queued_torrents: 3,
+            checking_torrents: 1,
+            error_torrents: 4,
             bytes_downloaded: 1073741824,
             bytes_uploaded: 2147483648,
             download_rate: 10485760,
@@ -325,10 +419,18 @@ mod tests {
             disk_write_queue_bytes: 65536,
             utp_packet_loss_total: 8,
             dht_dos_blocks_total: 19,
+            event_bus_lag_total: 7,
+            auth_failures_total: 11,
+            free_disk_space_bytes: 987_654_321,
+            session_flush_duration_ms: 14,
+            rpc_sync_duration_ms: 3,
         };
 
         let rendered = render_prometheus_metrics(&snapshot);
         assert!(rendered.contains("synapse_torrents_total{state=\"total\"} 42"));
+        assert!(rendered.contains("synapse_torrents_total{state=\"queued\"} 3"));
+        assert!(rendered.contains("synapse_torrents_total{state=\"checking\"} 1"));
+        assert!(rendered.contains("synapse_torrents_total{state=\"error\"} 4"));
         assert!(rendered.contains("synapse_bytes_downloaded_total 1073741824"));
         assert!(rendered.contains("synapse_download_rate_bytes 10485760"));
         assert!(rendered.contains("synapse_dht_nodes_total 384"));
@@ -346,5 +448,10 @@ mod tests {
         assert!(rendered.contains("synapse_utp_packet_loss_total 8"));
         assert!(rendered.contains("synapse_utp_packets_lost_total 8"));
         assert!(rendered.contains("synapse_dht_dos_blocked_total 19"));
+        assert!(rendered.contains("synapse_event_bus_lag_total 7"));
+        assert!(rendered.contains("synapse_auth_failures_total 11"));
+        assert!(rendered.contains("synapse_free_disk_space_bytes 987654321"));
+        assert!(rendered.contains("synapse_session_flush_duration_ms 14"));
+        assert!(rendered.contains("synapse_rpc_sync_duration_ms 3"));
     }
 }

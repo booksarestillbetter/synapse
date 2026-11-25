@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::Hash;
 use std::time::{Duration, Instant};
 
@@ -50,7 +50,7 @@ pub struct Choker<Id> {
     optimistic_peer: Option<Id>,
     rotation_index: usize,
     seed_algorithm: SeedChokingAlgorithm,
-    round_robin_offset: usize,
+    round_robin_queue: VecDeque<Id>,
 }
 
 impl<Id: Copy + Eq + Hash> Choker<Id> {
@@ -62,7 +62,7 @@ impl<Id: Copy + Eq + Hash> Choker<Id> {
             optimistic_peer: None,
             rotation_index: 0,
             seed_algorithm: SeedChokingAlgorithm::RoundRobin,
-            round_robin_offset: 0,
+            round_robin_queue: VecDeque::new(),
         }
     }
 
@@ -109,14 +109,29 @@ impl<Id: Copy + Eq + Hash> Choker<Id> {
                     });
                 }
                 SeedChokingAlgorithm::RoundRobin => {
-                    if rotate && !interested.is_empty() {
-                        self.round_robin_offset = (self.round_robin_offset
-                            + self.regular_unchokes.max(1))
-                            % interested.len();
+                    let interested_set: HashSet<Id> = interested.iter().map(|p| p.id).collect();
+                    self.round_robin_queue
+                        .retain(|id| interested_set.contains(id));
+                    for p in &interested {
+                        if !self.round_robin_queue.contains(&p.id) {
+                            self.round_robin_queue.push_back(p.id);
+                        }
+                    }
+                    if rotate && !self.round_robin_queue.is_empty() {
+                        let step = self
+                            .regular_unchokes
+                            .max(1)
+                            .min(self.round_robin_queue.len());
+                        self.round_robin_queue.rotate_left(step);
                     }
                     if !interested.is_empty() {
-                        let offset = self.round_robin_offset % interested.len();
-                        interested.rotate_left(offset);
+                        let by_id: HashMap<Id, &PeerStats<Id>> =
+                            interested.iter().map(|p| (p.id, *p)).collect();
+                        interested = self
+                            .round_robin_queue
+                            .iter()
+                            .filter_map(|id| by_id.get(id).copied())
+                            .collect();
                     }
                 }
             }
@@ -137,8 +152,12 @@ impl<Id: Copy + Eq + Hash> Choker<Id> {
             .filter(|id| !unchoke.contains(id))
             .collect();
 
-        let still_present = |id: Id| peers.iter().any(|p| p.id == id && p.interested);
-        if rotate || self.optimistic_peer.is_none_or(|id| !still_present(id)) {
+        // Optimistic peer must be in `remaining`; if it disconnected or was promoted into regular
+        // unchokes, immediately promote another peer into the optimistic slot.
+        let opt_still_eligible = self
+            .optimistic_peer
+            .is_some_and(|id| remaining.contains(&id));
+        if rotate || !opt_still_eligible {
             let candidate = if remaining.is_empty() {
                 None
             } else {
@@ -213,36 +232,41 @@ impl SessionChoker {
         let total_slots = self.effective_slots(upload_rate_limit);
         let mut result = HashMap::new();
 
-        let active_demands: Vec<&SwarmChokerDemand<SwarmId>> =
-            demands.iter().filter(|d| d.interested_peers > 0).collect();
-
-        if active_demands.is_empty() {
-            return result;
-        }
-
-        // Weight = priority (1..=7) * (if is_seeding { 1 } else { 2 })
-        // Leeching swarms receive 2x weight to incentivize reciprocal download rates.
-        let weights: Vec<u32> = active_demands
+        let mut active_demands: Vec<(usize, &SwarmChokerDemand<SwarmId>, u32)> = demands
             .iter()
-            .map(|d| {
-                let p = (d.priority.clamp(1, 7)) as u32;
-                if d.is_seeding {
-                    p
-                } else {
-                    p * 2
-                }
+            .filter(|d| d.interested_peers > 0)
+            .enumerate()
+            .map(|(i, d)| {
+                let p = d.priority.clamp(1, 7) as u32;
+                let w = if d.is_seeding { p } else { p * 2 };
+                (i, d, w)
             })
             .collect();
 
-        let total_weight: u32 = weights.iter().sum();
+        if active_demands.is_empty() || total_slots == 0 {
+            return result;
+        }
+
+        if active_demands.len() >= total_slots {
+            active_demands.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+            for &(_, d, _) in active_demands.iter().take(total_slots) {
+                result.insert(d.swarm_id, 1);
+            }
+            return result;
+        }
+
+        let total_weight: u64 = active_demands.iter().map(|x| x.2 as u64).sum();
         if total_weight == 0 {
             return result;
         }
 
-        let mut allocated_total = 0;
-        for (i, d) in active_demands.iter().enumerate() {
-            let share = ((total_slots as u32 * weights[i]) / total_weight) as usize;
-            let slots = share.max(1).min(d.interested_peers);
+        let mut allocated_total = 0usize;
+        for &(_, d, w) in &active_demands {
+            let share = ((total_slots as u64 * w as u64) / total_weight) as usize;
+            let slots = share
+                .max(1)
+                .min(d.interested_peers)
+                .min(total_slots.saturating_sub(allocated_total));
             allocated_total += slots;
             result.insert(d.swarm_id, slots);
         }
@@ -250,11 +274,9 @@ impl SessionChoker {
         // If spare slots remain, distribute to highest-weight swarms that have unallocated interested peers
         if allocated_total < total_slots {
             let mut remaining = total_slots - allocated_total;
-            let mut indexed_demands: Vec<(usize, &SwarmChokerDemand<SwarmId>)> =
-                active_demands.iter().copied().enumerate().collect();
-            indexed_demands.sort_by_key(|&(idx, _)| std::cmp::Reverse(weights[idx]));
+            active_demands.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
 
-            for (_, d) in indexed_demands {
+            for &(_, d, _) in &active_demands {
                 if remaining == 0 {
                     break;
                 }
@@ -447,5 +469,64 @@ mod tests {
             "High priority leecher should receive more slots than low priority seeder"
         );
         assert_eq!(s1 + s2, 8, "All 8 slots should be allocated");
+    }
+
+    #[test]
+    fn optimistic_promotion_allocates_new_optimistic_slot_and_round_robin_survives_disconnect() {
+        let mut choker: Choker<u32> = Choker::new(1, Duration::from_secs(600));
+        let peers = vec![
+            peer(1, 100, 0, true),
+            peer(2, 10, 0, true),
+            peer(3, 5, 0, true),
+        ];
+        let d1 = choker.rechoke(&peers, false);
+        assert_eq!(d1.unchoke.len(), 2);
+        let opt = *d1.unchoke.iter().find(|&&id| id != 1).unwrap();
+
+        // Promote optimistic peer `opt` to fastest download rate; optimistic slot must move to another peer.
+        let promoted = vec![
+            peer(1, 100, 0, true),
+            peer(opt, 500, 0, true),
+            peer(if opt == 2 { 3 } else { 2 }, 5, 0, true),
+        ];
+        let d2 = choker.rechoke(&promoted, false);
+        assert_eq!(d2.unchoke.len(), 2);
+        assert!(d2.unchoke.contains(&opt));
+
+        // Round-robin preserves order across peer disconnect without resetting window.
+        let mut rr: Choker<u32> = Choker::new(2, Duration::from_secs(600));
+        rr.set_seed_algorithm(SeedChokingAlgorithm::RoundRobin);
+        let p4 = vec![
+            peer(1, 0, 0, true),
+            peer(2, 0, 0, true),
+            peer(3, 0, 0, true),
+            peer(4, 0, 0, true),
+        ];
+        let r1 = rr.rechoke(&p4, true);
+        assert!(r1.unchoke.contains(&1) && r1.unchoke.contains(&2));
+        // Disconnect peer 2 with reversed HashMap iteration order: peer 1 keeps its slot!
+        let p3_shuffled = vec![
+            peer(4, 0, 0, true),
+            peer(3, 0, 0, true),
+            peer(1, 0, 0, true),
+        ];
+        let r2 = rr.rechoke(&p3_shuffled, true);
+        assert!(r2.unchoke.contains(&1));
+    }
+
+    #[test]
+    fn session_choker_never_exceeds_total_slots_when_swarms_outnumber_slots() {
+        let session = SessionChoker::new(4, 16384);
+        let demands: Vec<_> = (1..=10)
+            .map(|i| SwarmChokerDemand {
+                swarm_id: i as u32,
+                priority: ((i % 7) + 1) as u8,
+                is_seeding: i % 2 == 0,
+                interested_peers: 5,
+            })
+            .collect();
+        let alloc = session.allocate_slots(&demands, 0);
+        let sum: usize = alloc.values().sum();
+        assert_eq!(sum, 4);
     }
 }

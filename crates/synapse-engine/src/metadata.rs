@@ -7,12 +7,13 @@
 use bytes::{Bytes, BytesMut};
 use sha1::{Digest, Sha1};
 use sha2::Sha256;
+use std::time::{Duration, Instant};
 use synapse_meta::Info;
 use synapse_wire::UT_METADATA_PIECE_LEN;
 
-/// Largest metadata (info dictionary) we will assemble from peers. Matches libtorrent's
-/// `max_metadata_size`; a peer declaring more is ignored rather than trusted.
-pub const MAX_METADATA_SIZE: u32 = 30 * 1024 * 1024;
+/// Largest metadata (info dictionary) we will assemble from peers. Matches
+/// `synapse_meta::MAX_TORRENT_FILE_BYTES`; a peer declaring more is ignored.
+pub const MAX_METADATA_SIZE: u32 = synapse_meta::MAX_TORRENT_FILE_BYTES as u32;
 
 #[derive(Debug, Clone)]
 pub struct MetadataFetcher {
@@ -24,6 +25,7 @@ pub struct MetadataFetcher {
     pub pieces: Vec<Option<Bytes>>,
     pub pieces_received: usize,
     pub total_pieces: usize,
+    pub started_at: Option<Instant>,
 }
 
 impl MetadataFetcher {
@@ -35,6 +37,7 @@ impl MetadataFetcher {
             pieces: Vec::new(),
             pieces_received: 0,
             total_pieces: 0,
+            started_at: None,
         }
     }
 
@@ -55,6 +58,7 @@ impl MetadataFetcher {
             let num_pieces = (size as usize).div_ceil(UT_METADATA_PIECE_LEN);
             self.total_pieces = num_pieces;
             self.pieces = vec![None; num_pieces];
+            self.started_at = Some(Instant::now());
         }
         self.total_size.is_some()
     }
@@ -66,6 +70,21 @@ impl MetadataFetcher {
         self.pieces = Vec::new();
         self.pieces_received = 0;
         self.total_pieces = 0;
+        self.started_at = None;
+    }
+
+    /// Resets the in-progress metadata fetch if it has remained incomplete without recent
+    /// piece progress for at least `timeout`.
+    pub fn reset_if_stalled(&mut self, timeout: Duration) -> bool {
+        if self.total_size.is_some()
+            && !self.is_complete()
+            && self.started_at.is_some_and(|t| t.elapsed() >= timeout)
+        {
+            self.reset();
+            true
+        } else {
+            false
+        }
     }
 
     pub fn is_complete(&self) -> bool {
@@ -98,9 +117,13 @@ impl MetadataFetcher {
         }
         if self.total_size.is_none() {
             self.set_metadata_size(total_size);
-        } else if self.total_size != Some(total_size) && self.pieces_received == 0 {
-            self.reset();
-            self.set_metadata_size(total_size);
+        } else if self.total_size != Some(total_size) {
+            if self.pieces_received == 0 {
+                self.reset();
+                self.set_metadata_size(total_size);
+            } else {
+                return Err("mismatched metadata total_size");
+            }
         }
         self.add_piece(piece_idx, data)
     }
@@ -128,6 +151,7 @@ impl MetadataFetcher {
         if self.pieces[idx].is_none() {
             self.pieces[idx] = Some(data);
             self.pieces_received += 1;
+            self.started_at = Some(Instant::now());
         }
 
         if self.is_complete() {
@@ -309,5 +333,37 @@ mod tests {
             .expect("honest peer metadata should resolve");
         assert_eq!(info.name, "honest.iso");
         assert_eq!(info.hash, info_hash);
+    }
+
+    #[test]
+    fn mismatched_total_size_errors_once_pieces_received_and_stall_resets() {
+        let mut fetcher = MetadataFetcher::new([0x33; 20]);
+        assert!(fetcher.set_metadata_size(UT_METADATA_PIECE_LEN as u32 + 128));
+        assert!(fetcher
+            .add_piece(0, Bytes::from(vec![0x11; UT_METADATA_PIECE_LEN]))
+            .unwrap()
+            .is_none());
+        assert_eq!(fetcher.pieces_received, 1);
+
+        // Once valid pieces have been received, a conflicting total_size must be rejected cleanly.
+        assert!(fetcher
+            .add_piece_with_total_size(
+                1,
+                UT_METADATA_PIECE_LEN as u32 + 256,
+                Bytes::from(vec![0x22; 256]),
+            )
+            .is_err());
+        assert_eq!(fetcher.pieces_received, 1);
+        assert_eq!(fetcher.total_size, Some(UT_METADATA_PIECE_LEN as u32 + 128));
+
+        // Before the timeout expires, reset_if_stalled returns false.
+        assert!(!fetcher.reset_if_stalled(Duration::from_secs(30)));
+
+        // Force stall age past timeout and verify clean reset.
+        fetcher.started_at = Some(Instant::now() - Duration::from_secs(31));
+        assert!(fetcher.reset_if_stalled(Duration::from_secs(30)));
+        assert_eq!(fetcher.total_size, None);
+        assert_eq!(fetcher.pieces_received, 0);
+        assert_eq!(fetcher.started_at, None);
     }
 }

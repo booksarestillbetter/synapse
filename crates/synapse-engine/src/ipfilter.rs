@@ -3,6 +3,7 @@
 //! Evaluates incoming and outgoing peer IP addresses against CIDR ranges
 //! and `ipfilter.dat` blocklists to drop malicious or unwanted peers.
 
+use std::io::BufRead;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::Path;
 use std::str::FromStr;
@@ -18,18 +19,16 @@ fn parse_v4(s: &str) -> Option<Ipv4Addr> {
     parts.next().is_none().then(|| Ipv4Addr::from(octets))
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Ipv4Range {
     pub start: u32,
     pub end: u32,
-    pub description: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Ipv6Range {
     pub start: u128,
     pub end: u128,
-    pub description: String,
 }
 
 #[derive(Debug, Default)]
@@ -48,14 +47,13 @@ impl IpFilter {
     }
 
     /// Adds an IPv4 range (inclusive) to the blocklist.
-    pub fn add_v4_range(&mut self, start: Ipv4Addr, end: Ipv4Addr, description: &str) {
+    pub fn add_v4_range(&mut self, start: Ipv4Addr, end: Ipv4Addr, _description: &str) {
         let start_u32 = u32::from(start);
         let end_u32 = u32::from(end);
         self.normalized = false;
         self.v4_ranges.push(Ipv4Range {
             start: start_u32.min(end_u32),
             end: start_u32.max(end_u32),
-            description: description.to_string(),
         });
     }
 
@@ -73,22 +71,17 @@ impl IpFilter {
         let start = ip_u32 & mask;
         let end = start | !mask;
         self.normalized = false;
-        self.v4_ranges.push(Ipv4Range {
-            start,
-            end,
-            description: format!("{}/{}", ip, prefix),
-        });
+        self.v4_ranges.push(Ipv4Range { start, end });
     }
 
     /// Adds an IPv6 range (inclusive) to the blocklist.
-    pub fn add_v6_range(&mut self, start: Ipv6Addr, end: Ipv6Addr, description: &str) {
+    pub fn add_v6_range(&mut self, start: Ipv6Addr, end: Ipv6Addr, _description: &str) {
         let start_u128 = u128::from(start);
         let end_u128 = u128::from(end);
         self.normalized = false;
         self.v6_ranges.push(Ipv6Range {
             start: start_u128.min(end_u128),
             end: start_u128.max(end_u128),
-            description: description.to_string(),
         });
     }
 
@@ -106,11 +99,7 @@ impl IpFilter {
         let start = ip_u128 & mask;
         let end = start | !mask;
         self.normalized = false;
-        self.v6_ranges.push(Ipv6Range {
-            start,
-            end,
-            description: format!("{}/{}", ip, prefix),
-        });
+        self.v6_ranges.push(Ipv6Range { start, end });
     }
 
     /// Parses and adds a single CIDR string (`"192.168.1.0/24"` or `"fc00::/7"`).
@@ -124,10 +113,16 @@ impl IpFilter {
             .map_err(|_| format!("invalid CIDR '{cidr}': bad prefix"))?;
         match IpAddr::from_str(addr_str.trim()) {
             Ok(IpAddr::V4(ip)) => {
+                if prefix > 32 {
+                    return Err(format!("invalid IPv4 CIDR prefix '{prefix}' (max 32)"));
+                }
                 self.add_v4_cidr(ip, prefix);
                 Ok(())
             }
             Ok(IpAddr::V6(ip)) => {
+                if prefix > 128 {
+                    return Err(format!("invalid IPv6 CIDR prefix '{prefix}' (max 128)"));
+                }
                 self.add_v6_cidr(ip, prefix);
                 Ok(())
             }
@@ -137,8 +132,10 @@ impl IpFilter {
 
     /// Loads additional blocklist rules from an `ipfilter.dat`-style file. Two line
     /// formats are auto-detected per line:
-    ///   - eMule/PeerGuardian range format: `1.2.3.4 - 1.2.3.10 , description` (octets may be
-    ///     zero-padded, as real eMule files write them: `001.002.003.004`)
+    ///   - eMule/PeerGuardian range format: `1.2.3.4 - 1.2.3.10 , level , description`
+    ///     (or `1.2.3.4 - 1.2.3.10 , description`; octets may be zero-padded). Per the eMule
+    ///     `ipfilter.dat` convention, entries with `level >= 128` are allowlist entries and are
+    ///     skipped rather than blocked.
     ///   - Plain CIDR notation: `1.2.3.0/24` or `fc00::/7`
     ///
     /// Blank lines and lines starting with `#` or `;` are ignored. A malformed line is
@@ -146,26 +143,53 @@ impl IpFilter {
     /// line in a large third-party blocklist should never prevent the daemon starting.
     /// Returns the number of rules successfully loaded.
     pub fn load_file(&mut self, path: &Path) -> std::io::Result<usize> {
-        let contents = std::fs::read_to_string(path)?;
+        let file = std::fs::File::open(path)?;
+        let mut reader = std::io::BufReader::new(file);
+        let mut line_buf = String::new();
         let mut loaded = 0usize;
-        for (idx, raw_line) in contents.lines().enumerate() {
-            let line = raw_line.trim();
+        let mut line_num = 0usize;
+        loop {
+            line_buf.clear();
+            if reader.read_line(&mut line_buf)? == 0 {
+                break;
+            }
+            line_num += 1;
+            let line = line_buf.trim();
             if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
                 continue;
             }
 
-            if let Some((range_part, desc)) = line.split_once(',') {
+            if let Some((range_part, rest)) = line.split_once(',') {
                 if let Some((start_str, end_str)) = range_part.split_once('-') {
                     let (start_str, end_str) = (start_str.trim(), end_str.trim());
+                    // Standard eMule format is `start - end , level , description`: level >= 128
+                    // means allow/whitelist rather than block.
+                    let level_allowed = if let Some((lvl_str, _desc_part)) = rest.split_once(',') {
+                        lvl_str
+                            .trim()
+                            .parse::<u16>()
+                            .map(|level| level < 128)
+                            .unwrap_or(true)
+                    } else if let Ok(level) = rest.trim().parse::<u16>() {
+                        level < 128
+                    } else {
+                        true
+                    };
                     if let (Some(start), Some(end)) = (parse_v4(start_str), parse_v4(end_str)) {
-                        self.add_v4_range(start, end, desc.trim());
+                        if !level_allowed {
+                            continue;
+                        }
+                        self.add_v4_range(start, end, "");
                         loaded += 1;
                         continue;
                     }
                     if let (Ok(start), Ok(end)) =
                         (Ipv6Addr::from_str(start_str), Ipv6Addr::from_str(end_str))
                     {
-                        self.add_v6_range(start, end, desc.trim());
+                        if !level_allowed {
+                            continue;
+                        }
+                        self.add_v6_range(start, end, "");
                         loaded += 1;
                         continue;
                     }
@@ -178,7 +202,7 @@ impl IpFilter {
             }
 
             tracing::warn!(
-                line = idx + 1,
+                line = line_num,
                 path = %path.display(),
                 content = %line,
                 "Skipping unparseable ipfilter line"
@@ -188,40 +212,51 @@ impl IpFilter {
         Ok(loaded)
     }
 
-    /// Sorts and merges overlapping/adjacent ranges so lookups are O(log n). Public
+    /// Sorts and merges overlapping/adjacent ranges in-place so lookups are O(log n). Public
     /// blocklists have hundreds of thousands of ranges and every accept, dial and
     /// periodic re-check consults the filter, so a linear scan is not acceptable. Call
     /// after a batch of `add_*`/`load_file`; `is_blocked` stays correct without it, just slower.
     pub fn normalize(&mut self) {
-        self.v4_ranges.sort_by_key(|r| r.start);
-        let mut merged: Vec<Ipv4Range> = Vec::with_capacity(self.v4_ranges.len());
-        for r in self.v4_ranges.drain(..) {
-            match merged.last_mut() {
-                Some(last) if r.start <= last.end.saturating_add(1) => {
-                    last.end = last.end.max(r.end)
+        if self.v4_ranges.len() > 1 {
+            self.v4_ranges.sort_unstable_by_key(|r| r.start);
+            let mut write = 0usize;
+            for read in 1..self.v4_ranges.len() {
+                let r = self.v4_ranges[read];
+                if r.start <= self.v4_ranges[write].end.saturating_add(1) {
+                    self.v4_ranges[write].end = self.v4_ranges[write].end.max(r.end);
+                } else {
+                    write += 1;
+                    self.v4_ranges[write] = r;
                 }
-                _ => merged.push(r),
             }
+            self.v4_ranges.truncate(write + 1);
         }
-        self.v4_ranges = merged;
 
-        self.v6_ranges.sort_by_key(|r| r.start);
-        let mut merged6: Vec<Ipv6Range> = Vec::with_capacity(self.v6_ranges.len());
-        for r in self.v6_ranges.drain(..) {
-            match merged6.last_mut() {
-                Some(last) if r.start <= last.end.saturating_add(1) => {
-                    last.end = last.end.max(r.end)
+        if self.v6_ranges.len() > 1 {
+            self.v6_ranges.sort_unstable_by_key(|r| r.start);
+            let mut write = 0usize;
+            for read in 1..self.v6_ranges.len() {
+                let r = self.v6_ranges[read];
+                if r.start <= self.v6_ranges[write].end.saturating_add(1) {
+                    self.v6_ranges[write].end = self.v6_ranges[write].end.max(r.end);
+                } else {
+                    write += 1;
+                    self.v6_ranges[write] = r;
                 }
-                _ => merged6.push(r),
             }
+            self.v6_ranges.truncate(write + 1);
         }
-        self.v6_ranges = merged6;
         self.normalized = true;
     }
 
-    /// Checks if a given IP address is blocked.
+    /// Checks if a given IP address is blocked (canonicalizing IPv4-mapped IPv6 addresses
+    /// like `::ffff:1.2.3.4` to their IPv4 form).
     pub fn is_blocked(&self, addr: IpAddr) -> bool {
-        match addr {
+        let canonical = match addr {
+            IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(addr),
+            v4 => v4,
+        };
+        match canonical {
             IpAddr::V4(v4) => {
                 let val = u32::from(v4);
                 if self.normalized {
@@ -279,7 +314,9 @@ mod tests {
         assert!(filter.add_cidr_str("10.0.0.0/8").is_ok());
         assert!(filter.add_cidr_str("fc00::/7").is_ok());
         assert!(filter.add_cidr_str("not-a-cidr").is_err());
+        assert!(filter.add_cidr_str("10.0.0.0/33").is_err());
         assert!(filter.add_cidr_str("10.0.0.0/999").is_err());
+        assert!(filter.add_cidr_str("fc00::/129").is_err());
 
         assert!(filter.is_blocked(IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3))));
         assert!(filter.is_blocked("fc00::1".parse().unwrap()));
@@ -295,6 +332,8 @@ mod tests {
             &path,
             "001.002.003.000 - 001.002.003.255 , 000 , Example Range\n\
              010.000.000.001-010.000.000.009 , 100 , Compact\n\
+             198.051.100.001 - 198.051.100.050 , 128 , Allowed high level\n\
+             203.000.113.001 - 203.000.113.050 , 200 , Allowed level 200\n\
              1.2.3.256 - 1.2.3.300 , 000 , not an address\n",
         )
         .unwrap();
@@ -303,6 +342,8 @@ mod tests {
         assert!(filter.is_blocked("1.2.3.77".parse().unwrap()));
         assert!(filter.is_blocked("10.0.0.5".parse().unwrap()));
         assert!(!filter.is_blocked("10.0.0.10".parse().unwrap()));
+        assert!(!filter.is_blocked("198.51.100.10".parse().unwrap()));
+        assert!(!filter.is_blocked("203.0.113.10".parse().unwrap()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -372,5 +413,14 @@ mod tests {
         // Adding after normalizing stays correct (falls back to scanning until re-normalized).
         f.add_v4_cidr(Ipv4Addr::new(172, 16, 0, 0), 12);
         assert!(f.is_blocked("172.20.1.1".parse().unwrap()));
+        // IPv4-mapped IPv6 addresses match IPv4 rules too.
+        assert!(f.is_blocked("::ffff:172.20.1.1".parse().unwrap()));
+        assert!(!f.is_blocked("::ffff:8.8.8.8".parse().unwrap()));
+    }
+
+    #[test]
+    fn compact_range_sizes_without_heap_descriptions() {
+        assert_eq!(std::mem::size_of::<Ipv4Range>(), 8);
+        assert_eq!(std::mem::size_of::<Ipv6Range>(), 32);
     }
 }

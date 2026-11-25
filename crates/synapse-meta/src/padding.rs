@@ -16,11 +16,12 @@ pub fn is_padding_file(path: &Path, attr: Option<&str>) -> bool {
         }
     }
 
-    // Check path components
-    let path_str = path.to_string_lossy();
-    path_str.starts_with(".pad")
-        || path_str.contains("/.pad")
-        || path_str.contains("_____padding_file_")
+    path.components().any(|c| match c {
+        std::path::Component::Normal(s) => s
+            .to_str()
+            .is_some_and(|name| name == ".pad" || name.starts_with("_____padding_file_")),
+        _ => false,
+    })
 }
 
 /// Splits a list of torrent files into real payload files and padding files.
@@ -29,7 +30,7 @@ pub fn separate_padding_files(files: &[File]) -> (Vec<File>, Vec<File>) {
     let mut padding = Vec::new();
 
     for f in files {
-        if is_padding_file(&f.path, None) {
+        if f.is_padding || is_padding_file(&f.path, None) {
             padding.push(f.clone());
         } else {
             payload.push(f.clone());
@@ -54,6 +55,8 @@ mod tests {
         ));
         assert!(is_padding_file(Path::new("video/movie.mp4"), Some("p")));
         assert!(!is_padding_file(Path::new("video/movie.mp4"), None));
+        assert!(!is_padding_file(Path::new(".padlock"), None));
+        assert!(!is_padding_file(Path::new("video/.padded_file.bin"), None));
     }
 
     #[test]
@@ -62,14 +65,17 @@ mod tests {
             File {
                 path: PathBuf::from("video/movie.mp4"),
                 length: 1_000_000,
+                is_padding: false,
             },
             File {
                 path: PathBuf::from(".pad/24576"),
                 length: 24576,
+                is_padding: true,
             },
             File {
                 path: PathBuf::from("subs/movie.srt"),
                 length: 50_000,
+                is_padding: false,
             },
         ];
 

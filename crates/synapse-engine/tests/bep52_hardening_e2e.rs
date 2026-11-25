@@ -266,7 +266,7 @@ async fn a_layerless_v2_torrent_fetches_its_piece_layer_with_proofs_before_reque
 
     let mut f = connect(info.clone()).await;
     // Claim every piece and unchoke, so the only thing holding the leecher back is the layer.
-    let bitfield = vec![0xFFu8; pieces.div_ceil(8)];
+    let bitfield = synapse_picker::Bitfield::full(pieces).as_bytes().to_vec();
     f.send(Message::Bitfield(bitfield.into())).await.unwrap();
     f.send(Message::Unchoke).await.unwrap();
 

@@ -15,9 +15,9 @@
 //! properly to any incoming query, which is how routing tables across the network learn
 //! about it) and for direct queries to specific known nodes.
 
-use std::collections::HashMap;
-use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::{HashMap, HashSet};
+use std::net::{IpAddr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -26,6 +26,7 @@ use sha1::{Digest, Sha1};
 use synapse_wire::UdpTransport;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinSet;
 
 use crate::dos::{DosBlocker, ReplyQuota};
 use crate::ip_voter::IpVoter;
@@ -66,6 +67,10 @@ const MAX_PACKET_LEN: usize = 1500;
 /// told to wait before asking again.
 const MAX_SAMPLES_PER_REPLY: usize = 20;
 const SAMPLE_INTERVAL_SECS: i64 = 3600;
+const MAX_PENDING_QUERIES: usize = 2048;
+const MAX_REFRESH_PINGS_PER_TICK: usize = 16;
+const MAX_PEERS_PER_IPV4_HOST: usize = 2;
+const MAX_PEERS_PER_IPV4_SUBNET_24: usize = 16;
 
 /// Behaviour switches for a DHT node.
 #[derive(Debug, Clone, Copy, Default)]
@@ -97,7 +102,7 @@ struct AnnouncedPeer {
 }
 
 struct PendingQuery {
-    reply: oneshot::Sender<Result<Message, DhtError>>,
+    reply: Option<oneshot::Sender<Result<Message, DhtError>>>,
     sent_at: Instant,
     target_addr: SocketAddr,
     target_id: Option<NodeId>,
@@ -192,11 +197,15 @@ enum Command {
 
 #[derive(Clone)]
 pub struct DhtHandle {
-    /// Our node id. It can change once, after enough nodes agree on our external address, when
-    /// BEP 42 requires the id to be derived from it (see `ip_voter`).
+    /// Our IPv4 node id. It can change once, after enough IPv4 nodes agree on our external
+    /// IPv4 address under BEP 42.
     our_id: Arc<std::sync::RwLock<NodeId>>,
+    /// Our IPv6 node id (tracked separately for dual-stack BEP 42 so an IPv6 consensus vote
+    /// does not overwrite our IPv4 node id or vice versa).
+    our_id_v6: Arc<std::sync::RwLock<NodeId>>,
     cmd_tx: mpsc::Sender<Command>,
     dos_blocks: Arc<AtomicU64>,
+    node_count: Arc<AtomicUsize>,
     /// BEP 43 read-only switch, read by the node for every packet so it can be flipped live.
     read_only: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -236,21 +245,27 @@ pub fn spawn_with_transports(
 ) -> DhtHandle {
     let (cmd_tx, cmd_rx) = mpsc::channel(256);
     let dos_blocks = Arc::new(AtomicU64::new(0));
-    let id_cell = Arc::new(std::sync::RwLock::new(our_id));
+    let node_count = Arc::new(AtomicUsize::new(0));
+    let id_cell_v4 = Arc::new(std::sync::RwLock::new(our_id));
+    let id_cell_v6 = Arc::new(std::sync::RwLock::new(our_id));
     let read_only = Arc::new(std::sync::atomic::AtomicBool::new(options.read_only));
     tokio::spawn(run(
-        id_cell.clone(),
+        id_cell_v4.clone(),
+        id_cell_v6.clone(),
         v4.map(Arc::new),
         v6.map(Arc::new),
         cmd_rx,
         options,
         dos_blocks.clone(),
+        node_count.clone(),
         read_only.clone(),
     ));
     DhtHandle {
-        our_id: id_cell,
+        our_id: id_cell_v4,
+        our_id_v6: id_cell_v6,
         cmd_tx,
         dos_blocks,
+        node_count,
         read_only,
     }
 }
@@ -310,6 +325,10 @@ impl DhtHandle {
         *self.our_id.read().unwrap_or_else(|e| e.into_inner())
     }
 
+    pub fn our_id_v6(&self) -> NodeId {
+        *self.our_id_v6.read().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Our id and every routing-table node that has not gone bad, for persisting across
     /// restarts (see [`crate::state`]).
     pub async fn state(&self) -> Result<(NodeId, Vec<SocketAddr>), DhtError> {
@@ -323,6 +342,11 @@ impl DhtHandle {
 
     pub fn dos_blocks_total(&self) -> u64 {
         self.dos_blocks.load(Ordering::Relaxed)
+    }
+
+    /// Current routing-table node count (IPv4 + IPv6) maintained atomically in O(1).
+    pub fn node_count(&self) -> usize {
+        self.node_count.load(Ordering::Relaxed)
     }
 
     async fn query(
@@ -375,11 +399,23 @@ impl DhtHandle {
         target: NodeId,
         want: Option<Vec<String>>,
     ) -> Result<(Vec<NodeInfo>, Vec<NodeInfoV6>), DhtError> {
+        let (_sid, nodes, nodes6) = self.find_node_raw(addr.into(), None, target, want).await?;
+        Ok((nodes, nodes6))
+    }
+
+    async fn find_node_raw(
+        &self,
+        addr: SocketAddr,
+        node_id: Option<NodeId>,
+        target: NodeId,
+        want: Option<Vec<String>>,
+    ) -> Result<(Option<NodeId>, Vec<NodeInfo>, Vec<NodeInfoV6>), DhtError> {
         let msg = self
-            .query(addr, None, Query::FindNode { target, want })
+            .query(addr, node_id, Query::FindNode { target, want })
             .await?;
+        let sender_id = msg.sender_id;
         match msg.body {
-            Body::Response(Response::FindNode { nodes, nodes6 }) => Ok((nodes, nodes6)),
+            Body::Response(Response::FindNode { nodes, nodes6 }) => Ok((sender_id, nodes, nodes6)),
             Body::Response(_) => Err(DhtError::Malformed),
             Body::Error { message, .. } => Err(DhtError::Remote(message)),
             Body::Query(_) => Err(DhtError::Malformed),
@@ -400,11 +436,25 @@ impl DhtHandle {
         info_hash: [u8; 20],
         want: Option<Vec<String>>,
     ) -> Result<(Vec<u8>, GetPeersResult), DhtError> {
-        let msg = self
-            .query(addr, None, Query::GetPeers { info_hash, want })
+        let (_sid, token, result) = self
+            .get_peers_raw(addr.into(), None, info_hash, want)
             .await?;
+        Ok((token, result))
+    }
+
+    async fn get_peers_raw(
+        &self,
+        addr: SocketAddr,
+        node_id: Option<NodeId>,
+        info_hash: [u8; 20],
+        want: Option<Vec<String>>,
+    ) -> Result<(Option<NodeId>, Vec<u8>, GetPeersResult), DhtError> {
+        let msg = self
+            .query(addr, node_id, Query::GetPeers { info_hash, want })
+            .await?;
+        let sender_id = msg.sender_id;
         match msg.body {
-            Body::Response(Response::GetPeers { token, result }) => Ok((token, result)),
+            Body::Response(Response::GetPeers { token, result }) => Ok((sender_id, token, result)),
             Body::Response(_) => Err(DhtError::Malformed),
             Body::Error { message, .. } => Err(DhtError::Remote(message)),
             Body::Query(_) => Err(DhtError::Malformed),
@@ -418,7 +468,19 @@ impl DhtHandle {
         port: u16,
         token: Vec<u8>,
     ) -> Result<(), DhtError> {
-        self.announce_peer_impl(addr, info_hash, port, token, false)
+        self.announce_peer_impl(addr, info_hash, port, token, false, false)
+            .await
+    }
+
+    pub async fn announce_peer_seed(
+        &self,
+        addr: impl Into<SocketAddr>,
+        info_hash: [u8; 20],
+        port: u16,
+        token: Vec<u8>,
+        seed: bool,
+    ) -> Result<(), DhtError> {
+        self.announce_peer_impl(addr, info_hash, port, token, false, seed)
             .await
     }
 
@@ -428,7 +490,7 @@ impl DhtHandle {
         info_hash: [u8; 20],
         token: Vec<u8>,
     ) -> Result<(), DhtError> {
-        self.announce_peer_impl(addr, info_hash, 0, token, true)
+        self.announce_peer_impl(addr, info_hash, 0, token, true, false)
             .await
     }
 
@@ -439,6 +501,7 @@ impl DhtHandle {
         port: u16,
         token: Vec<u8>,
         implied_port: bool,
+        seed: bool,
     ) -> Result<(), DhtError> {
         let msg = self
             .query(
@@ -449,6 +512,7 @@ impl DhtHandle {
                     port,
                     token,
                     implied_port,
+                    seed,
                 },
             )
             .await?;
@@ -464,10 +528,23 @@ impl DhtHandle {
         target: [u8; 20],
         seq: Option<u64>,
     ) -> Result<(Vec<u8>, Option<GetItem>), DhtError> {
+        self.get_with_salt(addr, target, None, seq).await
+    }
+
+    /// BEP 44 `get` for mutable items derived with `salt` (or unsalted/immutable items when
+    /// `salt` is `None`), verifying any returned mutable item against both `(k, salt)` target
+    /// derivation and its Ed25519 signature over `(salt, seq, v)`.
+    pub async fn get_with_salt(
+        &self,
+        addr: impl Into<SocketAddr>,
+        target: [u8; 20],
+        salt: Option<&[u8]>,
+        seq: Option<u64>,
+    ) -> Result<(Vec<u8>, Option<GetItem>), DhtError> {
         let msg = self.query(addr, None, Query::Get { target, seq }).await?;
         match msg.body {
             Body::Response(Response::Get { token, item, .. }) => {
-                if !verify_get_item(target, seq, &item) {
+                if !verify_get_item(target, salt, seq, &item) {
                     return Err(DhtError::Malformed);
                 }
                 Ok((token, Some(item)))
@@ -576,82 +653,98 @@ impl DhtHandle {
         target: NodeId,
         bootstrap_nodes: &[SocketAddrV4],
     ) -> Result<Vec<NodeInfo>, DhtError> {
-        let mut candidates: Vec<NodeInfo> = Vec::new();
-        let mut seen_addrs = std::collections::HashSet::new();
-        let mut queried_addrs = std::collections::HashSet::new();
-
-        // 1. Seed from local routing table
-        let local_closest = self.closest_nodes(target, routing::K).await?;
-        for n in local_closest {
-            seen_addrs.insert(n.addr);
-            candidates.push(NodeInfo {
-                id: n.id,
-                addr: n.addr,
-            });
+        #[derive(Clone, Copy)]
+        struct Cand {
+            addr: SocketAddr,
+            id: Option<NodeId>,
         }
 
-        // 2. Add bootstrap nodes
-        for &addr in bootstrap_nodes {
+        const ALPHA: usize = 3;
+        const MAX_TOTAL_QUERIES: usize = 64;
+
+        let mut candidates: Vec<Cand> = Vec::new();
+        let mut seen_addrs: HashSet<SocketAddr> = HashSet::new();
+        let mut queried_addrs: HashSet<SocketAddr> = HashSet::new();
+        let mut responded: HashMap<SocketAddr, NodeInfo> = HashMap::new();
+
+        for n in self.closest_nodes(target, routing::K).await? {
+            let addr = SocketAddr::V4(n.addr);
             if seen_addrs.insert(addr) {
-                candidates.push(NodeInfo {
-                    id: [0u8; 20],
+                candidates.push(Cand {
                     addr,
+                    id: Some(n.id),
                 });
             }
         }
-
-        let alpha = 3;
-        let mut step = 0;
-        while step < 50 {
-            step += 1;
-            candidates.sort_by_key(|n| routing::xor_distance(&n.id, &target));
-
-            let unqueried: Vec<NodeInfo> = candidates
-                .iter()
-                .filter(|n| !queried_addrs.contains(&n.addr))
-                .take(alpha)
-                .cloned()
-                .collect();
-
-            if unqueried.is_empty() {
-                break;
-            }
-
-            let mut query_futs = Vec::new();
-            for cand in unqueried {
-                queried_addrs.insert(cand.addr);
-                let handle = self.clone();
-                query_futs.push(tokio::spawn(async move {
-                    handle.find_node(cand.addr, target).await
-                }));
-            }
-
-            let mut any_progress = false;
-            for fut in query_futs {
-                if let Ok(Ok(nodes)) = fut.await {
-                    for node in nodes {
-                        if seen_addrs.insert(node.addr) {
-                            candidates.push(node);
-                            any_progress = true;
-                        }
-                    }
-                }
-            }
-
-            if !any_progress
-                && candidates
-                    .iter()
-                    .filter(|n| !queried_addrs.contains(&n.addr))
-                    .count()
-                    == 0
-            {
-                break;
+        for &addr_v4 in bootstrap_nodes {
+            let addr = SocketAddr::V4(addr_v4);
+            if seen_addrs.insert(addr) {
+                candidates.push(Cand { addr, id: None });
             }
         }
 
-        candidates.sort_by_key(|n| routing::xor_distance(&n.id, &target));
-        candidates.truncate(routing::K);
-        Ok(candidates)
+        type FindNodeOutcome = Result<(Option<NodeId>, Vec<NodeInfo>, Vec<NodeInfoV6>), DhtError>;
+        let mut in_flight: JoinSet<(Cand, FindNodeOutcome)> = JoinSet::new();
+        let mut total_queries = 0usize;
+
+        loop {
+            candidates.sort_by_key(|c| match c.id {
+                None => (0u8, [0u8; 20]),
+                Some(id) => (1u8, routing::xor_distance(&id, &target)),
+            });
+
+            let mut sorted_resp: Vec<&NodeInfo> = responded.values().collect();
+            sorted_resp.sort_by_key(|n| routing::xor_distance(&n.id, &target));
+            let kth_dist = sorted_resp
+                .get(routing::K - 1)
+                .map(|n| routing::xor_distance(&n.id, &target));
+
+            while in_flight.len() < ALPHA && total_queries < MAX_TOTAL_QUERIES {
+                let next_pos = candidates.iter().position(|c| {
+                    if queried_addrs.contains(&c.addr) {
+                        return false;
+                    }
+                    match (c.id, kth_dist) {
+                        (Some(id), Some(kth)) => routing::xor_distance(&id, &target) < kth,
+                        _ => true,
+                    }
+                });
+                let Some(idx) = next_pos else {
+                    break;
+                };
+                let cand = candidates.remove(idx);
+                queried_addrs.insert(cand.addr);
+                total_queries += 1;
+                let handle = self.clone();
+                in_flight.spawn(async move {
+                    let res = handle.find_node_raw(cand.addr, cand.id, target, None).await;
+                    (cand, res)
+                });
+            }
+
+            let Some(joined) = in_flight.join_next().await else {
+                break;
+            };
+            if let Ok((cand, Ok((sender_id, nodes, _nodes6)))) = joined {
+                if let (SocketAddr::V4(v4), Some(id)) = (cand.addr, sender_id.or(cand.id)) {
+                    responded.insert(cand.addr, NodeInfo { id, addr: v4 });
+                }
+                for node in nodes {
+                    let addr = SocketAddr::V4(node.addr);
+                    if seen_addrs.insert(addr) {
+                        candidates.push(Cand {
+                            addr,
+                            id: Some(node.id),
+                        });
+                    }
+                }
+            }
+        }
+
+        let mut out: Vec<NodeInfo> = responded.into_values().collect();
+        out.sort_by_key(|n| routing::xor_distance(&n.id, &target));
+        out.truncate(routing::K);
+        Ok(out)
     }
 
     /// Recursively queries nodes across the DHT network for peers associated with `info_hash`.
@@ -660,113 +753,152 @@ impl DhtHandle {
         info_hash: [u8; 20],
         bootstrap_nodes: &[SocketAddrV4],
     ) -> Result<IterativePeersResult, DhtError> {
-        let target = info_hash;
-        let mut candidates: Vec<NodeInfo> = Vec::new();
-        let mut seen_addrs = std::collections::HashSet::new();
-        let mut queried_addrs = std::collections::HashSet::new();
-
-        let mut discovered_peers = std::collections::HashSet::new();
-        let mut discovered_peers6 = std::collections::HashSet::new();
-        let mut closest_nodes_with_tokens = Vec::new();
-
-        // 1. Seed from local routing table
-        let local_closest = self.closest_nodes(target, routing::K).await?;
-        for n in local_closest {
-            seen_addrs.insert(n.addr);
-            candidates.push(NodeInfo {
-                id: n.id,
-                addr: n.addr,
-            });
+        #[derive(Clone, Copy)]
+        struct Cand {
+            addr: SocketAddr,
+            id: Option<NodeId>,
         }
 
-        // 2. Add bootstrap nodes
-        for &addr in bootstrap_nodes {
+        const ALPHA: usize = 3;
+        const MAX_TOTAL_QUERIES: usize = 64;
+
+        let target = info_hash;
+        let mut candidates: Vec<Cand> = Vec::new();
+        let mut seen_addrs: HashSet<SocketAddr> = HashSet::new();
+        let mut queried_addrs: HashSet<SocketAddr> = HashSet::new();
+
+        let mut discovered_peers: HashSet<SocketAddrV4> = HashSet::new();
+        let mut discovered_peers6: HashSet<SocketAddrV6> = HashSet::new();
+        let mut closest_v4: HashMap<SocketAddrV4, (NodeInfo, Vec<u8>)> = HashMap::new();
+        let mut closest_v6: HashMap<SocketAddrV6, (NodeInfoV6, Vec<u8>)> = HashMap::new();
+        let mut all_responded_ids: HashMap<SocketAddr, NodeId> = HashMap::new();
+
+        for n in self.closest_nodes(target, routing::K).await? {
+            let addr = SocketAddr::V4(n.addr);
             if seen_addrs.insert(addr) {
-                candidates.push(NodeInfo {
-                    id: [0u8; 20],
+                candidates.push(Cand {
                     addr,
+                    id: Some(n.id),
                 });
             }
         }
-
-        let alpha = 3;
-        let mut step = 0;
-        while step < 50 {
-            step += 1;
-            candidates.sort_by_key(|n| routing::xor_distance(&n.id, &target));
-
-            let unqueried: Vec<NodeInfo> = candidates
-                .iter()
-                .filter(|n| !queried_addrs.contains(&n.addr))
-                .take(alpha)
-                .cloned()
-                .collect();
-
-            if unqueried.is_empty() {
-                break;
+        for n6 in self.closest_nodes_v6(target, routing::K).await? {
+            let addr = SocketAddr::V6(n6.addr);
+            if seen_addrs.insert(addr) {
+                candidates.push(Cand {
+                    addr,
+                    id: Some(n6.id),
+                });
             }
+        }
+        for &addr_v4 in bootstrap_nodes {
+            let addr = SocketAddr::V4(addr_v4);
+            if seen_addrs.insert(addr) {
+                candidates.push(Cand { addr, id: None });
+            }
+        }
 
-            let mut query_futs = Vec::new();
-            for cand in unqueried {
+        type GetPeersOutcome = Result<(Option<NodeId>, Vec<u8>, GetPeersResult), DhtError>;
+        let mut in_flight: JoinSet<(Cand, GetPeersOutcome)> = JoinSet::new();
+        let mut total_queries = 0usize;
+
+        loop {
+            candidates.sort_by_key(|c| match c.id {
+                None => (0u8, [0u8; 20]),
+                Some(id) => (1u8, routing::xor_distance(&id, &target)),
+            });
+
+            let mut sorted_ids: Vec<&NodeId> = all_responded_ids.values().collect();
+            sorted_ids.sort_by_key(|id| routing::xor_distance(id, &target));
+            let kth_dist = sorted_ids
+                .get(routing::K - 1)
+                .map(|id| routing::xor_distance(id, &target));
+
+            while in_flight.len() < ALPHA && total_queries < MAX_TOTAL_QUERIES {
+                let next_pos = candidates.iter().position(|c| {
+                    if queried_addrs.contains(&c.addr) {
+                        return false;
+                    }
+                    match (c.id, kth_dist) {
+                        (Some(id), Some(kth)) => routing::xor_distance(&id, &target) < kth,
+                        _ => true,
+                    }
+                });
+                let Some(idx) = next_pos else {
+                    break;
+                };
+                let cand = candidates.remove(idx);
                 queried_addrs.insert(cand.addr);
+                total_queries += 1;
                 let handle = self.clone();
-                let cand_clone = cand;
-                query_futs.push(tokio::spawn(async move {
-                    let res = handle.get_peers(cand.addr, info_hash).await;
-                    (cand_clone, res)
-                }));
+                in_flight.spawn(async move {
+                    let res = handle
+                        .get_peers_raw(
+                            cand.addr,
+                            cand.id,
+                            info_hash,
+                            Some(vec!["n4".into(), "n6".into()]),
+                        )
+                        .await;
+                    (cand, res)
+                });
             }
 
-            let mut any_progress = false;
-            for fut in query_futs {
-                if let Ok((cand, Ok((token, result)))) = fut.await {
-                    match result {
-                        GetPeersResult::Peers(peers) => {
-                            for peer in peers {
-                                discovered_peers.insert(peer);
+            let Some(joined) = in_flight.join_next().await else {
+                break;
+            };
+            if let Ok((cand, Ok((sender_id, token, result)))) = joined {
+                let real_id = sender_id.or(cand.id);
+                if let Some(id) = real_id {
+                    all_responded_ids.insert(cand.addr, id);
+                    if !token.is_empty() {
+                        match cand.addr {
+                            SocketAddr::V4(v4) => {
+                                closest_v4.insert(v4, (NodeInfo { id, addr: v4 }, token));
                             }
-                            closest_nodes_with_tokens.push((cand, token));
-                            any_progress = true;
-                        }
-                        GetPeersResult::Peers6(peers6) => {
-                            for peer in peers6 {
-                                discovered_peers6.insert(peer);
+                            SocketAddr::V6(v6) => {
+                                closest_v6.insert(v6, (NodeInfoV6 { id, addr: v6 }, token));
                             }
-                            closest_nodes_with_tokens.push((cand, token));
-                            any_progress = true;
-                        }
-                        GetPeersResult::Nodes(nodes) => {
-                            closest_nodes_with_tokens.push((cand, token));
-                            for node in nodes {
-                                if seen_addrs.insert(node.addr) {
-                                    candidates.push(node);
-                                    any_progress = true;
-                                }
-                            }
-                        }
-                        GetPeersResult::Nodes6(_) => {
-                            closest_nodes_with_tokens.push((cand, token));
                         }
                     }
                 }
-            }
-
-            if !any_progress
-                && candidates
-                    .iter()
-                    .filter(|n| !queried_addrs.contains(&n.addr))
-                    .count()
-                    == 0
-            {
-                break;
+                let (peers, peers6, nodes, nodes6) = result.into_parts();
+                discovered_peers.extend(peers);
+                discovered_peers6.extend(peers6);
+                for node in nodes {
+                    let addr = SocketAddr::V4(node.addr);
+                    if seen_addrs.insert(addr) {
+                        candidates.push(Cand {
+                            addr,
+                            id: Some(node.id),
+                        });
+                    }
+                }
+                for node6 in nodes6 {
+                    let addr = SocketAddr::V6(node6.addr);
+                    if seen_addrs.insert(addr) {
+                        candidates.push(Cand {
+                            addr,
+                            id: Some(node6.id),
+                        });
+                    }
+                }
             }
         }
+
+        let mut closest_nodes: Vec<(NodeInfo, Vec<u8>)> = closest_v4.into_values().collect();
+        closest_nodes.sort_by_key(|(n, _)| routing::xor_distance(&n.id, &target));
+        closest_nodes.truncate(routing::K);
+
+        let mut closest_nodes6: Vec<(NodeInfoV6, Vec<u8>)> = closest_v6.into_values().collect();
+        closest_nodes6.sort_by_key(|(n, _)| routing::xor_distance(&n.id, &target));
+        closest_nodes6.truncate(routing::K);
 
         Ok(IterativePeersResult {
             peers: discovered_peers.into_iter().collect(),
             peers6: discovered_peers6.into_iter().collect(),
-            closest_nodes: closest_nodes_with_tokens,
-            closest_nodes6: Vec::new(),
+            closest_nodes,
+            closest_nodes6,
         })
     }
 }
@@ -783,46 +915,59 @@ fn expect_response(
     }
 }
 
-/// Validates a BEP 44 `get` response item against `target` and optional `min_seq`.
-fn verify_get_item(target: [u8; 20], min_seq: Option<u64>, item: &GetItem) -> bool {
+/// Validates a BEP 44 `get` response item against `target`, optional `salt`, and optional `min_seq`.
+fn verify_get_item(
+    target: [u8; 20],
+    salt: Option<&[u8]>,
+    min_seq: Option<u64>,
+    item: &GetItem,
+) -> bool {
     if item.v.len() > MAX_ITEM_VALUE_LEN {
         return false;
     }
     match (item.k, item.sig, item.seq) {
-        (None, None, None) => compute_immutable_target(&item.v) == target,
+        (None, None, None) => salt.is_none() && compute_immutable_target(&item.v) == target,
         (Some(k), Some(sig), Some(item_seq)) => {
             if min_seq.is_some_and(|s| item_seq < s) {
                 return false;
             }
-            // When salt is absent (`compute_mutable_target(&k, None) == target`), verify the
-            // Ed25519 signature immediately. When a non-empty salt was used to derive `target`,
-            // the caller (e.g. `TorrentUpdatePointer`) knows `salt` and verifies the signature
-            // over `(salt, seq, v)`.
-            if compute_mutable_target(&k, None) == target {
-                let payload = format_sign_payload(None, item_seq, &item.v);
-                if !verify_ed25519(&k, &payload, &sig) {
-                    return false;
-                }
+            if compute_mutable_target(&k, salt) != target {
+                return false;
             }
-            true
+            let payload = format_sign_payload(salt, item_seq, &item.v);
+            verify_ed25519(&k, &payload, &sig)
         }
         _ => false,
     }
 }
 
+fn next_random_txn_id(pending: &HashMap<Vec<u8>, PendingQuery>) -> Vec<u8> {
+    let mut txn_id = vec![0u8; 4];
+    loop {
+        rand::thread_rng().fill_bytes(&mut txn_id);
+        if !pending.contains_key(&txn_id) {
+            return txn_id;
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn run(
-    id_cell: Arc<std::sync::RwLock<NodeId>>,
-    socket_v4: Option<Arc<UdpTransport>>,
-    socket_v6: Option<Arc<UdpTransport>>,
+    id_cell_v4: Arc<std::sync::RwLock<NodeId>>,
+    id_cell_v6: Arc<std::sync::RwLock<NodeId>>,
+    mut socket_v4: Option<Arc<UdpTransport>>,
+    mut socket_v6: Option<Arc<UdpTransport>>,
     mut cmds: mpsc::Receiver<Command>,
     options: DhtOptions,
     dos_blocks: Arc<AtomicU64>,
+    node_count: Arc<AtomicUsize>,
     read_only_flag: Arc<std::sync::atomic::AtomicBool>,
 ) {
     let _ = options;
-    let mut our_id = *id_cell.read().unwrap_or_else(|e| e.into_inner());
-    let mut routing = RoutingTable::new(our_id);
-    let mut routing_v6 = RoutingTableV6::new(our_id);
+    let mut our_id_v4 = *id_cell_v4.read().unwrap_or_else(|e| e.into_inner());
+    let mut our_id_v6 = *id_cell_v6.read().unwrap_or_else(|e| e.into_inner());
+    let mut routing = RoutingTable::new(our_id_v4);
+    let mut routing_v6 = RoutingTableV6::new(our_id_v6);
     let mut voter_v4 = IpVoter::new();
     let mut voter_v6 = IpVoter::new();
     let mut vote: Option<(std::net::IpAddr, std::net::IpAddr)> = None;
@@ -830,7 +975,6 @@ async fn run(
     let mut announced: HashMap<[u8; 20], Vec<AnnouncedPeer>> = HashMap::new();
     let mut secrets = TokenSecrets::generate();
     let mut last_rotation = Instant::now();
-    let mut next_txn: u32 = rand::random();
     let mut buf_v4 = vec![0u8; RECV_BUF_LEN];
     let mut buf_v6 = vec![0u8; RECV_BUF_LEN];
     let mut maintenance = tokio::time::interval(MAINTENANCE_INTERVAL);
@@ -848,7 +992,36 @@ async fn run(
                     std::future::pending().await
                 }
             } => {
-                let Ok((n, from)) = recvd else { continue };
+                let (n, from) = match recvd {
+                    Ok(v) => v,
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::ConnectionRefused
+                                | std::io::ErrorKind::ConnectionAborted
+                                | std::io::ErrorKind::Interrupted
+                                | std::io::ErrorKind::WouldBlock
+                        ) =>
+                    {
+                        continue;
+                    }
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::NotConnected
+                        ) =>
+                    {
+                        tracing::debug!(error = %e, "DHT IPv4 socket closed; disabling IPv4 recv");
+                        socket_v4 = None;
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "DHT IPv4 recv_from error, backing off");
+                        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                        continue;
+                    }
+                };
                 if n > MAX_PACKET_LEN || !dos.allow(from.ip(), Instant::now()) {
                     dos_blocks.fetch_add(1, Ordering::Relaxed);
                     continue;
@@ -863,8 +1036,18 @@ async fn run(
                     vote: &mut vote,
                 };
                 let s = socket_v4.as_ref().unwrap();
-                handle_packet(&buf_v4[..n], from, s, our_id, &mut ctx, &secrets, &mut quota).await;
-                apply_vote(&mut vote, &mut voter_v4, &mut voter_v6, &id_cell, &mut our_id, &mut routing, &mut routing_v6);
+                handle_packet(&buf_v4[..n], from, s, our_id_v4, &mut ctx, &secrets, &mut quota).await;
+                apply_vote(
+                    &mut vote,
+                    &mut voter_v4,
+                    &mut voter_v6,
+                    &id_cell_v4,
+                    &id_cell_v6,
+                    &mut our_id_v4,
+                    &mut our_id_v6,
+                    &mut routing,
+                    &mut routing_v6,
+                );
             }
             recvd = async {
                 if let Some(s) = &socket_v6 {
@@ -873,7 +1056,36 @@ async fn run(
                     std::future::pending().await
                 }
             } => {
-                let Ok((n, from)) = recvd else { continue };
+                let (n, from) = match recvd {
+                    Ok(v) => v,
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::ConnectionRefused
+                                | std::io::ErrorKind::ConnectionAborted
+                                | std::io::ErrorKind::Interrupted
+                                | std::io::ErrorKind::WouldBlock
+                        ) =>
+                    {
+                        continue;
+                    }
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::NotConnected
+                        ) =>
+                    {
+                        tracing::debug!(error = %e, "DHT IPv6 socket closed; disabling IPv6 recv");
+                        socket_v6 = None;
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "DHT IPv6 recv_from error, backing off");
+                        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                        continue;
+                    }
+                };
                 if n > MAX_PACKET_LEN || !dos.allow(from.ip(), Instant::now()) {
                     dos_blocks.fetch_add(1, Ordering::Relaxed);
                     continue;
@@ -888,17 +1100,27 @@ async fn run(
                     vote: &mut vote,
                 };
                 let s = socket_v6.as_ref().unwrap();
-                handle_packet(&buf_v6[..n], from, s, our_id, &mut ctx, &secrets, &mut quota).await;
-                apply_vote(&mut vote, &mut voter_v4, &mut voter_v6, &id_cell, &mut our_id, &mut routing, &mut routing_v6);
+                handle_packet(&buf_v6[..n], from, s, our_id_v6, &mut ctx, &secrets, &mut quota).await;
+                apply_vote(
+                    &mut vote,
+                    &mut voter_v4,
+                    &mut voter_v6,
+                    &id_cell_v4,
+                    &id_cell_v6,
+                    &mut our_id_v4,
+                    &mut our_id_v6,
+                    &mut routing,
+                    &mut routing_v6,
+                );
             }
             cmd = cmds.recv() => {
                 match cmd {
                     Some(cmd) => {
                         let mut cmd_ctx = CommandCtx {
-                            our_id,
+                            our_id_v4,
+                            our_id_v6,
                             socket_v4: socket_v4.as_deref(),
                             socket_v6: socket_v6.as_deref(),
-                            next_txn: &mut next_txn,
                             pending: &mut pending,
                             routing: &routing,
                             routing_v6: &routing_v6,
@@ -924,7 +1146,9 @@ async fn run(
                                 SocketAddr::V6(_) => routing_v6.mark_failed(&id),
                             }
                         }
-                        let _ = pq.reply.send(Err(DhtError::Timeout));
+                        if let Some(reply) = pq.reply {
+                            let _ = reply.send(Err(DhtError::Timeout));
+                        }
                     }
                 }
             }
@@ -939,63 +1163,158 @@ async fn run(
                     secrets.previous = std::mem::replace(&mut secrets.current, random_secret());
                     last_rotation = now;
                 }
+
+                // BEP 5: probe Questionable routing-table entries periodically so live nodes
+                // stay Good and unresponsive nodes accumulate failures and rotate out.
+                let ro = read_only_flag.load(std::sync::atomic::Ordering::Relaxed);
+                let mut pings_sent = 0usize;
+                let mut inflight_addrs: HashSet<SocketAddr> =
+                    pending.values().map(|pq| pq.target_addr).collect();
+                for node in routing.questionable(now) {
+                    if pings_sent >= MAX_REFRESH_PINGS_PER_TICK
+                        || pending.len() >= MAX_PENDING_QUERIES
+                    {
+                        break;
+                    }
+                    let target_addr = SocketAddr::V4(node.addr);
+                    if !inflight_addrs.insert(target_addr) {
+                        continue;
+                    }
+                    if let Some(s) = socket_v4.as_ref().or(socket_v6.as_ref()) {
+                        let txn_id = next_random_txn_id(&pending);
+                        let msg = Message {
+                            transaction_id: txn_id.clone(),
+                            sender_id: Some(our_id_v4),
+                            body: Body::Query(Query::Ping),
+                            read_only: ro,
+                            external_addr: None,
+                        };
+                        if s.send_to(&msg.encode(), target_addr).await.is_ok() {
+                            pending.insert(
+                                txn_id,
+                                PendingQuery {
+                                    reply: None,
+                                    sent_at: now,
+                                    target_addr,
+                                    target_id: Some(node.id),
+                                },
+                            );
+                            pings_sent += 1;
+                        }
+                    }
+                }
+                for node6 in routing_v6.questionable(now) {
+                    if pings_sent >= MAX_REFRESH_PINGS_PER_TICK
+                        || pending.len() >= MAX_PENDING_QUERIES
+                    {
+                        break;
+                    }
+                    let target_addr = SocketAddr::V6(node6.addr);
+                    if !inflight_addrs.insert(target_addr) {
+                        continue;
+                    }
+                    if let Some(s) = socket_v6.as_ref().or(socket_v4.as_ref()) {
+                        let txn_id = next_random_txn_id(&pending);
+                        let msg = Message {
+                            transaction_id: txn_id.clone(),
+                            sender_id: Some(our_id_v6),
+                            body: Body::Query(Query::Ping),
+                            read_only: ro,
+                            external_addr: None,
+                        };
+                        if s.send_to(&msg.encode(), target_addr).await.is_ok() {
+                            pending.insert(
+                                txn_id,
+                                PendingQuery {
+                                    reply: None,
+                                    sent_at: now,
+                                    target_addr,
+                                    target_id: Some(node6.id),
+                                },
+                            );
+                            pings_sent += 1;
+                        }
+                    }
+                }
             }
         }
+        node_count.store(routing.len() + routing_v6.len(), Ordering::Relaxed);
     }
 }
 
 /// Feeds a reported-address vote (see `PacketCtx::vote`) to the per-family voters and, when the
-/// vote produces a new consensus external address that our current node id does not match
-/// under BEP 42, switches to a fresh id derived from it. The routing tables are rebuilt around
-/// the new id (bucket placement is relative to it) keeping every node we already know.
+/// vote produces a new consensus external address that the corresponding family's node id does
+/// not match under BEP 42, switches that family's id and rebuilds only its routing table.
+#[allow(clippy::too_many_arguments)]
 fn apply_vote(
     vote: &mut Option<(std::net::IpAddr, std::net::IpAddr)>,
     voter_v4: &mut IpVoter,
     voter_v6: &mut IpVoter,
-    id_cell: &Arc<std::sync::RwLock<NodeId>>,
-    our_id: &mut NodeId,
+    id_cell_v4: &Arc<std::sync::RwLock<NodeId>>,
+    id_cell_v6: &Arc<std::sync::RwLock<NodeId>>,
+    our_id_v4: &mut NodeId,
+    our_id_v6: &mut NodeId,
     routing: &mut RoutingTable,
     routing_v6: &mut RoutingTableV6,
 ) {
     let Some((voter, reported)) = vote.take() else {
         return;
     };
+    if voter.is_ipv4() != reported.is_ipv4() {
+        return;
+    }
     let voter_table = if voter.is_ipv4() { voter_v4 } else { voter_v6 };
     let Some(consensus) = voter_table.vote(voter, reported) else {
         return;
     };
-    if crate::bep42::is_exempt_from_node_id_check(consensus)
-        || crate::bep42::verify_secure_node_id(our_id, consensus)
-    {
+    if crate::bep42::is_exempt_from_node_id_check(consensus) {
         return;
     }
-    let new_id = crate::bep42::generate_secure_node_id(consensus, rand::random());
-    tracing::info!(
-        "DHT: external address agreed as {consensus}; adopting BEP 42 node id derived from it"
-    );
-    let enforce_v4 = routing.enforce_node_id();
-    let enforce_v6 = routing_v6.enforce_node_id();
-    let old4 = routing.closest(our_id, usize::MAX);
-    let old6 = routing_v6.closest(our_id, usize::MAX);
-    *routing = RoutingTable::new(new_id);
-    routing.set_enforce_node_id(enforce_v4);
-    *routing_v6 = RoutingTableV6::new(new_id);
-    routing_v6.set_enforce_node_id(enforce_v6);
-    for n in old4 {
-        routing.seen(n.id, n.addr, n.last_seen);
+    match consensus {
+        IpAddr::V4(_) => {
+            if crate::bep42::verify_secure_node_id(our_id_v4, consensus) {
+                return;
+            }
+            let new_id = crate::bep42::generate_secure_node_id(consensus, rand::random());
+            tracing::info!(
+                "DHT: external IPv4 agreed as {consensus}; adopting BEP 42 IPv4 node id derived from it"
+            );
+            let enforce_v4 = routing.enforce_node_id();
+            let old4 = routing.closest(our_id_v4, usize::MAX);
+            *routing = RoutingTable::new(new_id);
+            routing.set_enforce_node_id(enforce_v4);
+            for n in old4 {
+                routing.seen(n.id, n.addr, n.last_seen);
+            }
+            *our_id_v4 = new_id;
+            *id_cell_v4.write().unwrap_or_else(|e| e.into_inner()) = new_id;
+        }
+        IpAddr::V6(_) => {
+            if crate::bep42::verify_secure_node_id(our_id_v6, consensus) {
+                return;
+            }
+            let new_id = crate::bep42::generate_secure_node_id(consensus, rand::random());
+            tracing::info!(
+                "DHT: external IPv6 agreed as {consensus}; adopting BEP 42 IPv6 node id derived from it"
+            );
+            let enforce_v6 = routing_v6.enforce_node_id();
+            let old6 = routing_v6.closest(our_id_v6, usize::MAX);
+            *routing_v6 = RoutingTableV6::new(new_id);
+            routing_v6.set_enforce_node_id(enforce_v6);
+            for n in old6 {
+                routing_v6.seen(n.id, n.addr, n.last_seen);
+            }
+            *our_id_v6 = new_id;
+            *id_cell_v6.write().unwrap_or_else(|e| e.into_inner()) = new_id;
+        }
     }
-    for n in old6 {
-        routing_v6.seen(n.id, n.addr, n.last_seen);
-    }
-    *our_id = new_id;
-    *id_cell.write().unwrap_or_else(|e| e.into_inner()) = new_id;
 }
 
 struct CommandCtx<'a> {
-    our_id: NodeId,
+    our_id_v4: NodeId,
+    our_id_v6: NodeId,
     socket_v4: Option<&'a UdpTransport>,
     socket_v6: Option<&'a UdpTransport>,
-    next_txn: &'a mut u32,
     pending: &'a mut HashMap<Vec<u8>, PendingQuery>,
     routing: &'a RoutingTable,
     routing_v6: &'a RoutingTableV6,
@@ -1010,9 +1329,16 @@ async fn handle_command(cmd: Command, ctx: &mut CommandCtx<'_>) {
             query,
             reply,
         } => {
-            let socket = match addr {
-                SocketAddr::V4(_) => ctx.socket_v4.or(ctx.socket_v6),
-                SocketAddr::V6(_) => ctx.socket_v6.or(ctx.socket_v4),
+            if ctx.pending.len() >= MAX_PENDING_QUERIES {
+                let _ = reply.send(Err(DhtError::Io(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "too many pending DHT queries",
+                ))));
+                return;
+            }
+            let (socket, sender_id) = match addr {
+                SocketAddr::V4(_) => (ctx.socket_v4.or(ctx.socket_v6), ctx.our_id_v4),
+                SocketAddr::V6(_) => (ctx.socket_v6.or(ctx.socket_v4), ctx.our_id_v6),
             };
             let Some(socket) = socket else {
                 let _ = reply.send(Err(DhtError::Io(std::io::Error::new(
@@ -1021,11 +1347,10 @@ async fn handle_command(cmd: Command, ctx: &mut CommandCtx<'_>) {
                 ))));
                 return;
             };
-            let txn_id = ctx.next_txn.to_be_bytes().to_vec();
-            *ctx.next_txn = ctx.next_txn.wrapping_add(1);
+            let txn_id = next_random_txn_id(ctx.pending);
             let msg = Message {
                 transaction_id: txn_id.clone(),
-                sender_id: Some(ctx.our_id),
+                sender_id: Some(sender_id),
                 body: Body::Query(*query),
                 read_only: ctx.read_only,
                 external_addr: None,
@@ -1037,7 +1362,7 @@ async fn handle_command(cmd: Command, ctx: &mut CommandCtx<'_>) {
             ctx.pending.insert(
                 txn_id,
                 PendingQuery {
-                    reply,
+                    reply: Some(reply),
                     sent_at: Instant::now(),
                     target_addr: addr,
                     target_id: node_id,
@@ -1045,28 +1370,28 @@ async fn handle_command(cmd: Command, ctx: &mut CommandCtx<'_>) {
             );
         }
         Command::Snapshot { reply } => {
-            let _ = reply.send(ctx.routing.closest(&ctx.our_id, usize::MAX));
+            let _ = reply.send(ctx.routing.closest(&ctx.our_id_v4, usize::MAX));
         }
         Command::State { reply } => {
             let now = Instant::now();
             let mut nodes: Vec<SocketAddr> = ctx
                 .routing
-                .closest(&ctx.our_id, usize::MAX)
+                .closest(&ctx.our_id_v4, usize::MAX)
                 .into_iter()
                 .filter(|n| n.state(now) != crate::routing::NodeState::Bad)
                 .map(|n| SocketAddr::V4(n.addr))
                 .collect();
             nodes.extend(
                 ctx.routing_v6
-                    .closest(&ctx.our_id, usize::MAX)
+                    .closest(&ctx.our_id_v6, usize::MAX)
                     .into_iter()
                     .filter(|n| n.state(now) != crate::routing::NodeState::Bad)
                     .map(|n| SocketAddr::V6(n.addr)),
             );
-            let _ = reply.send((ctx.our_id, nodes));
+            let _ = reply.send((ctx.our_id_v4, nodes));
         }
         Command::SnapshotV6 { reply } => {
-            let _ = reply.send(ctx.routing_v6.closest(&ctx.our_id, usize::MAX));
+            let _ = reply.send(ctx.routing_v6.closest(&ctx.our_id_v6, usize::MAX));
         }
         Command::ClosestNodes {
             target,
@@ -1162,7 +1487,9 @@ async fn handle_packet(
                     }
                 }
             }
-            let _ = pq.reply.send(Ok(msg));
+            if let Some(reply) = pq.reply {
+                let _ = reply.send(Ok(msg));
+            }
         }
     }
 }
@@ -1216,7 +1543,46 @@ fn handle_query(
                     .collect();
                 fresh.sort_by_key(|p| std::cmp::Reverse(p.announced_at));
 
-                if wants_v6 && !wants_v4 {
+                if wants_v4 && wants_v6 {
+                    let half = MAX_PEERS_PER_REPLY / 2;
+                    let v4_peers: Vec<SocketAddrV4> = fresh
+                        .iter()
+                        .filter_map(|p| match p.addr {
+                            SocketAddr::V4(v4) => Some(v4),
+                            _ => None,
+                        })
+                        .take(half.max(1))
+                        .collect();
+                    let v6_peers: Vec<SocketAddrV6> = fresh
+                        .iter()
+                        .filter_map(|p| match p.addr {
+                            SocketAddr::V6(v6) => Some(v6),
+                            _ => None,
+                        })
+                        .take(half.max(1))
+                        .collect();
+                    if !v4_peers.is_empty() && !v6_peers.is_empty() {
+                        return Body::Response(Response::GetPeers {
+                            token,
+                            result: GetPeersResult::Combined {
+                                peers: v4_peers,
+                                peers6: v6_peers,
+                                nodes: Vec::new(),
+                                nodes6: Vec::new(),
+                            },
+                        });
+                    } else if !v4_peers.is_empty() {
+                        return Body::Response(Response::GetPeers {
+                            token,
+                            result: GetPeersResult::Peers(v4_peers),
+                        });
+                    } else if !v6_peers.is_empty() {
+                        return Body::Response(Response::GetPeers {
+                            token,
+                            result: GetPeersResult::Peers6(v6_peers),
+                        });
+                    }
+                } else if wants_v6 {
                     let v6_peers: Vec<SocketAddrV6> = fresh
                         .iter()
                         .filter_map(|p| match p.addr {
@@ -1231,38 +1597,7 @@ fn handle_query(
                             result: GetPeersResult::Peers6(v6_peers),
                         });
                     }
-                } else if wants_v4 && !wants_v6 {
-                    let v4_peers: Vec<SocketAddrV4> = fresh
-                        .iter()
-                        .filter_map(|p| match p.addr {
-                            SocketAddr::V4(v4) => Some(v4),
-                            _ => None,
-                        })
-                        .take(MAX_PEERS_PER_REPLY)
-                        .collect();
-                    if !v4_peers.is_empty() {
-                        return Body::Response(Response::GetPeers {
-                            token,
-                            result: GetPeersResult::Peers(v4_peers),
-                        });
-                    }
                 } else {
-                    if from.is_ipv6() {
-                        let v6_peers: Vec<SocketAddrV6> = fresh
-                            .iter()
-                            .filter_map(|p| match p.addr {
-                                SocketAddr::V6(v6) => Some(v6),
-                                _ => None,
-                            })
-                            .take(MAX_PEERS_PER_REPLY)
-                            .collect();
-                        if !v6_peers.is_empty() {
-                            return Body::Response(Response::GetPeers {
-                                token,
-                                result: GetPeersResult::Peers6(v6_peers),
-                            });
-                        }
-                    }
                     let v4_peers: Vec<SocketAddrV4> = fresh
                         .iter()
                         .filter_map(|p| match p.addr {
@@ -1280,19 +1615,31 @@ fn handle_query(
                 }
             }
 
-            if wants_v6 && !wants_v4 {
-                let nodes6 = ctx.routing_v6.closest_nodes6(info_hash, routing::K);
-                Body::Response(Response::GetPeers {
-                    token,
-                    result: GetPeersResult::Nodes6(nodes6),
-                })
-            } else if wants_v4 && !wants_v6 {
+            if wants_v4 && wants_v6 {
                 let nodes = ctx.routing.closest_nodes(info_hash, routing::K);
-                Body::Response(Response::GetPeers {
-                    token,
-                    result: GetPeersResult::Nodes(nodes),
-                })
-            } else if from.is_ipv6() {
+                let nodes6 = ctx.routing_v6.closest_nodes6(info_hash, routing::K);
+                if !nodes.is_empty() && !nodes6.is_empty() {
+                    Body::Response(Response::GetPeers {
+                        token,
+                        result: GetPeersResult::Combined {
+                            peers: Vec::new(),
+                            peers6: Vec::new(),
+                            nodes,
+                            nodes6,
+                        },
+                    })
+                } else if !nodes6.is_empty() || (from.is_ipv6() && nodes.is_empty()) {
+                    Body::Response(Response::GetPeers {
+                        token,
+                        result: GetPeersResult::Nodes6(nodes6),
+                    })
+                } else {
+                    Body::Response(Response::GetPeers {
+                        token,
+                        result: GetPeersResult::Nodes(nodes),
+                    })
+                }
+            } else if wants_v6 {
                 let nodes6 = ctx.routing_v6.closest_nodes6(info_hash, routing::K);
                 Body::Response(Response::GetPeers {
                     token,
@@ -1311,6 +1658,7 @@ fn handle_query(
             port,
             token,
             implied_port,
+            seed,
         } => {
             if !secrets.validate(token, &from, info_hash) {
                 return Body::Error {
@@ -1335,7 +1683,7 @@ fn handle_query(
                 )),
             };
             let now = Instant::now();
-            store_announce(ctx.announced, *info_hash, addr, now, false);
+            store_announce(ctx.announced, *info_hash, addr, now, *seed);
             Body::Response(Response::Id)
         }
         Query::Get { target, seq } => {
@@ -1501,43 +1849,90 @@ fn store_announce(
         return;
     }
 
-    // Enforce IPv6 /64 and /48 prefix caps so an attacker with a /48 or /64 cannot flood a swarm.
-    if let SocketAddr::V6(v6) = addr {
-        let octs = v6.ip().octets();
-        let prefix64 = &octs[..8];
-        let prefix48 = &octs[..6];
-
-        let count64 = list
-            .iter()
-            .filter(|p| matches!(p.addr, SocketAddr::V6(existing) if existing.ip().octets()[..8] == *prefix64))
-            .count();
-        if count64 >= MAX_PEERS_PER_IPV6_PREFIX_64 {
-            if let Some(oldest_in_64) = list
+    // Enforce IPv6 /64 and /48 prefix caps, and IPv4 per-host / per-/24 caps for public IPs,
+    // so a single host or subnet cannot flood a swarm.
+    match addr {
+        SocketAddr::V4(v4) if !crate::bep42::is_exempt_from_node_id_check(IpAddr::V4(*v4.ip())) => {
+            let host_ip = *v4.ip();
+            let count_host = list
                 .iter()
-                .enumerate()
-                .filter(|(_, p)| matches!(p.addr, SocketAddr::V6(existing) if existing.ip().octets()[..8] == *prefix64))
-                .min_by_key(|(_, p)| p.announced_at)
-                .map(|(i, _)| i)
-            {
-                list.swap_remove(oldest_in_64);
-            }
-        } else {
-            let count48 = list
-                .iter()
-                .filter(|p| matches!(p.addr, SocketAddr::V6(existing) if existing.ip().octets()[..6] == *prefix48))
+                .filter(|p| matches!(p.addr, SocketAddr::V4(existing) if *existing.ip() == host_ip))
                 .count();
-            if count48 >= MAX_PEERS_PER_IPV6_PREFIX_48 {
-                if let Some(oldest_in_48) = list
+            if count_host >= MAX_PEERS_PER_IPV4_HOST {
+                if let Some(oldest_host) = list
                     .iter()
                     .enumerate()
-                    .filter(|(_, p)| matches!(p.addr, SocketAddr::V6(existing) if existing.ip().octets()[..6] == *prefix48))
+                    .filter(|(_, p)| matches!(p.addr, SocketAddr::V4(existing) if *existing.ip() == host_ip))
                     .min_by_key(|(_, p)| p.announced_at)
                     .map(|(i, _)| i)
                 {
-                    list.swap_remove(oldest_in_48);
+                    list.swap_remove(oldest_host);
+                }
+            } else {
+                let subnet24 = [
+                    host_ip.octets()[0],
+                    host_ip.octets()[1],
+                    host_ip.octets()[2],
+                ];
+                let count24 = list
+                    .iter()
+                    .filter(|p| {
+                        matches!(p.addr, SocketAddr::V4(existing) if existing.ip().octets()[..3] == subnet24)
+                    })
+                    .count();
+                if count24 >= MAX_PEERS_PER_IPV4_SUBNET_24 {
+                    if let Some(oldest_24) = list
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, p)| {
+                            matches!(p.addr, SocketAddr::V4(existing) if existing.ip().octets()[..3] == subnet24)
+                        })
+                        .min_by_key(|(_, p)| p.announced_at)
+                        .map(|(i, _)| i)
+                    {
+                        list.swap_remove(oldest_24);
+                    }
                 }
             }
         }
+        SocketAddr::V6(v6) => {
+            let octs = v6.ip().octets();
+            let prefix64 = &octs[..8];
+            let prefix48 = &octs[..6];
+
+            let count64 = list
+                .iter()
+                .filter(|p| matches!(p.addr, SocketAddr::V6(existing) if existing.ip().octets()[..8] == *prefix64))
+                .count();
+            if count64 >= MAX_PEERS_PER_IPV6_PREFIX_64 {
+                if let Some(oldest_in_64) = list
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, p)| matches!(p.addr, SocketAddr::V6(existing) if existing.ip().octets()[..8] == *prefix64))
+                    .min_by_key(|(_, p)| p.announced_at)
+                    .map(|(i, _)| i)
+                {
+                    list.swap_remove(oldest_in_64);
+                }
+            } else {
+                let count48 = list
+                    .iter()
+                    .filter(|p| matches!(p.addr, SocketAddr::V6(existing) if existing.ip().octets()[..6] == *prefix48))
+                    .count();
+                if count48 >= MAX_PEERS_PER_IPV6_PREFIX_48 {
+                    if let Some(oldest_in_48) = list
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, p)| matches!(p.addr, SocketAddr::V6(existing) if existing.ip().octets()[..6] == *prefix48))
+                        .min_by_key(|(_, p)| p.announced_at)
+                        .map(|(i, _)| i)
+                    {
+                        list.swap_remove(oldest_in_48);
+                    }
+                }
+            }
+        }
+        SocketAddr::V4(_) => {}
     }
 
     if list.len() >= MAX_PEERS_PER_TORRENT {
@@ -1649,8 +2044,10 @@ mod tests {
     #[test]
     fn agreement_on_our_external_address_switches_to_a_bep42_id_and_keeps_known_nodes() {
         let old_id = [0x11u8; 20];
-        let cell = Arc::new(std::sync::RwLock::new(old_id));
-        let mut our_id = old_id;
+        let cell_v4 = Arc::new(std::sync::RwLock::new(old_id));
+        let cell_v6 = Arc::new(std::sync::RwLock::new(old_id));
+        let mut our_id_v4 = old_id;
+        let mut our_id_v6 = old_id;
         let mut routing = RoutingTable::new(old_id);
         let mut routing_v6 = RoutingTableV6::new(old_id);
         let neighbour = SocketAddrV4::new(std::net::Ipv4Addr::new(8, 8, 4, 4), 6881);
@@ -1664,54 +2061,67 @@ mod tests {
                 &mut vote,
                 &mut v4,
                 &mut v6,
-                &cell,
-                &mut our_id,
+                &cell_v4,
+                &cell_v6,
+                &mut our_id_v4,
+                &mut our_id_v6,
                 &mut routing,
                 &mut routing_v6,
             );
-            assert_eq!(our_id, old_id, "not enough voters yet");
+            assert_eq!(our_id_v4, old_id, "not enough voters yet");
         }
         let mut vote = Some((public_v4(50), me));
         apply_vote(
             &mut vote,
             &mut v4,
             &mut v6,
-            &cell,
-            &mut our_id,
+            &cell_v4,
+            &cell_v6,
+            &mut our_id_v4,
+            &mut our_id_v6,
             &mut routing,
             &mut routing_v6,
         );
 
-        assert_ne!(our_id, old_id);
+        assert_ne!(our_id_v4, old_id);
+        assert_eq!(our_id_v6, old_id, "v4 consensus must not alter v6 id");
         assert!(
-            crate::bep42::verify_secure_node_id(&our_id, me),
+            crate::bep42::verify_secure_node_id(&our_id_v4, me),
             "the new id must verify for the agreed address"
         );
-        assert_eq!(*cell.read().unwrap(), our_id, "handle-visible id updated");
-        assert_eq!(routing.our_id(), our_id);
+        assert_eq!(
+            *cell_v4.read().unwrap(),
+            our_id_v4,
+            "handle-visible id updated"
+        );
+        assert_eq!(routing.our_id(), our_id_v4);
         assert_eq!(routing.len(), 1, "known nodes survive the re-key");
         // Agreement on an address the id already matches changes nothing further.
-        let before = our_id;
+        let before = our_id_v4;
         for n in 60..70u8 {
             let mut vote = Some((public_v4(n), me));
             apply_vote(
                 &mut vote,
                 &mut v4,
                 &mut v6,
-                &cell,
-                &mut our_id,
+                &cell_v4,
+                &cell_v6,
+                &mut our_id_v4,
+                &mut our_id_v6,
                 &mut routing,
                 &mut routing_v6,
             );
         }
-        assert_eq!(our_id, before);
+        assert_eq!(our_id_v4, before);
     }
 
     #[test]
     fn a_private_consensus_address_never_changes_the_id() {
         let old_id = [0x22u8; 20];
-        let cell = Arc::new(std::sync::RwLock::new(old_id));
-        let mut our_id = old_id;
+        let cell_v4 = Arc::new(std::sync::RwLock::new(old_id));
+        let cell_v6 = Arc::new(std::sync::RwLock::new(old_id));
+        let mut our_id_v4 = old_id;
+        let mut our_id_v6 = old_id;
         let mut routing = RoutingTable::new(old_id);
         let mut routing_v6 = RoutingTableV6::new(old_id);
         let (mut v4, mut v6) = (IpVoter::new(), IpVoter::new());
@@ -1722,14 +2132,16 @@ mod tests {
                 &mut vote,
                 &mut v4,
                 &mut v6,
-                &cell,
-                &mut our_id,
+                &cell_v4,
+                &cell_v6,
+                &mut our_id_v4,
+                &mut our_id_v6,
                 &mut routing,
                 &mut routing_v6,
             );
         }
         assert_eq!(
-            our_id, old_id,
+            our_id_v4, old_id,
             "BEP 42 exempts private addresses; no derived id is needed"
         );
     }
@@ -1800,6 +2212,7 @@ mod tests {
                 port: 0,
                 token,
                 implied_port: false,
+                seed: false,
             },
             from,
             &mut test_ctx(&mut routing, &mut routing_v6, &mut pending, &mut announced),
@@ -1818,7 +2231,7 @@ mod tests {
             store_announce(
                 &mut announced,
                 popular,
-                addr(9, 9, 9, 9, 1000 + p),
+                addr(9, 9, p as u8, 1, 1000 + p),
                 now,
                 false,
             );
@@ -1842,7 +2255,7 @@ mod tests {
             store_announce(
                 &mut announced,
                 h,
-                addr(7, 7, (p >> 8) as u8, p as u8, 5000),
+                addr(7, 7 + (p / 250) as u8, (p % 250) as u8, 1, 5000),
                 t0 + Duration::from_millis(u64::from(p)),
                 false,
             );
@@ -1850,15 +2263,11 @@ mod tests {
         let list = &announced[&h];
         assert_eq!(list.len(), MAX_PEERS_PER_TORRENT);
         // The first 100 announced were the ones dropped.
-        assert!(!list.iter().any(|p| p.addr == addr(7, 7, 0, 0, 5000)));
-        assert!(list.iter().any(|p| p.addr
-            == addr(
-                7,
-                7,
-                ((MAX_PEERS_PER_TORRENT as u16 + 99) >> 8) as u8,
-                (MAX_PEERS_PER_TORRENT as u16 + 99) as u8,
-                5000
-            )));
+        assert!(!list.iter().any(|p| p.addr == addr(7, 7, 0, 1, 5000)));
+        let last_p = MAX_PEERS_PER_TORRENT as u16 + 99;
+        assert!(list
+            .iter()
+            .any(|p| p.addr == addr(7, 7 + (last_p / 250) as u8, (last_p % 250) as u8, 1, 5000)));
     }
 
     #[test]
@@ -1874,7 +2283,7 @@ mod tests {
             store_announce(
                 &mut announced,
                 info_hash,
-                addr(6, 6, (p >> 8) as u8, p as u8, 4000),
+                addr(6, 6 + (p / 250) as u8, (p % 250) as u8, 1, 4000),
                 now,
                 false,
             );
@@ -1912,6 +2321,7 @@ mod tests {
                 port: 6881,
                 token: vec![0, 0, 0, 0, 0, 0, 0, 0],
                 implied_port: false,
+                seed: false,
             },
             from,
             &mut test_ctx(&mut routing, &mut routing_v6, &mut pending, &mut announced),
@@ -1950,6 +2360,7 @@ mod tests {
                 port: 6881,
                 token,
                 implied_port: true,
+                seed: false,
             },
             from,
             &mut test_ctx(&mut routing, &mut routing_v6, &mut pending, &mut announced),
@@ -2013,6 +2424,7 @@ mod tests {
                 port: 6881,
                 token,
                 implied_port: false,
+                seed: false,
             },
             from6,
             &mut test_ctx(&mut routing, &mut routing_v6, &mut pending, &mut announced),
@@ -2191,14 +2603,14 @@ mod tests {
             sig: None,
             seq: None,
         };
-        assert!(verify_get_item(target, None, &good_imm));
+        assert!(verify_get_item(target, None, None, &good_imm));
         let forged_imm = GetItem {
             v: b"11:tampered!!".to_vec(),
             k: None,
             sig: None,
             seq: None,
         };
-        assert!(!verify_get_item(target, None, &forged_imm));
+        assert!(!verify_get_item(target, None, None, &forged_imm));
 
         // 2. Mutable item (no salt): valid Ed25519 signature passes, forged signature fails.
         let sk = SigningKey::from_bytes(&[0x77; 32]);
@@ -2213,12 +2625,55 @@ mod tests {
             sig: Some(sig),
             seq: Some(5),
         };
-        assert!(verify_get_item(mut_target, Some(5), &good_mut));
-        assert!(!verify_get_item(mut_target, Some(6), &good_mut));
+        assert!(verify_get_item(mut_target, None, Some(5), &good_mut));
+        assert!(!verify_get_item(mut_target, None, Some(6), &good_mut));
 
         let mut bad_mut = good_mut.clone();
         bad_mut.sig = Some([0xAB; 64]);
-        assert!(!verify_get_item(mut_target, None, &bad_mut));
+        assert!(!verify_get_item(mut_target, None, None, &bad_mut));
+
+        // 3. Previously, supplying a mismatched key `k` or bogus mutable item against ANY
+        // target bypassed verification. Now it must fail target binding and signature checks.
+        let other_sk = SigningKey::from_bytes(&[0x88; 32]);
+        let other_pk = other_sk.verifying_key().to_bytes();
+        let spoofed_target_item = GetItem {
+            v: v.clone(),
+            k: Some(other_pk),
+            sig: Some([0xAB; 64]),
+            seq: Some(99),
+        };
+        assert!(!verify_get_item(target, None, None, &spoofed_target_item));
+        assert!(!verify_get_item(
+            mut_target,
+            None,
+            None,
+            &spoofed_target_item
+        ));
+
+        // 4. Salted mutable item must verify with exact salt and fail with missing/wrong salt.
+        let salt = b"my-salt";
+        let salted_target = compute_mutable_target(&pk, Some(salt));
+        let salted_payload = format_sign_payload(Some(salt), 7, &v);
+        let salted_sig = sk.sign(&salted_payload).to_bytes();
+        let salted_item = GetItem {
+            v,
+            k: Some(pk),
+            sig: Some(salted_sig),
+            seq: Some(7),
+        };
+        assert!(verify_get_item(
+            salted_target,
+            Some(salt),
+            None,
+            &salted_item
+        ));
+        assert!(!verify_get_item(salted_target, None, None, &salted_item));
+        assert!(!verify_get_item(
+            salted_target,
+            Some(b"wrong-salt"),
+            None,
+            &salted_item
+        ));
     }
 
     #[test]
@@ -2283,8 +2738,10 @@ mod tests {
     #[test]
     fn apply_vote_preserves_enforce_node_id_flag() {
         let old_id = [0x11u8; 20];
-        let cell = Arc::new(std::sync::RwLock::new(old_id));
-        let mut our_id = old_id;
+        let cell_v4 = Arc::new(std::sync::RwLock::new(old_id));
+        let cell_v6 = Arc::new(std::sync::RwLock::new(old_id));
+        let mut our_id_v4 = old_id;
+        let mut our_id_v6 = old_id;
         let mut routing = RoutingTable::new(old_id);
         let mut routing_v6 = RoutingTableV6::new(old_id);
         routing.set_enforce_node_id(true);
@@ -2298,14 +2755,117 @@ mod tests {
                 &mut vote,
                 &mut v4,
                 &mut v6,
-                &cell,
-                &mut our_id,
+                &cell_v4,
+                &cell_v6,
+                &mut our_id_v4,
+                &mut our_id_v6,
                 &mut routing,
                 &mut routing_v6,
             );
         }
-        assert_ne!(our_id, old_id);
+        assert_ne!(our_id_v4, old_id);
+        assert_eq!(our_id_v6, old_id);
         assert!(routing.enforce_node_id());
         assert!(routing_v6.enforce_node_id());
+    }
+
+    #[test]
+    fn dual_stack_bep42_votes_are_isolated_per_family() {
+        let old_id = [0x11u8; 20];
+        let cell_v4 = Arc::new(std::sync::RwLock::new(old_id));
+        let cell_v6 = Arc::new(std::sync::RwLock::new(old_id));
+        let mut our_id_v4 = old_id;
+        let mut our_id_v6 = old_id;
+        let mut routing = RoutingTable::new(old_id);
+        let mut routing_v6 = RoutingTableV6::new(old_id);
+        let (mut v4, mut v6) = (IpVoter::new(), IpVoter::new());
+
+        let me_v6: IpAddr = "3fff:0:42::99".parse().unwrap();
+        // Cast 8 public IPv6 votes from distinct IPv6 /32 voter groups.
+        for n in 0..8u16 {
+            let voter6 = IpAddr::V6(std::net::Ipv6Addr::new(0x3fff, n + 1, 0, 0, 0, 0, 0, 1));
+            let mut vote = Some((voter6, me_v6));
+            apply_vote(
+                &mut vote,
+                &mut v4,
+                &mut v6,
+                &cell_v4,
+                &cell_v6,
+                &mut our_id_v4,
+                &mut our_id_v6,
+                &mut routing,
+                &mut routing_v6,
+            );
+        }
+        assert_ne!(our_id_v6, old_id);
+        assert_eq!(our_id_v4, old_id, "IPv6 vote must not change our_id_v4");
+        assert!(crate::bep42::verify_secure_node_id(&our_id_v6, me_v6));
+    }
+
+    #[test]
+    fn ipv4_announce_host_and_subnet_caps() {
+        let mut announced: HashMap<[u8; 20], Vec<AnnouncedPeer>> = HashMap::new();
+        let h = [0x88u8; 20];
+        let t0 = Instant::now();
+
+        // Same public IPv4 (198.51.100.1) capped at MAX_PEERS_PER_IPV4_HOST (2).
+        for p in 0..5u16 {
+            store_announce(
+                &mut announced,
+                h,
+                addr(198, 51, 100, 1, 6881 + p),
+                t0 + Duration::from_millis(u64::from(p)),
+                false,
+            );
+        }
+        assert_eq!(announced[&h].len(), MAX_PEERS_PER_IPV4_HOST);
+
+        // Same public /24 (198.51.100.x) across distinct hosts capped at MAX_PEERS_PER_IPV4_SUBNET_24 (16).
+        for d in 10..40u8 {
+            store_announce(
+                &mut announced,
+                h,
+                addr(198, 51, 100, d, 6881),
+                t0 + Duration::from_millis(100 + u64::from(d)),
+                false,
+            );
+        }
+        assert_eq!(announced[&h].len(), MAX_PEERS_PER_IPV4_SUBNET_24);
+    }
+
+    #[tokio::test]
+    async fn announce_peer_seed_updates_bep33_scrape_seeders() {
+        let ((a, _a_addr), (_b, b_addr)) = spawn_pair().await;
+        let info_hash = [0x99u8; 20];
+        let (token, _) = a.get_peers(b_addr, info_hash).await.unwrap();
+        a.announce_peer_seed(b_addr, info_hash, 6881, token, true)
+            .await
+            .unwrap();
+        let scrape = a.scrape(b_addr, info_hash).await.unwrap();
+        assert_eq!(scrape.seeders, 1);
+        assert_eq!(scrape.leechers, 0);
+    }
+
+    #[tokio::test]
+    async fn iterative_get_peers_caps_closest_nodes_at_k() {
+        let (client, _) = spawn([0x01; 20], "127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let info_hash = [0x77; 20];
+        let mut nodes = Vec::new();
+        let mut addrs = Vec::new();
+        for i in 2..14u8 {
+            let (n, a) = spawn([i; 20], "127.0.0.1:0".parse().unwrap())
+                .await
+                .unwrap();
+            let SocketAddr::V4(v4) = a else {
+                unreachable!()
+            };
+            nodes.push(n);
+            addrs.push(v4);
+        }
+        let res = client.iterative_get_peers(info_hash, &addrs).await.unwrap();
+        assert_eq!(res.closest_nodes.len(), routing::K);
+        drop(nodes);
     }
 }

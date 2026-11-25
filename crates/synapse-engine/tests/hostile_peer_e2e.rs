@@ -121,10 +121,12 @@ async fn connect_evil(data: &[u8]) -> (Framed<TcpStream, PeerCodec>, tempfile::T
             .unwrap();
     });
 
+    let mut reserved = [0u8; 8];
+    reserved[7] |= 0x04; // BEP 6 Fast Extension (needed for RejectRequest assertions)
     let mut framed = Framed::new(TcpStream::connect(addr).await.unwrap(), PeerCodec::new());
     framed
         .send(Message::Handshake {
-            reserved: [0; 8],
+            reserved,
             info_hash: info.hash,
             peer_id: EVIL_ID,
         })

@@ -17,6 +17,8 @@ const MAX_MESSAGES_PER_WINDOW: u32 = 50;
 const BLOCK_DURATION: Duration = Duration::from_secs(5 * 60);
 /// Sources tracked at once. Bounded so spoofed-source floods cannot grow the table.
 const MAX_TRACKED_SOURCES: usize = 4096;
+/// Number of oldest/unblocked entries evicted at once when full to amortize cleanup to O(1).
+const EVICT_BATCH: usize = 256;
 
 struct Entry {
     window_start: Instant,
@@ -90,27 +92,31 @@ impl DosBlocker {
             .is_some_and(|until| now < until)
     }
 
-    /// Makes room: drops expired windows first, then the stalest non-blocked entry.
+    /// Makes room: drops expired windows first, then batch-evicts oldest non-blocked entries.
     fn evict(&mut self, now: Instant) {
         self.entries.retain(|_, e| {
             e.blocked_until.is_some_and(|u| now < u) || now.duration_since(e.window_start) < WINDOW
         });
-        if self.entries.len() >= MAX_TRACKED_SOURCES {
-            let victim = self
+        let target_len = MAX_TRACKED_SOURCES.saturating_sub(EVICT_BATCH);
+        if self.entries.len() > target_len {
+            let drop_count = self.entries.len() - target_len;
+            let mut candidates: Vec<(IpAddr, bool, Instant)> = self
                 .entries
                 .iter()
-                .filter(|(_, e)| e.blocked_until.is_none())
-                .min_by_key(|(_, e)| e.window_start)
-                .map(|(ip, _)| *ip)
-                .or_else(|| {
-                    // Fallback when all tracked entries are blocked: evict earliest-expiring block
-                    self.entries
-                        .iter()
-                        .min_by_key(|(_, e)| e.blocked_until.unwrap_or(e.window_start))
-                        .map(|(ip, _)| *ip)
-                });
-            if let Some(victim) = victim {
-                self.entries.remove(&victim);
+                .map(|(&ip, e)| {
+                    (
+                        ip,
+                        e.blocked_until.is_some(),
+                        e.blocked_until.unwrap_or(e.window_start),
+                    )
+                })
+                .collect();
+            if !candidates.is_empty() {
+                let pivot = (drop_count - 1).min(candidates.len() - 1);
+                candidates.select_nth_unstable_by_key(pivot, |&(_, blocked, ts)| (blocked, ts));
+                for &(victim, _, _) in &candidates[..=pivot] {
+                    self.entries.remove(&victim);
+                }
             }
         }
     }
@@ -225,5 +231,33 @@ mod tests {
             "8000 B/s refill"
         );
         assert!(!q.try_consume(100, t0 + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn batch_eviction_frees_batch_slots_and_preserves_blocked_sources() {
+        let mut d = DosBlocker::new();
+        let t0 = Instant::now();
+        let blocked_ip = ip(7);
+        for _ in 0..=MAX_MESSAGES_PER_WINDOW {
+            d.allow(blocked_ip, t0);
+        }
+        assert!(d.is_blocked(blocked_ip, t0));
+
+        // Fill up to MAX_TRACKED_SOURCES with fresh unblocked sources, then trigger one eviction.
+        for n in 0..MAX_TRACKED_SOURCES as u32 {
+            d.allow(
+                IpAddr::from([10 + (n >> 16) as u8, (n >> 8) as u8, n as u8, 1]),
+                t0,
+            );
+        }
+        assert!(
+            d.entries.len() <= MAX_TRACKED_SOURCES - EVICT_BATCH + 1,
+            "expected batch eviction to leave headroom, len={}",
+            d.entries.len()
+        );
+        assert!(
+            d.is_blocked(blocked_ip, t0),
+            "active blocked source must survive batch eviction while unblocked entries exist"
+        );
     }
 }

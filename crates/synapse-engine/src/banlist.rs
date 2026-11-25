@@ -15,12 +15,42 @@ pub const DEFAULT_BAN_DURATION: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Upper bound on tracked bans, so a flood of distinct poisoning sources (or a spoofed
 /// address space) cannot grow the map without limit. When full, expired entries are
-/// dropped first, then the entry closest to expiry.
+/// dropped first, then the oldest entries closest to expiry are evicted in a batch.
 const MAX_BANS: usize = 100_000;
+const EVICT_BATCH: usize = 1024;
 
 #[derive(Default)]
 pub struct BanList {
     entries: RwLock<HashMap<IpAddr, Instant>>,
+}
+
+fn evict_batch(
+    entries: &mut HashMap<IpAddr, Instant>,
+    now: Instant,
+    max_bans: usize,
+    batch: usize,
+) {
+    entries.retain(|_, &mut exp| exp > now);
+    if entries.len() >= max_bans {
+        let target_len = max_bans.saturating_sub(batch);
+        let drop_count = entries.len().saturating_sub(target_len).max(1);
+        let mut candidates: Vec<(IpAddr, Instant)> =
+            entries.iter().map(|(&k, &v)| (k, v)).collect();
+        if !candidates.is_empty() {
+            let pivot = (drop_count - 1).min(candidates.len() - 1);
+            candidates.select_nth_unstable_by_key(pivot, |&(_, exp)| exp);
+            for &(victim, _) in &candidates[..=pivot] {
+                entries.remove(&victim);
+            }
+        }
+    }
+}
+
+fn canonical_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(ip),
+        v4 => v4,
+    }
 }
 
 impl BanList {
@@ -30,17 +60,12 @@ impl BanList {
 
     /// Bans `ip` until `duration` from now (extending an existing ban, never shortening it).
     pub fn ban(&self, ip: IpAddr, duration: Duration) {
+        let ip = canonical_ip(ip);
         let until = Instant::now() + duration;
         let mut entries = self.entries.write();
         if entries.len() >= MAX_BANS && !entries.contains_key(&ip) {
             let now = Instant::now();
-            entries.retain(|_, &mut exp| exp > now);
-            if entries.len() >= MAX_BANS {
-                if let Some(&oldest) = entries.iter().min_by_key(|(_, &exp)| exp).map(|(ip, _)| ip)
-                {
-                    entries.remove(&oldest);
-                }
-            }
+            evict_batch(&mut entries, now, MAX_BANS, EVICT_BATCH);
         }
         entries
             .entry(ip)
@@ -49,6 +74,7 @@ impl BanList {
     }
 
     pub fn is_banned(&self, ip: IpAddr) -> bool {
+        let ip = canonical_ip(ip);
         match self.entries.read().get(&ip) {
             Some(&exp) => exp > Instant::now(),
             None => false,
@@ -57,6 +83,7 @@ impl BanList {
 
     /// Lifts a ban early; returns whether one was in place.
     pub fn unban(&self, ip: IpAddr) -> bool {
+        let ip = canonical_ip(ip);
         self.entries.write().remove(&ip).is_some()
     }
 
@@ -71,7 +98,8 @@ impl BanList {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        let now = Instant::now();
+        !self.entries.read().values().any(|&exp| exp > now)
     }
 
     /// Drops expired entries; call periodically.
@@ -119,5 +147,27 @@ mod tests {
         bans.ban(ip(1), Duration::from_secs(3600));
         bans.ban(ip(1), Duration::ZERO);
         assert!(bans.is_banned(ip(1)));
+        // IPv4-mapped IPv6 form shares canonical identity with IPv4.
+        let mapped: IpAddr = "::ffff:198.51.100.1".parse().unwrap();
+        assert!(bans.is_banned(mapped));
+        assert!(bans.unban(mapped));
+        assert!(!bans.is_banned(ip(1)));
+    }
+
+    #[test]
+    fn batch_eviction_drops_earliest_expiring_and_preserves_longest_bans() {
+        let now = Instant::now();
+        let mut entries = HashMap::new();
+        for i in 0..100u8 {
+            entries.insert(ip(i), now + Duration::from_secs(10 + u64::from(i)));
+        }
+        evict_batch(&mut entries, now, 100, 20);
+        assert_eq!(entries.len(), 80);
+        for i in 0..20u8 {
+            assert!(!entries.contains_key(&ip(i)), "expected {i} to be evicted");
+        }
+        for i in 20..100u8 {
+            assert!(entries.contains_key(&ip(i)), "expected {i} to survive");
+        }
     }
 }

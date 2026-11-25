@@ -42,10 +42,10 @@
 //! it is still in flight.
 
 use std::collections::HashMap;
-use std::fs::File;
 use std::io;
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::Arc;
 use std::thread;
@@ -54,8 +54,18 @@ use bytes::{Bytes, BytesMut};
 use io_uring::{opcode, types, IoUring};
 use tokio::sync::oneshot;
 
-use crate::cache::FileCache;
-use crate::{DiskError, ReadJob, Result, WriteJob};
+use crate::cache::{FileCache, OpenMode};
+use crate::{DiskError, ReadJob, Result, WriteJob, WriteReservation};
+
+/// Linux caps a single read/write syscall (and io_uring RW CQE result) at 2 GiB - 4 KiB.
+const MAX_RW_COUNT: usize = 0x7fff_f000;
+/// Cap concurrent un-reaped ops in the ring to avoid overflowing the default 2*SQ completion queue
+/// while reserving room for the `eventfd` wakeup `PollAdd`.
+const MAX_IN_FLIGHT_OPS: usize = 510;
+/// Sentinel `user_data` reserved for the persistent `eventfd` wakeup `PollAdd` SQE.
+const WAKEUP_USER_DATA: u64 = u64::MAX;
+/// Bound CQE reaping per iteration so newly queued jobs and retries get fair progress.
+const REAP_BATCH_LIMIT: usize = 128;
 
 #[derive(Clone, Copy)]
 pub struct IoUringDiskEngineConfig {
@@ -81,6 +91,7 @@ enum Job {
         offset: u64,
         data: Bytes,
         file_len: u64,
+        reservation: Option<Arc<WriteReservation>>,
     },
     Read {
         path: Arc<PathBuf>,
@@ -98,25 +109,125 @@ enum OpResponder {
     Sync(oneshot::Sender<Result<()>>),
 }
 
+struct EventFd {
+    fd: OwnedFd,
+    signaled: AtomicBool,
+}
+
+impl EventFd {
+    fn new() -> io::Result<Self> {
+        // SAFETY: `eventfd` creates a new non-blocking close-on-exec fd; `-1` is checked before wrapping.
+        let raw = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+        if raw < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `raw >= 0` is an open owned file descriptor returned by `eventfd(2)`.
+        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        Ok(Self {
+            fd,
+            signaled: AtomicBool::new(false),
+        })
+    }
+
+    fn raw_fd(&self) -> RawFd {
+        self.fd.as_raw_fd()
+    }
+
+    fn write_one(&self) {
+        let buf = 1u64.to_ne_bytes();
+        loop {
+            // SAFETY: `self.fd` is a valid open eventfd and `buf` points to 8 stack bytes.
+            let n = unsafe {
+                libc::write(
+                    self.fd.as_raw_fd(),
+                    buf.as_ptr().cast::<libc::c_void>(),
+                    buf.len(),
+                )
+            };
+            if n >= 0 {
+                return;
+            }
+            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return;
+        }
+    }
+
+    fn notify(&self) {
+        if !self.signaled.swap(true, Ordering::SeqCst) {
+            self.write_one();
+        }
+    }
+
+    fn force_notify(&self) {
+        self.signaled.store(true, Ordering::SeqCst);
+        self.write_one();
+    }
+
+    fn drain(&self) {
+        let mut buf = [0u8; 8];
+        loop {
+            // SAFETY: `self.fd` is a valid open eventfd and `buf` points to 8 writable stack bytes.
+            let n = unsafe {
+                libc::read(
+                    self.fd.as_raw_fd(),
+                    buf.as_mut_ptr().cast::<libc::c_void>(),
+                    buf.len(),
+                )
+            };
+            if n >= 0 {
+                return;
+            }
+            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return;
+        }
+    }
+}
+
 /// Everything that must stay alive, unmoved, until this operation's CQE arrives.
 struct PendingOp {
-    _file: Arc<File>,
+    _file: Arc<std::fs::File>,
     /// Absolute file offset for the *next* SQE this op submits -- advanced on each
     /// short completion so a retry resumes exactly where the last one left off.
     offset: u64,
     _write_buf: Option<Bytes>,
+    _write_reservation: Option<Arc<WriteReservation>>,
     read_buf: Option<BytesMut>,
     /// Bytes already completed for this op across however many short completions
     /// preceded this one (0 on first submission).
     progress: usize,
     expected_len: usize,
-    path: PathBuf,
+    path: Arc<PathBuf>,
     responder: OpResponder,
 }
 
+/// Declaration order guarantees `ring` drops *first* (closing the kernel ring FD)
+/// before `pending` buffers/file handles, `cache`, and `eventfd` are released, even on unwind.
+struct RingLoopState {
+    ring: IoUring,
+    pending: HashMap<u64, PendingOp>,
+    cqe_buf: Vec<(u64, i32)>,
+    cache: Arc<FileCache>,
+    eventfd: Arc<EventFd>,
+    eventfd_poll_armed: bool,
+    next_id: u64,
+}
+
 pub struct IoUringDiskEngine {
-    tx: std_mpsc::Sender<(Job, OpResponder)>,
+    tx: Option<std_mpsc::Sender<(Job, OpResponder)>>,
+    eventfd: Arc<EventFd>,
+    cache: Arc<FileCache>,
     budget: Arc<crate::WriteBudget>,
+}
+
+impl Drop for IoUringDiskEngine {
+    fn drop(&mut self) {
+        drop(self.tx.take());
+        self.eventfd.force_notify();
+    }
 }
 
 impl IoUringDiskEngine {
@@ -125,14 +236,19 @@ impl IoUringDiskEngine {
     /// blocking `io_uring_setup`, etc.) instead of failing on first use.
     pub async fn new(config: IoUringDiskEngineConfig) -> io::Result<IoUringDiskEngine> {
         let ring = IoUring::new(config.queue_depth)?;
+        let eventfd = Arc::new(EventFd::new()?);
         let (tx, rx) = std_mpsc::channel();
-        let max_open_files = config.max_open_files;
+        let cache = Arc::new(FileCache::new(config.max_open_files));
+        let worker_cache = cache.clone();
+        let worker_eventfd = eventfd.clone();
         thread::Builder::new()
             .name("diskio-uring".into())
-            .spawn(move || run_ring(ring, rx, max_open_files))
+            .spawn(move || run_ring(ring, rx, worker_cache, worker_eventfd))
             .map_err(io::Error::other)?;
         Ok(IoUringDiskEngine {
-            tx,
+            tx: Some(tx),
+            eventfd,
+            cache,
             budget: crate::WriteBudget::new(config.max_write_buffer_bytes),
         })
     }
@@ -142,6 +258,10 @@ impl IoUringDiskEngine {
             path: path.to_path_buf(),
             source: io::Error::other("io_uring worker thread is gone"),
         }
+    }
+
+    pub fn evict(&self, path: &std::path::Path) {
+        self.cache.evict(path);
     }
 
     pub fn in_flight_write_bytes(&self) -> usize {
@@ -160,41 +280,49 @@ impl IoUringDiskEngine {
         // Same behaviour as the blocking engine: merge contiguous blocks into single writes
         // and hold at most `max_write_buffer_bytes` of data in flight.
         let jobs = crate::coalesce_write_jobs(jobs);
-        let total_bytes: usize = jobs.iter().map(|j| j.data.len()).sum();
-        if total_bytes == 0 {
+        if jobs.is_empty() {
             return Ok(());
         }
-        let _reservation = self
-            .budget
-            .reserve(total_bytes)
-            .await
-            .map_err(|e| DiskError::Io {
-                path: PathBuf::from("<buffer>"),
-                source: io::Error::new(io::ErrorKind::BrokenPipe, e),
-            })?;
+        let total_bytes: usize = jobs.iter().map(|j| j.data.len()).sum();
+        let reservation = if total_bytes > 0 {
+            Some(Arc::new(self.budget.reserve(total_bytes).await.map_err(
+                |e| DiskError::Io {
+                    path: PathBuf::from("<buffer>"),
+                    source: io::Error::new(io::ErrorKind::BrokenPipe, e),
+                },
+            )?))
+        } else {
+            None
+        };
+        let tx = self
+            .tx
+            .as_ref()
+            .ok_or_else(|| Self::send_gone_err(&jobs[0].path))?;
         let mut receivers = Vec::with_capacity(jobs.len());
         for job in jobs {
             let (otx, orx) = oneshot::channel();
             let path = job.path.clone();
-            self.tx
-                .send((
-                    Job::Write {
-                        path: job.path,
-                        offset: job.offset,
-                        data: job.data,
-                        file_len: job.file_len,
-                    },
-                    OpResponder::Write(otx),
-                ))
-                .map_err(|_| Self::send_gone_err(&path))?;
-            receivers.push(orx);
+            tx.send((
+                Job::Write {
+                    path: job.path,
+                    offset: job.offset,
+                    data: job.data,
+                    file_len: job.file_len,
+                    reservation: reservation.clone(),
+                },
+                OpResponder::Write(otx),
+            ))
+            .map_err(|_| Self::send_gone_err(&path))?;
+            receivers.push((path, orx));
         }
+        self.eventfd.notify();
+        // Drop the local Arc so `budget` is released once the last PendingOp in the worker drops.
+        drop(reservation);
         // Every SQE above is already queued for the worker thread to batch-submit; we
         // just wait for each to complete. Order of completion doesn't need to match
         // submission order, so this doesn't force artificial serialization.
-        for rx in receivers {
-            rx.await
-                .expect("io_uring worker dropped a pending write response")?;
+        for (path, rx) in receivers {
+            rx.await.map_err(|_| Self::send_gone_err(&path))??;
         }
         Ok(())
     }
@@ -202,126 +330,192 @@ impl IoUringDiskEngine {
     pub async fn read(&self, job: ReadJob) -> Result<Bytes> {
         let (otx, orx) = oneshot::channel();
         let path = job.path.clone();
-        self.tx
-            .send((
-                Job::Read {
-                    path: job.path,
-                    offset: job.offset,
-                    len: job.len,
-                },
-                OpResponder::Read(otx),
-            ))
-            .map_err(|_| Self::send_gone_err(&path))?;
-        orx.await
-            .expect("io_uring worker dropped a pending read response")
+        let tx = self.tx.as_ref().ok_or_else(|| Self::send_gone_err(&path))?;
+        tx.send((
+            Job::Read {
+                path: job.path,
+                offset: job.offset,
+                len: job.len,
+            },
+            OpResponder::Read(otx),
+        ))
+        .map_err(|_| Self::send_gone_err(&path))?;
+        self.eventfd.notify();
+        orx.await.map_err(|_| Self::send_gone_err(&path))?
     }
 
     pub async fn sync(&self, path: Arc<PathBuf>) -> Result<()> {
         let (otx, orx) = oneshot::channel();
-        self.tx
-            .send((Job::Sync { path: path.clone() }, OpResponder::Sync(otx)))
+        let tx = self.tx.as_ref().ok_or_else(|| Self::send_gone_err(&path))?;
+        tx.send((Job::Sync { path: path.clone() }, OpResponder::Sync(otx)))
             .map_err(|_| Self::send_gone_err(&path))?;
-        orx.await
-            .expect("io_uring worker dropped a pending sync response")
+        self.eventfd.notify();
+        orx.await.map_err(|_| Self::send_gone_err(&path))?
     }
 }
 
-fn run_ring(mut ring: IoUring, rx: std_mpsc::Receiver<(Job, OpResponder)>, max_open_files: usize) {
-    let cache = FileCache::new(max_open_files);
-    let mut pending: HashMap<u64, PendingOp> = HashMap::new();
-    let mut next_id: u64 = 0;
+fn next_op_id(state: &mut RingLoopState) -> u64 {
+    let mut id = state.next_id;
+    if id == WAKEUP_USER_DATA {
+        id = 0;
+    }
+    state.next_id = id.wrapping_add(1);
+    if state.next_id == WAKEUP_USER_DATA {
+        state.next_id = 0;
+    }
+    id
+}
+
+fn arm_eventfd_poll(state: &mut RingLoopState) -> io::Result<()> {
+    if state.eventfd_poll_armed {
+        return Ok(());
+    }
+    let entry = opcode::PollAdd::new(types::Fd(state.eventfd.raw_fd()), libc::POLLIN as u32)
+        .build()
+        .user_data(WAKEUP_USER_DATA);
+    // SAFETY: `state.eventfd` outlives `state.ring` by `RingLoopState` field declaration order,
+    // and the poll targets `POLLIN` on an owned `eventfd` until its `WAKEUP_USER_DATA` CQE arrives.
+    unsafe { push_entry(&mut state.ring, &entry)? };
+    state.eventfd_poll_armed = true;
+    Ok(())
+}
+
+fn run_ring(
+    ring: IoUring,
+    rx: std_mpsc::Receiver<(Job, OpResponder)>,
+    cache: Arc<FileCache>,
+    eventfd: Arc<EventFd>,
+) {
+    let mut state = RingLoopState {
+        ring,
+        pending: HashMap::new(),
+        cqe_buf: Vec::with_capacity(REAP_BATCH_LIMIT),
+        cache,
+        eventfd,
+        eventfd_poll_armed: false,
+        next_id: 0,
+    };
+    let mut disconnected = false;
 
     loop {
-        // Drain and submit everything currently queued without blocking.
-        loop {
-            match rx.try_recv() {
-                Ok((job, responder)) => {
-                    submit_job(
-                        &mut ring,
-                        &cache,
-                        &mut pending,
-                        &mut next_id,
-                        job,
-                        responder,
-                    );
+        reap_completions(&mut state);
+
+        if !disconnected {
+            // Clear signaled BEFORE draining `rx` (paired with SeqCst swap+write on producers)
+            // so no submitted job can slip in after `try_recv()` without waking `eventfd`.
+            state.eventfd.signaled.store(false, Ordering::SeqCst);
+            while state.pending.len() < MAX_IN_FLIGHT_OPS {
+                match rx.try_recv() {
+                    Ok((job, responder)) => submit_job(&mut state, job, responder),
+                    Err(std_mpsc::TryRecvError::Empty) => break,
+                    Err(std_mpsc::TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
                 }
-                Err(std_mpsc::TryRecvError::Empty) => break,
-                Err(std_mpsc::TryRecvError::Disconnected) => return,
             }
         }
 
-        if pending.is_empty() {
-            // Nothing in flight: block for the next job rather than busy-polling.
-            match rx.recv() {
-                Ok((job, responder)) => {
-                    submit_job(
-                        &mut ring,
-                        &cache,
-                        &mut pending,
-                        &mut next_id,
-                        job,
-                        responder,
-                    );
-                }
-                Err(_) => return,
-            }
+        if disconnected && state.pending.is_empty() {
+            return;
+        }
+
+        if !state.ring.completion().is_empty() {
+            let _ = state.ring.submit();
             continue;
         }
 
-        if let Err(e) = ring.submit_and_wait(1) {
-            tracing::error!("io_uring submit_and_wait failed: {e}");
+        if !disconnected && state.pending.len() < MAX_IN_FLIGHT_OPS {
+            if let Err(e) = arm_eventfd_poll(&mut state) {
+                tracing::error!("io_uring eventfd PollAdd failed: {e}");
+                let msg = e.to_string();
+                for (_, op) in state.pending.drain() {
+                    fail_responder(op.responder, &op.path, io::Error::other(msg.clone()));
+                }
+                return;
+            }
+        }
+
+        match state.ring.submit_and_wait(1) {
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) if e.raw_os_error() == Some(libc::EBUSY) => {}
+            Err(e) => {
+                tracing::error!("io_uring submit_and_wait failed: {e}");
+                let msg = e.to_string();
+                for (_, op) in state.pending.drain() {
+                    fail_responder(op.responder, &op.path, io::Error::other(msg.clone()));
+                }
+                return;
+            }
+        }
+
+        reap_completions(&mut state);
+
+        if disconnected && state.pending.is_empty() {
+            return;
+        }
+    }
+}
+
+fn reap_completions(state: &mut RingLoopState) -> usize {
+    state.cqe_buf.clear();
+    {
+        let mut cq = state.ring.completion();
+        for cqe in (&mut cq).take(REAP_BATCH_LIMIT) {
+            state.cqe_buf.push((cqe.user_data(), cqe.result()));
+        }
+    }
+    let reaped = state.cqe_buf.len();
+    let mut completed = std::mem::take(&mut state.cqe_buf);
+
+    for &(user_data, result) in &completed {
+        if user_data == WAKEUP_USER_DATA {
+            state.eventfd_poll_armed = false;
+            state.eventfd.drain();
             continue;
         }
-        let completed: Vec<(u64, i32)> = ring
-            .completion()
-            .map(|cqe| (cqe.user_data(), cqe.result()))
-            .collect();
-        for (user_data, result) in completed {
-            if let Some(op) = pending.remove(&user_data) {
-                let fd = types::Fd(op._file.as_raw_fd());
-                if let Some((entry, retry_op)) = process_completion(fd, op, result) {
-                    let retry_id = next_id;
-                    next_id += 1;
-                    let entry = entry.user_data(retry_id);
-                    // SAFETY: same invariant as the initial submission in `submit_job` --
-                    // `retry_op` (and its buffer/file) is inserted into `pending` before
-                    // this SQE is pushed, and is only dropped after the matching CQE is
-                    // reaped in a future pass through this same loop.
-                    let push_result = unsafe { push_entry(&mut ring, &entry) };
-                    match push_result {
-                        Ok(()) => {
-                            pending.insert(retry_id, retry_op);
-                        }
-                        Err(e) => {
-                            fail_responder(retry_op.responder, retry_op.path, e);
-                        }
+        if let Some(op) = state.pending.remove(&user_data) {
+            let fd = types::Fd(op._file.as_raw_fd());
+            if let Some((entry, retry_op)) = process_completion(fd, op, result) {
+                let retry_id = next_op_id(state);
+                let entry = entry.user_data(retry_id);
+                // SAFETY: `retry_op` (and its buffer/file) is inserted into `state.pending`
+                // before any future wait and `state.ring` drops before `state.pending`.
+                let push_result = unsafe { push_entry(&mut state.ring, &entry) };
+                match push_result {
+                    Ok(()) => {
+                        state.pending.insert(retry_id, retry_op);
+                    }
+                    Err(e) => {
+                        fail_responder(retry_op.responder, &retry_op.path, e);
                     }
                 }
             }
         }
     }
+
+    completed.clear();
+    state.cqe_buf = completed;
+    reaped
 }
 
-fn submit_job(
-    ring: &mut IoUring,
-    cache: &FileCache,
-    pending: &mut HashMap<u64, PendingOp>,
-    next_id: &mut u64,
-    job: Job,
-    responder: OpResponder,
-) {
-    let id = *next_id;
-    *next_id += 1;
+fn submit_job(state: &mut RingLoopState, job: Job, responder: OpResponder) {
+    let id = next_op_id(state);
 
-    let (path, file_len_hint): (&PathBuf, Option<u64>) = match &job {
-        Job::Write { path, file_len, .. } => (path, Some(*file_len)),
-        Job::Read { path, .. } => (path, None),
-        Job::Sync { path } => (path, None),
+    let (path, mode): (&PathBuf, OpenMode) = match &job {
+        Job::Write { path, file_len, .. } => (
+            path,
+            OpenMode::Write {
+                file_len: *file_len,
+            },
+        ),
+        Job::Read { path, .. } | Job::Sync { path } => (path, OpenMode::ReadOnly),
     };
-    let file = match cache.get_or_open(path, file_len_hint) {
+    let file = match state.cache.get_or_open(path, mode) {
         Ok(file) => file,
         Err(e) => {
-            fail_responder(responder, path.clone(), e);
+            fail_responder(responder, path.as_path(), e);
             return;
         }
     };
@@ -329,9 +523,28 @@ fn submit_job(
 
     let (entry, op) = match job {
         Job::Write {
-            path, offset, data, ..
+            path,
+            offset,
+            data,
+            reservation,
+            ..
         } => {
-            let entry = opcode::Write::new(fd, data.as_ptr(), data.len() as u32)
+            if offset > i64::MAX as u64 {
+                fail_responder(
+                    responder,
+                    &path,
+                    io::Error::new(io::ErrorKind::InvalidInput, "write offset exceeds i64::MAX"),
+                );
+                return;
+            }
+            if data.is_empty() {
+                if let OpResponder::Write(tx) = responder {
+                    let _ = tx.send(Ok(()));
+                }
+                return;
+            }
+            let chunk_len = data.len().min(MAX_RW_COUNT) as u32;
+            let entry = opcode::Write::new(fd, data.as_ptr(), chunk_len)
                 .offset(offset)
                 .build()
                 .user_data(id);
@@ -341,15 +554,31 @@ fn submit_job(
                 expected_len: data.len(),
                 progress: 0,
                 _write_buf: Some(data),
+                _write_reservation: reservation,
                 read_buf: None,
-                path: (*path).clone(),
+                path,
                 responder,
             };
             (entry, op)
         }
         Job::Read { path, offset, len } => {
+            if offset > i64::MAX as u64 {
+                fail_responder(
+                    responder,
+                    &path,
+                    io::Error::new(io::ErrorKind::InvalidInput, "read offset exceeds i64::MAX"),
+                );
+                return;
+            }
+            if len == 0 {
+                if let OpResponder::Read(tx) = responder {
+                    let _ = tx.send(Ok(Bytes::new()));
+                }
+                return;
+            }
             let mut buf = BytesMut::zeroed(len);
-            let entry = opcode::Read::new(fd, buf.as_mut_ptr(), len as u32)
+            let chunk_len = len.min(MAX_RW_COUNT) as u32;
+            let entry = opcode::Read::new(fd, buf.as_mut_ptr(), chunk_len)
                 .offset(offset)
                 .build()
                 .user_data(id);
@@ -359,8 +588,9 @@ fn submit_job(
                 expected_len: len,
                 progress: 0,
                 _write_buf: None,
+                _write_reservation: None,
                 read_buf: Some(buf),
-                path: (*path).clone(),
+                path,
                 responder,
             };
             (entry, op)
@@ -373,24 +603,23 @@ fn submit_job(
                 expected_len: 0,
                 progress: 0,
                 _write_buf: None,
+                _write_reservation: None,
                 read_buf: None,
-                path: (*path).clone(),
+                path,
                 responder,
             };
             (entry, op)
         }
     };
 
-    // SAFETY: `op` (and the `Arc<File>`/buffer it owns) is inserted into `pending`
-    // before submission and is only removed - dropping the file handle and buffer -
-    // after this SQE's CQE has been reaped in `complete_op`. The pointers this entry
-    // carries (into `op`'s buffer) therefore stay valid for as long as the kernel might
-    // hold them.
-    if let Err(e) = unsafe { push_entry(ring, &entry) } {
-        fail_responder(op.responder, op.path, e);
+    // SAFETY: `op` (and the `Arc<File>`/buffer it owns) is inserted into `state.pending`
+    // before submission and `state.ring` drops before `state.pending`, ensuring pointers
+    // remain valid for as long as the kernel holds them.
+    if let Err(e) = unsafe { push_entry(&mut state.ring, &entry) } {
+        fail_responder(op.responder, &op.path, e);
         return;
     }
-    pending.insert(id, op);
+    state.pending.insert(id, op);
 }
 
 /// Pushes `entry` onto `ring`'s submission queue, flushing first (`ring.submit()`) if
@@ -416,8 +645,11 @@ unsafe fn push_entry(ring: &mut IoUring, entry: &io_uring::squeue::Entry) -> io:
         .map_err(|_| io::Error::other("io_uring submission queue full"))
 }
 
-fn fail_responder(responder: OpResponder, path: PathBuf, source: io::Error) {
-    let err = DiskError::Io { path, source };
+fn fail_responder(responder: OpResponder, path: &std::path::Path, source: io::Error) {
+    let err = DiskError::Io {
+        path: path.to_path_buf(),
+        source,
+    };
     match responder {
         OpResponder::Write(tx) => {
             let _ = tx.send(Err(err));
@@ -446,22 +678,47 @@ fn process_completion(
     mut op: PendingOp,
     result: i32,
 ) -> Option<(io_uring::squeue::Entry, PendingOp)> {
+    if result == -libc::EINTR {
+        let remaining = op.expected_len.saturating_sub(op.progress);
+        let entry = match (&mut op._write_buf, &mut op.read_buf) {
+            (Some(write_buf), None) => {
+                let chunk = remaining.min(MAX_RW_COUNT) as u32;
+                opcode::Write::new(fd, write_buf.as_ptr(), chunk)
+                    .offset(op.offset)
+                    .build()
+            }
+            (None, Some(read_buf)) => {
+                let chunk = remaining.min(MAX_RW_COUNT) as u32;
+                let ptr = unsafe { read_buf.as_mut_ptr().add(op.progress) };
+                opcode::Read::new(fd, ptr, chunk).offset(op.offset).build()
+            }
+            (None, None) => opcode::Fsync::new(fd).build(),
+            _ => unreachable!("a pending op has at most one of write_buf/read_buf set"),
+        };
+        return Some((entry, op));
+    }
+
     if result < 0 {
-        fail_responder(op.responder, op.path, io::Error::from_raw_os_error(-result));
+        fail_responder(
+            op.responder,
+            &op.path,
+            io::Error::from_raw_os_error(-result),
+        );
         return None;
     }
 
-    let n = result as usize;
-    op.progress += n;
+    let remaining_before = op.expected_len.saturating_sub(op.progress);
+    let advance = (result as usize).min(remaining_before);
+    op.progress += advance;
 
     // A zero-length completion that still leaves bytes unaccounted for means the
     // kernel can make no further progress at this offset (e.g. EOF on a short file) --
     // looping again would spin forever, so this is treated as an error rather than a
     // retry, exactly like a bare `read(2)`/`write(2)` loop must.
-    if op.progress < op.expected_len && n == 0 {
+    if op.progress < op.expected_len && advance == 0 {
         fail_responder(
             op.responder,
-            op.path,
+            &op.path,
             io::Error::other(format!(
                 "io_uring op made no progress: {} of {} bytes completed",
                 op.progress, op.expected_len
@@ -471,22 +728,21 @@ fn process_completion(
     }
 
     if op.progress < op.expected_len {
-        // Short completion: resubmit an SQE for exactly the remaining bytes, resuming
-        // at the advanced file offset.
-        op.offset += n as u64;
+        // Short completion: resubmit an SQE for the remaining bytes, resuming
+        // at the advanced file offset and capped at `MAX_RW_COUNT`.
+        op.offset += advance as u64;
         let remaining = op.expected_len - op.progress;
+        let chunk = remaining.min(MAX_RW_COUNT) as u32;
         let entry = match (&mut op._write_buf, &mut op.read_buf) {
             (Some(write_buf), None) => {
-                *write_buf = write_buf.slice(n..);
-                opcode::Write::new(fd, write_buf.as_ptr(), remaining as u32)
+                *write_buf = write_buf.slice(advance..);
+                opcode::Write::new(fd, write_buf.as_ptr(), chunk)
                     .offset(op.offset)
                     .build()
             }
             (None, Some(read_buf)) => {
                 let ptr = unsafe { read_buf.as_mut_ptr().add(op.progress) };
-                opcode::Read::new(fd, ptr, remaining as u32)
-                    .offset(op.offset)
-                    .build()
+                opcode::Read::new(fd, ptr, chunk).offset(op.offset).build()
             }
             _ => unreachable!("a pending op has exactly one of write_buf/read_buf set"),
         };

@@ -136,21 +136,50 @@ impl RoutingTable {
         }
         let idx = bucket_index(&self.our_id, &id);
 
-        if let Some(n) = self.buckets[idx].iter_mut().find(|n| n.id == id) {
-            if n.addr.ip() != addr.ip() && n.state(now) == NodeState::Good && !exempt {
-                return false;
+        let existing_pos = self.buckets[idx].iter().position(|n| n.id == id);
+        if let Some(pos) = existing_pos {
+            let existing = self.buckets[idx][pos];
+            if existing.addr.ip() != addr.ip() && !exempt {
+                if existing.state(now) == NodeState::Good {
+                    return false;
+                }
+                let mut stale_same_ip: Option<(usize, NodeId)> = None;
+                for (bi, bucket) in self.buckets.iter().enumerate() {
+                    for n in bucket {
+                        if n.id != id && n.addr.ip() == addr.ip() {
+                            if n.state(now) == NodeState::Good {
+                                return false;
+                            }
+                            stale_same_ip = Some((bi, n.id));
+                        }
+                    }
+                }
+                if self.buckets[idx].iter().any(|n| {
+                    n.id != id
+                        && Some((idx, n.id)) != stale_same_ip
+                        && !crate::bep42::is_exempt_from_node_id_check(IpAddr::V4(*n.addr.ip()))
+                        && slash24(&n.addr) == slash24(&addr)
+                }) {
+                    return false;
+                }
+                if let Some((bi, old)) = stale_same_ip {
+                    self.buckets[bi].retain(|n| n.id != old);
+                }
             }
-            n.addr = addr;
-            n.last_seen = now;
-            n.failed_queries = 0;
-            n.verified = verified;
+            if let Some(n) = self.buckets[idx].iter_mut().find(|n| n.id == id) {
+                n.addr = addr;
+                n.last_seen = now;
+                n.failed_queries = 0;
+                n.verified = verified;
+            }
             return true;
         }
 
+        let mut stale_same_ip: Option<(usize, NodeId)> = None;
         if !exempt {
             // One node per IP across the table: a different id from an IP we already have
-            // only replaces the old entry if the old one has stopped being good.
-            let mut stale_same_ip: Option<(usize, NodeId)> = None;
+            // only replaces the old entry if the old one has stopped being good AND the new
+            // node can actually enter its target bucket.
             for (bi, bucket) in self.buckets.iter().enumerate() {
                 for n in bucket {
                     if n.addr.ip() == addr.ip() {
@@ -161,12 +190,10 @@ impl RoutingTable {
                     }
                 }
             }
-            if let Some((bi, old)) = stale_same_ip {
-                self.buckets[bi].retain(|n| n.id != old);
-            }
             // One node per /24 within the destination bucket.
             if self.buckets[idx].iter().any(|n| {
-                !crate::bep42::is_exempt_from_node_id_check(IpAddr::V4(*n.addr.ip()))
+                Some((idx, n.id)) != stale_same_ip
+                    && !crate::bep42::is_exempt_from_node_id_check(IpAddr::V4(*n.addr.ip()))
                     && slash24(&n.addr) == slash24(&addr)
             }) {
                 return false;
@@ -180,6 +207,29 @@ impl RoutingTable {
             failed_queries: 0,
             verified,
         };
+        let has_stale_in_target = stale_same_ip.is_some_and(|(bi, _)| bi == idx);
+        let replace_bad = self.buckets[idx]
+            .iter()
+            .position(|n| Some((idx, n.id)) != stale_same_ip && n.state(now) == NodeState::Bad);
+        let replace_unverified = if verified {
+            self.buckets[idx].iter().position(|n| {
+                Some((idx, n.id)) != stale_same_ip && !n.verified && n.state(now) != NodeState::Good
+            })
+        } else {
+            None
+        };
+        if self.buckets[idx].len() >= K
+            && !has_stale_in_target
+            && replace_bad.is_none()
+            && replace_unverified.is_none()
+        {
+            return false;
+        }
+
+        if let Some((bi, old)) = stale_same_ip {
+            self.buckets[bi].retain(|n| n.id != old);
+        }
+
         let bucket = &mut self.buckets[idx];
         if bucket.len() < K {
             bucket.push(new_node);
@@ -320,19 +370,47 @@ impl RoutingTableV6 {
         }
         let idx = bucket_index(&self.our_id, &id);
 
-        if let Some(n) = self.buckets[idx].iter_mut().find(|n| n.id == id) {
-            if n.addr.ip() != addr.ip() && n.state(now) == NodeState::Good && !exempt {
-                return false;
+        let existing_pos = self.buckets[idx].iter().position(|n| n.id == id);
+        if let Some(pos) = existing_pos {
+            let existing = self.buckets[idx][pos];
+            if existing.addr.ip() != addr.ip() && !exempt {
+                if existing.state(now) == NodeState::Good {
+                    return false;
+                }
+                let mut stale_same_ip: Option<(usize, NodeId)> = None;
+                for (bi, bucket) in self.buckets.iter().enumerate() {
+                    for n in bucket {
+                        if n.id != id && n.addr.ip() == addr.ip() {
+                            if n.state(now) == NodeState::Good {
+                                return false;
+                            }
+                            stale_same_ip = Some((bi, n.id));
+                        }
+                    }
+                }
+                if self.buckets[idx].iter().any(|n| {
+                    n.id != id
+                        && Some((idx, n.id)) != stale_same_ip
+                        && !crate::bep42::is_exempt_from_node_id_check(IpAddr::V6(*n.addr.ip()))
+                        && slash64(&n.addr) == slash64(&addr)
+                }) {
+                    return false;
+                }
+                if let Some((bi, old)) = stale_same_ip {
+                    self.buckets[bi].retain(|n| n.id != old);
+                }
             }
-            n.addr = addr;
-            n.last_seen = now;
-            n.failed_queries = 0;
-            n.verified = verified;
+            if let Some(n) = self.buckets[idx].iter_mut().find(|n| n.id == id) {
+                n.addr = addr;
+                n.last_seen = now;
+                n.failed_queries = 0;
+                n.verified = verified;
+            }
             return true;
         }
 
+        let mut stale_same_ip: Option<(usize, NodeId)> = None;
         if !exempt {
-            let mut stale_same_ip: Option<(usize, NodeId)> = None;
             for (bi, bucket) in self.buckets.iter().enumerate() {
                 for n in bucket {
                     if n.addr.ip() == addr.ip() {
@@ -343,12 +421,10 @@ impl RoutingTableV6 {
                     }
                 }
             }
-            if let Some((bi, old)) = stale_same_ip {
-                self.buckets[bi].retain(|n| n.id != old);
-            }
             // One node per /64 within the destination bucket.
             if self.buckets[idx].iter().any(|n| {
-                !crate::bep42::is_exempt_from_node_id_check(IpAddr::V6(*n.addr.ip()))
+                Some((idx, n.id)) != stale_same_ip
+                    && !crate::bep42::is_exempt_from_node_id_check(IpAddr::V6(*n.addr.ip()))
                     && slash64(&n.addr) == slash64(&addr)
             }) {
                 return false;
@@ -362,6 +438,29 @@ impl RoutingTableV6 {
             failed_queries: 0,
             verified,
         };
+        let has_stale_in_target = stale_same_ip.is_some_and(|(bi, _)| bi == idx);
+        let replace_bad = self.buckets[idx]
+            .iter()
+            .position(|n| Some((idx, n.id)) != stale_same_ip && n.state(now) == NodeState::Bad);
+        let replace_unverified = if verified {
+            self.buckets[idx].iter().position(|n| {
+                Some((idx, n.id)) != stale_same_ip && !n.verified && n.state(now) != NodeState::Good
+            })
+        } else {
+            None
+        };
+        if self.buckets[idx].len() >= K
+            && !has_stale_in_target
+            && replace_bad.is_none()
+            && replace_unverified.is_none()
+        {
+            return false;
+        }
+
+        if let Some((bi, old)) = stale_same_ip {
+            self.buckets[bi].retain(|n| n.id != old);
+        }
+
         let bucket = &mut self.buckets[idx];
         if bucket.len() < K {
             bucket.push(new_node);
@@ -757,5 +856,52 @@ mod tests {
 
         let closest = rt.closest_nodes6(&ours, 10);
         assert_eq!(closest.len(), 2);
+    }
+
+    #[test]
+    fn failed_insert_preserves_stale_same_ip_and_ip_change_respects_sybil_checks() {
+        let mut rt = RoutingTable::new(id_all(0));
+        let t0 = Instant::now();
+        // Put node A in bucket 1 (`id[0] = 0x40`) with public IP 198.51.100.10.
+        let mut id_a = [0u8; 20];
+        id_a[0] = 0x40;
+        let ip_reused = pub_addr(198, 51, 100, 10);
+        assert!(rt.seen(id_a, ip_reused, t0));
+
+        // Fill bucket 0 (`id[0] = 0x80`) with K Good nodes from distinct /24s.
+        for i in 0..K as u8 {
+            let mut id = [0u8; 20];
+            id[0] = 0x80;
+            id[19] = i;
+            assert!(rt.seen(id, pub_addr(203, 0, i + 1, 1), t0));
+        }
+
+        // Wait until all nodes are Questionable, EXCEPT let's keep bucket 0 Good at t1:
+        let t1 = t0 + Duration::from_secs(20 * 60);
+        // Make id_a stale by staying at t0 while refreshing bucket 0 at t1.
+        for i in 0..K as u8 {
+            let mut id = [0u8; 20];
+            id[0] = 0x80;
+            id[19] = i;
+            assert!(rt.seen(id, pub_addr(203, 0, i + 1, 1), t1));
+        }
+
+        // Now try to insert a brand-new bucket-0 id claiming stale id_a's IP (198.51.100.10).
+        // Bucket 0 is full of Good nodes -> insertion fails AND id_a MUST still be in the table!
+        let mut newcomer = [0u8; 20];
+        newcomer[0] = 0x80;
+        newcomer[19] = 99;
+        assert!(!rt.seen(newcomer, ip_reused, t1));
+        assert!(rt.closest(&id_a, 1).iter().any(|n| n.id == id_a));
+
+        // Now test a Questionable existing id changing IP into an already-occupied /24 or Good IP:
+        let mut id_b = [0u8; 20];
+        id_b[0] = 0x40;
+        id_b[19] = 2;
+        assert!(rt.seen(id_b, pub_addr(198, 51, 200, 5), t0));
+        // Even at t1 when id_b is Questionable, it cannot move into id_a's /24 (198.51.100.x)
+        assert!(!rt.seen(id_b, pub_addr(198, 51, 100, 11), t1));
+        // Nor hijack a Good bucket-0 node's IP (203.0.1.1)
+        assert!(!rt.seen(id_b, pub_addr(203, 0, 1, 1), t1));
     }
 }

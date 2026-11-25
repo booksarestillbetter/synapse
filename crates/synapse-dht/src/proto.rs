@@ -40,6 +40,7 @@ pub enum Query {
         port: u16,
         token: Vec<u8>,
         implied_port: bool,
+        seed: bool,
     },
     /// BEP 44 `get`: fetch the item stored at `target`. For a mutable item, `seq` lets the
     /// requester say "only send it if newer than this".
@@ -89,6 +90,64 @@ pub enum GetPeersResult {
     Peers6(Vec<SocketAddrV6>),
     Nodes(Vec<NodeInfo>),
     Nodes6(Vec<NodeInfoV6>),
+    Combined {
+        peers: Vec<SocketAddrV4>,
+        peers6: Vec<SocketAddrV6>,
+        nodes: Vec<NodeInfo>,
+        nodes6: Vec<NodeInfoV6>,
+    },
+}
+
+impl GetPeersResult {
+    pub fn peers(&self) -> &[SocketAddrV4] {
+        match self {
+            Self::Peers(p) | Self::Combined { peers: p, .. } => p,
+            _ => &[],
+        }
+    }
+
+    pub fn peers6(&self) -> &[SocketAddrV6] {
+        match self {
+            Self::Peers6(p) | Self::Combined { peers6: p, .. } => p,
+            _ => &[],
+        }
+    }
+
+    pub fn nodes(&self) -> &[NodeInfo] {
+        match self {
+            Self::Nodes(n) | Self::Combined { nodes: n, .. } => n,
+            _ => &[],
+        }
+    }
+
+    pub fn nodes6(&self) -> &[NodeInfoV6] {
+        match self {
+            Self::Nodes6(n) | Self::Combined { nodes6: n, .. } => n,
+            _ => &[],
+        }
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        Vec<SocketAddrV4>,
+        Vec<SocketAddrV6>,
+        Vec<NodeInfo>,
+        Vec<NodeInfoV6>,
+    ) {
+        match self {
+            Self::Peers(p) => (p, Vec::new(), Vec::new(), Vec::new()),
+            Self::Peers6(p6) => (Vec::new(), p6, Vec::new(), Vec::new()),
+            Self::Nodes(n) => (Vec::new(), Vec::new(), n, Vec::new()),
+            Self::Nodes6(n6) => (Vec::new(), Vec::new(), Vec::new(), n6),
+            Self::Combined {
+                peers,
+                peers6,
+                nodes,
+                nodes6,
+            } => (peers, peers6, nodes, nodes6),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -335,6 +394,7 @@ impl Message {
                         port,
                         token,
                         implied_port,
+                        seed,
                     } => {
                         a.insert(b"info_hash".to_vec(), BEncode::String(info_hash.to_vec()));
                         a.insert(b"port".to_vec(), BEncode::Int(*port as i64));
@@ -343,6 +403,9 @@ impl Message {
                             b"implied_port".to_vec(),
                             BEncode::Int(if *implied_port { 1 } else { 0 }),
                         );
+                        if *seed {
+                            a.insert(b"seed".to_vec(), BEncode::Int(1));
+                        }
                         b"announce_peer"
                     }
                     Query::Get { target, seq } => {
@@ -493,6 +556,47 @@ impl Message {
                                     BEncode::String(compact_nodes6_encode(nodes)),
                                 );
                             }
+                            GetPeersResult::Combined {
+                                peers,
+                                peers6,
+                                nodes,
+                                nodes6,
+                            } => {
+                                if !peers.is_empty() {
+                                    rd.insert(
+                                        b"values".to_vec(),
+                                        BEncode::List(
+                                            peers
+                                                .iter()
+                                                .map(|p| BEncode::String(compact_peer_encode(p)))
+                                                .collect(),
+                                        ),
+                                    );
+                                }
+                                if !peers6.is_empty() {
+                                    rd.insert(
+                                        b"values6".to_vec(),
+                                        BEncode::List(
+                                            peers6
+                                                .iter()
+                                                .map(|p| BEncode::String(compact_peer6_encode(p)))
+                                                .collect(),
+                                        ),
+                                    );
+                                }
+                                if !nodes.is_empty() {
+                                    rd.insert(
+                                        b"nodes".to_vec(),
+                                        BEncode::String(compact_nodes_encode(nodes)),
+                                    );
+                                }
+                                if !nodes6.is_empty() {
+                                    rd.insert(
+                                        b"nodes6".to_vec(),
+                                        BEncode::String(compact_nodes6_encode(nodes6)),
+                                    );
+                                }
+                            }
                         }
                     }
                 }
@@ -583,11 +687,17 @@ impl Message {
                             .and_then(BEncode::into_int)
                             .map(|v| v != 0)
                             .unwrap_or(false);
+                        let seed = a
+                            .remove(b"seed".as_ref())
+                            .and_then(BEncode::into_int)
+                            .map(|v| v != 0)
+                            .unwrap_or(false);
                         Query::AnnouncePeer {
                             info_hash,
                             port,
                             token,
                             implied_port,
+                            seed,
                         }
                     }
                     b"get" => {
@@ -671,10 +781,15 @@ impl Message {
                         crate::sample::decode_sample_infohashes_response(&mut r)
                             .map_err(|_| ProtoError::Malformed("bad sample_infohashes response"))?,
                     )
-                } else if r.contains_key(b"sn".as_ref())
+                } else if (r.contains_key(b"sn".as_ref())
                     || r.contains_key(b"ln".as_ref())
                     || r.contains_key(b"BFsd".as_ref())
-                    || r.contains_key(b"BFpe".as_ref())
+                    || r.contains_key(b"BFpe".as_ref()))
+                    && !r.contains_key(b"token".as_ref())
+                    && !r.contains_key(b"values".as_ref())
+                    && !r.contains_key(b"values6".as_ref())
+                    && !r.contains_key(b"nodes".as_ref())
+                    && !r.contains_key(b"nodes6".as_ref())
                 {
                     Response::Scrape(
                         crate::sample::decode_dht_scrape_response(&mut r)
@@ -714,38 +829,71 @@ impl Message {
                 } else if let Some(token) =
                     r.remove(b"token".as_ref()).and_then(BEncode::into_bytes)
                 {
-                    let result = if let Some(values) =
-                        r.remove(b"values".as_ref()).and_then(BEncode::into_list)
-                    {
-                        GetPeersResult::Peers(
-                            values
-                                .into_iter()
-                                .filter_map(|v| v.into_bytes())
-                                .filter_map(|b| compact_peer_decode(&b))
-                                .collect(),
-                        )
-                    } else if let Some(values6) =
-                        r.remove(b"values6".as_ref()).and_then(BEncode::into_list)
-                    {
-                        GetPeersResult::Peers6(
-                            values6
-                                .into_iter()
-                                .filter_map(|v| v.into_bytes())
-                                .filter_map(|b| compact_peer6_decode(&b))
-                                .collect(),
-                        )
-                    } else if let Some(nodes6) =
-                        r.remove(b"nodes6".as_ref()).and_then(BEncode::into_bytes)
-                    {
-                        GetPeersResult::Nodes6(compact_nodes6_decode(&nodes6)?)
-                    } else if let Some(nodes) =
-                        r.remove(b"nodes".as_ref()).and_then(BEncode::into_bytes)
-                    {
-                        GetPeersResult::Nodes(compact_nodes_decode(&nodes)?)
-                    } else {
+                    let has_values = r.contains_key(b"values".as_ref());
+                    let has_values6 = r.contains_key(b"values6".as_ref());
+                    let has_nodes = r.contains_key(b"nodes".as_ref());
+                    let has_nodes6 = r.contains_key(b"nodes6".as_ref());
+                    if !(has_values || has_values6 || has_nodes || has_nodes6) {
                         return Err(ProtoError::Malformed(
                             "get_peers response missing values/nodes",
                         ));
+                    }
+                    let mut peers = Vec::new();
+                    let mut peers6 = Vec::new();
+                    if let Some(values) = r.remove(b"values".as_ref()).and_then(BEncode::into_list)
+                    {
+                        for b in values.into_iter().filter_map(BEncode::into_bytes) {
+                            if let Some(p4) = compact_peer_decode(&b) {
+                                peers.push(p4);
+                            } else if let Some(p6) = compact_peer6_decode(&b) {
+                                peers6.push(p6);
+                            }
+                        }
+                    }
+                    if let Some(values6) =
+                        r.remove(b"values6".as_ref()).and_then(BEncode::into_list)
+                    {
+                        for b in values6.into_iter().filter_map(BEncode::into_bytes) {
+                            if let Some(p6) = compact_peer6_decode(&b) {
+                                peers6.push(p6);
+                            }
+                        }
+                    }
+                    let nodes = match r.remove(b"nodes".as_ref()).and_then(BEncode::into_bytes) {
+                        Some(b) => compact_nodes_decode(&b)?,
+                        None => Vec::new(),
+                    };
+                    let nodes6 = match r.remove(b"nodes6".as_ref()).and_then(BEncode::into_bytes) {
+                        Some(b) => compact_nodes6_decode(&b)?,
+                        None => Vec::new(),
+                    };
+                    let result = match (
+                        !peers.is_empty(),
+                        !peers6.is_empty(),
+                        !nodes.is_empty(),
+                        !nodes6.is_empty(),
+                    ) {
+                        (true, false, false, false) => GetPeersResult::Peers(peers),
+                        (false, true, false, false) => GetPeersResult::Peers6(peers6),
+                        (false, false, true, false) => GetPeersResult::Nodes(nodes),
+                        (false, false, false, true) => GetPeersResult::Nodes6(nodes6),
+                        (false, false, false, false) => {
+                            if has_values {
+                                GetPeersResult::Peers(peers)
+                            } else if has_values6 {
+                                GetPeersResult::Peers6(peers6)
+                            } else if has_nodes6 {
+                                GetPeersResult::Nodes6(nodes6)
+                            } else {
+                                GetPeersResult::Nodes(nodes)
+                            }
+                        }
+                        _ => GetPeersResult::Combined {
+                            peers,
+                            peers6,
+                            nodes,
+                            nodes6,
+                        },
                     };
                     Response::GetPeers { token, result }
                 } else if r.contains_key(b"nodes".as_ref()) || r.contains_key(b"nodes6".as_ref()) {
@@ -944,6 +1092,58 @@ mod tests {
                 port: 6881,
                 token: vec![1, 2, 3],
                 implied_port: true,
+                seed: false,
+            }),
+            read_only: false,
+            external_addr: None,
+        };
+        assert_eq!(roundtrip(msg.clone()), msg);
+
+        let seed_msg = Message {
+            transaction_id: vec![2],
+            sender_id: Some(id(1)),
+            body: Body::Query(Query::AnnouncePeer {
+                info_hash: id(6),
+                port: 6881,
+                token: vec![1, 2, 3],
+                implied_port: false,
+                seed: true,
+            }),
+            read_only: false,
+            external_addr: None,
+        };
+        assert_eq!(roundtrip(seed_msg.clone()), seed_msg);
+    }
+
+    #[test]
+    fn get_peers_combined_values_and_nodes_roundtrip() {
+        let msg = Message {
+            transaction_id: vec![7, 8],
+            sender_id: Some(id(1)),
+            body: Body::Response(Response::GetPeers {
+                token: vec![0xAA, 0xBB],
+                result: GetPeersResult::Combined {
+                    peers: vec![SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 1), 6881)],
+                    peers6: vec![SocketAddrV6::new(
+                        Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1),
+                        6882,
+                        0,
+                        0,
+                    )],
+                    nodes: vec![NodeInfo {
+                        id: id(2),
+                        addr: SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 1), 6883),
+                    }],
+                    nodes6: vec![NodeInfoV6 {
+                        id: id(3),
+                        addr: SocketAddrV6::new(
+                            Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2),
+                            6884,
+                            0,
+                            0,
+                        ),
+                    }],
+                },
             }),
             read_only: false,
             external_addr: None,

@@ -21,6 +21,8 @@ const CACHE_FLUSH: u16 = 0x8000;
 const RECORD_TTL: u32 = 120;
 /// The most records read from one message, so a crafted packet cannot burn CPU.
 const MAX_RECORDS: usize = 256;
+/// Most peer tuples returned from a single mDNS message (prevents PTR x SRV x A cubic amplification).
+const MAX_DISCOVERED_PER_MSG: usize = 256;
 
 pub const SERVICE: &str = "_bittorrent._tcp.local";
 
@@ -89,10 +91,15 @@ pub fn build_query(names: &[String]) -> Vec<u8> {
     msg
 }
 
-fn push_record(out: &mut Vec<u8>, name: &str, rtype: u16, rdata: &[u8]) {
+fn push_record(out: &mut Vec<u8>, name: &str, rtype: u16, cache_flush: bool, rdata: &[u8]) {
     push_name(out, name);
     out.extend_from_slice(&rtype.to_be_bytes());
-    out.extend_from_slice(&(CLASS_IN | CACHE_FLUSH).to_be_bytes());
+    let class = if cache_flush {
+        CLASS_IN | CACHE_FLUSH
+    } else {
+        CLASS_IN
+    };
+    out.extend_from_slice(&class.to_be_bytes());
     out.extend_from_slice(&RECORD_TTL.to_be_bytes());
     out.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
     out.extend_from_slice(rdata);
@@ -113,23 +120,30 @@ pub fn build_response(
 
     let mut ptr_rdata = Vec::new();
     push_name(&mut ptr_rdata, &instance);
-    push_record(&mut records, SERVICE, TYPE_PTR, &ptr_rdata);
+    // RFC 6762 §10.2: shared PTR records MUST NOT set the cache-flush bit.
+    push_record(&mut records, SERVICE, TYPE_PTR, false, &ptr_rdata);
     count += 1;
     for hash in info_hashes {
-        push_record(&mut records, &sub_service_name(hash), TYPE_PTR, &ptr_rdata);
+        push_record(
+            &mut records,
+            &sub_service_name(hash),
+            TYPE_PTR,
+            false,
+            &ptr_rdata,
+        );
         count += 1;
     }
     let mut srv = Vec::new();
     srv.extend_from_slice(&[0, 0, 0, 0]); // priority, weight
     srv.extend_from_slice(&port.to_be_bytes());
     push_name(&mut srv, &host);
-    push_record(&mut records, &instance, TYPE_SRV, &srv);
-    push_record(&mut records, &instance, TYPE_TXT, &[0]);
+    push_record(&mut records, &instance, TYPE_SRV, true, &srv);
+    push_record(&mut records, &instance, TYPE_TXT, true, &[0]);
     count += 2;
     for addr in addrs {
         match addr {
-            IpAddr::V4(a) => push_record(&mut records, &host, TYPE_A, &a.octets()),
-            IpAddr::V6(a) => push_record(&mut records, &host, TYPE_AAAA, &a.octets()),
+            IpAddr::V4(a) => push_record(&mut records, &host, TYPE_A, true, &a.octets()),
+            IpAddr::V6(a) => push_record(&mut records, &host, TYPE_AAAA, true, &a.octets()),
         }
         count += 1;
     }
@@ -249,19 +263,44 @@ pub fn parse_message(buf: &[u8]) -> Option<DnsMessage> {
 
 /// The peers a response lists for torrents: every PTR under a `_<hash>._sub._bittorrent._tcp`
 /// name whose instance has a SRV record and whose host has an address in the same message.
+/// Uses indexed maps and a strict per-message cap so a crafted response with many PTR/SRV/A
+/// records cannot amplify into `O(N^3)` output.
 pub fn discovered_peers(msg: &DnsMessage) -> Vec<([u8; 20], std::net::SocketAddr)> {
+    use std::collections::{HashMap, HashSet};
+
+    let mut srvs: HashMap<&str, Vec<(u16, &str)>> = HashMap::new();
+    for (srv_name, port, host) in &msg.srv {
+        if *port != 0 {
+            srvs.entry(srv_name.as_str())
+                .or_default()
+                .push((*port, host.as_str()));
+        }
+    }
+    let mut addrs: HashMap<&str, Vec<IpAddr>> = HashMap::new();
+    for (host, ip) in &msg.addrs {
+        addrs.entry(host.as_str()).or_default().push(*ip);
+    }
+
+    let mut seen = HashSet::new();
     let mut out = Vec::new();
     for (name, instance) in &msg.ptr {
         let Some(hash) = info_hash_of_sub_service(name) else {
             continue;
         };
-        for (srv_name, port, host) in &msg.srv {
-            if srv_name != instance || *port == 0 {
+        let Some(targets) = srvs.get(instance.as_str()) else {
+            continue;
+        };
+        for &(port, host) in targets {
+            let Some(ips) = addrs.get(host) else {
                 continue;
-            }
-            for (addr_host, ip) in &msg.addrs {
-                if addr_host == host {
-                    out.push((hash, std::net::SocketAddr::new(*ip, *port)));
+            };
+            for &ip in ips {
+                let sa = std::net::SocketAddr::new(ip, port);
+                if seen.insert((hash, sa)) {
+                    out.push((hash, sa));
+                    if out.len() >= MAX_DISCOVERED_PER_MSG {
+                        return out;
+                    }
                 }
             }
         }
@@ -345,5 +384,51 @@ mod tests {
         assert!(discovered_peers(&parse_message(&no_addr).unwrap()).is_empty());
         let zero_port = build_response(&PEER, &[HASH], 0, &[IpAddr::V4(Ipv4Addr::LOCALHOST)]);
         assert!(discovered_peers(&parse_message(&zero_port).unwrap()).is_empty());
+    }
+
+    #[test]
+    fn shared_ptr_clears_cache_flush_while_unique_records_set_it_and_output_is_capped() {
+        let bytes = build_response(&PEER, &[HASH], 6881, &[IpAddr::V4(Ipv4Addr::LOCALHOST)]);
+        // Skip 12-byte header and inspect each answer RR's TYPE and CLASS.
+        let count = u16::from_be_bytes([bytes[6], bytes[7]]);
+        let mut pos = 12usize;
+        let mut saw_ptr = false;
+        let mut saw_srv_or_a = false;
+        for _ in 0..count {
+            let (_name, next) = read_name(&bytes, pos).unwrap();
+            let rtype = u16::from_be_bytes([bytes[next], bytes[next + 1]]);
+            let rclass = u16::from_be_bytes([bytes[next + 2], bytes[next + 3]]);
+            let rdlen = u16::from_be_bytes([bytes[next + 8], bytes[next + 9]]) as usize;
+            if rtype == TYPE_PTR {
+                assert_eq!(rclass & CACHE_FLUSH, 0, "PTR must not set cache-flush");
+                saw_ptr = true;
+            } else {
+                assert_ne!(
+                    rclass & CACHE_FLUSH,
+                    0,
+                    "unique records must set cache-flush"
+                );
+                saw_srv_or_a = true;
+            }
+            pos = next + 10 + rdlen;
+        }
+        assert!(saw_ptr && saw_srv_or_a);
+
+        // Amplification test: 40 PTR x 40 SRV x 40 A would be 64,000 tuples; capped at 256.
+        let mut msg = DnsMessage {
+            is_response: true,
+            ..Default::default()
+        };
+        let inst = instance_name(&PEER);
+        let host = host_name(&PEER);
+        for i in 0..40u8 {
+            msg.ptr.push((sub_service_name(&[i; 20]), inst.clone()));
+            msg.srv
+                .push((inst.clone(), 6881 + u16::from(i), host.clone()));
+            msg.addrs
+                .push((host.clone(), IpAddr::V4(Ipv4Addr::new(192, 168, 1, i + 1))));
+        }
+        let peers = discovered_peers(&msg);
+        assert_eq!(peers.len(), MAX_DISCOVERED_PER_MSG);
     }
 }
