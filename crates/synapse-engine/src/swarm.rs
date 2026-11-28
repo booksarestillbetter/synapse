@@ -1119,8 +1119,7 @@ impl SwarmEngine {
                         if path.is_file() {
                             if let Ok(bytes) = std::fs::read(&path) {
                                 if let Ok(reloaded) = Info::from_persisted_bencode(&bytes) {
-                                    if &reloaded.hash == info_hash && reloaded.has_piece_hashes()
-                                    {
+                                    if &reloaded.hash == info_hash && reloaded.has_piece_hashes() {
                                         tracing::info!(
                                             "Auto-healed corrupted session metadata for '{}' ({}) from {}",
                                             reloaded.name,
@@ -3228,7 +3227,9 @@ impl SwarmEngine {
                     // this cold path cannot.
                     let keep = verified
                         || (!has_expected_hash
-                            && previous_bitfield.as_ref().is_some_and(|b| b.has(idx as usize)));
+                            && previous_bitfield
+                                .as_ref()
+                                .is_some_and(|b| b.has(idx as usize)));
                     if keep {
                         new_bitfield.set(idx as usize);
                         verified_count += 1;

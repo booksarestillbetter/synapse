@@ -199,7 +199,7 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
         <div class="daemon-info-card">
           <div><small>Engine:</small> <strong>Synapse 2.0</strong></div>
           <div><small>Peer ID:</small> <code>-SY2200-</code></div>
-          <div id="daemon-version"><small>Version:</small> 2.2.35</div>
+          <div id="daemon-version"><small>Version:</small> 2.2.36</div>
           <div id="daemon-dht"><small>DHT Nodes:</small> <span id="stat-dht-nodes">0</span></div>
         </div>
       </div>
@@ -2607,7 +2607,10 @@ mod tests {
             "cfg-max-dht-announces",
             "cfg-max-lsd-announces",
         ] {
-            assert!(INDEX_HTML.contains(id), "settings dialog missing field {id}");
+            assert!(
+                INDEX_HTML.contains(id),
+                "settings dialog missing field {id}"
+            );
             assert!(APP_JS.contains(id), "settings JS missing field {id}");
         }
 

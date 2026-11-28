@@ -319,7 +319,10 @@ mod tests {
         for second_byte in [0x80u8, 0x81, 0xFF] {
             let bf = Bitfield::from_bytes(&[0xFF, second_byte], 9).unwrap();
             assert!(bf.has(8), "the one real bit in byte 1 must still be set");
-            assert!((0..8).all(|i| bf.has(i)), "byte 0's real bits are unaffected");
+            assert!(
+                (0..8).all(|i| bf.has(i)),
+                "byte 0's real bits are unaffected"
+            );
         }
         // 1 piece -> same for a single spare-bit byte.
         for byte in [0x80u8, 0x81, 0xFF] {

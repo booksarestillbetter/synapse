@@ -3,6 +3,16 @@
 All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [2.2.36] - 2026-11-28
+
+### Security
+
+- **Stack overflow in `Url::origin()` on nested `blob:` URLs (`url` 2.5.8, RUSTSEC-2026-0592).** `reqwest` (used by the tracker/webseed HTTP clients) depends on `url`, so externally-influenced URLs touch this code path. Bumped to `url` 2.5.9.
+
+### Fixed
+
+- **Public CI's `Rust` workflow (`cargo fmt --check`) had been red for several releases** on pre-existing formatting drift unrelated to any of those changes (`synapse-meta`, `synapse-picker`, `synapse-rpc`, `synapse-engine`). Ran a workspace-wide `cargo fmt` to clear it — whitespace-only, no behavior change.
+
 ## [2.2.35] - 2026-11-28
 
 ### Fixed

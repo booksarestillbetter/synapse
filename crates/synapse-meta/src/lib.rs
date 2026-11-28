@@ -2128,14 +2128,12 @@ mod tests {
             MetaError::PieceCountMismatch
         );
         let evicted =
-            Info::from_persisted_bencode(&single_file(16_384, 32_768, 0).encode_to_buf())
-                .unwrap();
+            Info::from_persisted_bencode(&single_file(16_384, 32_768, 0).encode_to_buf()).unwrap();
         assert_eq!(evicted.pieces(), 0);
         assert_eq!(evicted.total_len, 32_768);
         // A wrong non-zero count is still rejected, and size bounds still apply.
         assert!(
-            Info::from_persisted_bencode(&single_file(16_384, 32_768, 1).encode_to_buf())
-                .is_err()
+            Info::from_persisted_bencode(&single_file(16_384, 32_768, 1).encode_to_buf()).is_err()
         );
         assert!(Info::from_persisted_bencode(&single_file(0, 32_768, 0).encode_to_buf()).is_err());
     }
@@ -2431,8 +2429,8 @@ mod tests {
         let torrent = v2_torrent(&[("a", 100_000)]);
         let info = Info::from_bencode(torrent).unwrap();
         let bytes = info.to_torrent_bytes();
-        let back = Info::from_persisted_bencode(&bytes)
-            .expect("a persisted v2 torrent must load again");
+        let back =
+            Info::from_persisted_bencode(&bytes).expect("a persisted v2 torrent must load again");
         assert_eq!(back.hash, info.hash);
         assert_eq!(back.info_hash_v2, info.info_hash_v2);
         assert_eq!(back.file_roots, info.file_roots);
