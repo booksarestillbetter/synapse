@@ -3,6 +3,12 @@
 All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [2.2.35] - 2026-11-28
+
+### Fixed
+
+- **Stuck nonzero upload/download rate on torrents demoted to the Warm tier (`synapse-engine`).** Both Hot→Warm demotion paths — the seed-queue-cap sweep in `SwarmEngine::reconcile_queue` and `SwarmEngine::transition_to_warm` — flipped the tier and called `TorrentHandle::stop_actor`, which clears the live peer list synchronously but left `download_rate`/`upload_rate`/`peers_connected`/`peers_sending` to be zeroed later by the demoted actor's own asynchronous shutdown. If that teardown was ever slow or didn't run, a torrent could show a frozen nonzero transfer rate with 0 connected peers indefinitely. Both paths now zero those fields synchronously in the same lock acquisition as the tier flip (matching `transition_to_cold`'s existing handling) and correctly adjust the engine-wide aggregate rate counters, so a stuck torrent no longer inflates the session-wide totals either.
+
 ## [2.2.34] - 2026-11-25
 
 ### Added

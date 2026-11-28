@@ -2236,11 +2236,29 @@ impl SwarmEngine {
             let excess = hot_active_seeds.len() - qm.config().max_active_seeds;
             for &(hash, _, _) in hot_active_seeds.iter().take(excess) {
                 if let Some(handle) = self.torrents.get(&hash).map(|r| r.value().clone()) {
-                    {
+                    // Zero the live rate/peer fields synchronously here rather than leaving it
+                    // to the demoted actor's own async teardown -- `stop_actor` below clears
+                    // `live_peers` immediately but never touches `stats`, so without this a
+                    // torrent can show a frozen nonzero upload/download rate with 0 connected
+                    // peers indefinitely if the actor is slow (or never gets around) to notice
+                    // its stop signal. Mirrors `transition_to_cold`'s handling below.
+                    let demoted = {
                         let mut s = handle.stats.write();
                         if s.state == SwarmState::Seeding && s.tier == SwarmTier::Hot {
+                            let old = (s.download_rate, s.upload_rate, s.peers_connected);
                             s.tier = SwarmTier::Warm;
+                            s.download_rate = 0;
+                            s.upload_rate = 0;
+                            s.peers_connected = 0;
+                            s.peers_sending = 0;
+                            Some(old)
+                        } else {
+                            None
                         }
+                    };
+                    if let Some((old_dl, old_ul, old_peers)) = demoted {
+                        self.metrics
+                            .record_rate_change(old_dl, 0, old_ul, 0, old_peers, 0);
                     }
                     self.active_torrents.remove(&hash);
                     handle.stop_actor();
@@ -4236,11 +4254,25 @@ impl SwarmEngine {
     /// Transitions an active torrent to the Warm tier (idle seeding with compressed Roaring Bitfield).
     pub fn transition_to_warm(&self, info_hash: &[u8; 20]) -> bool {
         if let Some(handle) = self.torrents.get(info_hash).map(|r| r.value().clone()) {
-            let cur_state = {
+            let (cur_state, old_dl, old_ul, old_peers) = {
                 let mut stats = handle.stats.write();
+                let old = (
+                    stats.download_rate,
+                    stats.upload_rate,
+                    stats.peers_connected,
+                );
                 stats.tier = SwarmTier::Warm;
-                stats.state.clone()
+                // Zero synchronously -- see the matching comment on the seed-queue-cap
+                // demotion in `reconcile_queue` for why relying solely on `stop_actor`'s async
+                // teardown leaves a torrent showing a frozen nonzero rate with 0 peers.
+                stats.download_rate = 0;
+                stats.upload_rate = 0;
+                stats.peers_connected = 0;
+                stats.peers_sending = 0;
+                (stats.state.clone(), old.0, old.1, old.2)
             };
+            self.metrics
+                .record_rate_change(old_dl, 0, old_ul, 0, old_peers, 0);
             self.sync_tracking_sets(info_hash, &cur_state, SwarmTier::Warm, Some(&handle));
             handle.stop_actor();
             true
