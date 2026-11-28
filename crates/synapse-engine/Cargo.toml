@@ -2,6 +2,7 @@
 name = "synapse-engine"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 description = "Torrent state machine: wires peer connections, the piece picker/choker, and the disk engine together. See doc/REWRITE_ROADMAP.md."

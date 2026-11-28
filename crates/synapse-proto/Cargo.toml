@@ -2,6 +2,7 @@
 name = "synapse-proto"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 description = "Compiled Protobuf and gRPC definitions for Synapse 2.0 (synapse.v2)."

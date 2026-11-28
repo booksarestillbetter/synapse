@@ -3,6 +3,12 @@
 All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [2.2.37] - 2026-11-28
+
+### Fixed
+
+- **`v2.2.36`'s CI failure (clippy toolchain drift against CI's exact 1.100.0) (`synapse-picker`).** `needless_range_loop` newly flags `for avail in tier.buckets.min_avail..tier.buckets.buckets.len()` in `Picker::pick` — rewritten as an iterator (`tier.buckets.buckets.iter().skip(tier.buckets.min_avail)`). No behavior change. Also added `rust-version.workspace = true` to every crate so the workspace's declared MSRV is actually referenced (it was a dead field, flagged by a newer `cargo::unused_workspace_package_fields` lint).
+
 ## [2.2.36] - 2026-11-28
 
 ### Security

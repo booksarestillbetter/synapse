@@ -820,12 +820,8 @@ impl Picker {
                 Mode::RarestFirst => {
                     if !allow_requested {
                         if !tier.buckets.is_empty() {
-                            for avail in tier.buckets.min_avail..tier.buckets.buckets.len() {
-                                if let Some(p) = self.pick_from_bucket(
-                                    &tier.buckets.buckets[avail],
-                                    peer_has,
-                                    range,
-                                ) {
+                            for bucket in tier.buckets.buckets.iter().skip(tier.buckets.min_avail) {
+                                if let Some(p) = self.pick_from_bucket(bucket, peer_has, range) {
                                     return Some(p);
                                 }
                             }
